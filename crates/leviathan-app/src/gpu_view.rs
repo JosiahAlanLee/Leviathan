@@ -70,7 +70,6 @@ impl GpuPingPong {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
-                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
@@ -225,7 +224,6 @@ impl GpuPingPong {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.views[dst],
                     resolve_target: None,
-                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
@@ -312,17 +310,12 @@ impl FeedbackViewport {
                 surface,
                 preview_tex,
             } => {
-                let uniforms = VisualUniforms::from_cv(
-                    cv,
-                    frame,
-                    surface.width as u32,
-                    surface.height as u32,
-                );
+                let surf_w = surface.width;
+                let surf_h = surface.height;
+                let uniforms = VisualUniforms::from_cv(cv, frame, surf_w as u32, surf_h as u32);
                 let rgba = surface.step(&uniforms);
-                let color_img = egui::ColorImage::from_rgba_unmultiplied(
-                    [surface.width, surface.height],
-                    rgba,
-                );
+                let color_img =
+                    egui::ColorImage::from_rgba_unmultiplied([surf_w, surf_h], rgba);
                 let tex = preview_tex.get_or_insert_with(|| {
                     ctx.load_texture(
                         "feedback_surface_cpu",
