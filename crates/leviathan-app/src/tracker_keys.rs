@@ -156,7 +156,7 @@ impl TrackerCursor {
 
     pub fn handle_input(&mut self, ctx: &egui::Context, pattern: &mut Pattern) -> Vec<CellUpdate> {
         self.moved_this_frame = false;
-        if ctx.egui_wants_keyboard_input() {
+        if ctx.wants_keyboard_input() {
             return Vec::new();
         }
 
