@@ -235,7 +235,7 @@ impl SynthRack {
                 v.env = (cv.velocity_v[lane] / 10.0).clamp(0.1, 1.0);
                 v.pitch_env = 1.0;
                 v.fm.trigger();
-                v.sampler.trigger(lock);
+                v.sampler.trigger(&self.sample_bank, lock);
             }
             v.prev_gate = gate_high;
 
