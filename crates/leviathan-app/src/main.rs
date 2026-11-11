@@ -1,4 +1,5 @@
 mod sampler_ui;
+mod tracker_keys;
 mod wav;
 
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use leviathan_core::{
 use leviathan_dsp::{MachineKind, SynthRack};
 use leviathan_gpu::{FeedbackSurface, VisualUniforms, FEEDBACK_SHADER_WGSL};
 use sampler_ui::{BankAction, SamplerBankUi};
+use tracker_keys::{SubColumn, TrackerCursor};
 
 const LANE_NAMES: [&str; NUM_LANES] = ["0 KICK", "1 FM4", "2 SUB", "3 AIR", "4 SMPL", "5 ACID"];
 
@@ -365,7 +367,7 @@ struct LeviathanApp {
     playing: bool,
     fill_active: bool,
     bpm: f64,
-    selected_step: (usize, usize),
+    cursor: TrackerCursor,
     sampler_ui: SamplerBankUi,
     cmd_tx: rtrb::Producer<AudioCommand>,
     tel_rx: rtrb::Consumer<CvFrame>,
@@ -410,12 +412,15 @@ impl LeviathanApp {
                 ),
             };
 
+        let mut cursor = TrackerCursor::default();
+        cursor.select(4, 0, SubColumn::Note);
+
         Self {
             pattern: Box::new(initial_pattern),
             playing: false,
             fill_active: false,
             bpm: 132.0,
-            selected_step: (4, 0),
+            cursor,
             sampler_ui: SamplerBankUi::default(),
             cmd_tx,
             tel_rx,
@@ -433,12 +438,22 @@ impl LeviathanApp {
 
 impl eframe::App for LeviathanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+        if !ctx.egui_wants_keyboard_input()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space))
+        {
             self.playing = !self.playing;
             let _ = self.cmd_tx.push(AudioCommand::SetPlaying(self.playing));
             if let Some(ev) = self.offline_eval.as_mut() {
                 ev.playing = self.playing;
             }
+        }
+
+        for upd in self.cursor.handle_input(ctx, &mut self.pattern) {
+            let _ = self.cmd_tx.push(AudioCommand::SetCell {
+                lane: upd.lane,
+                row: upd.row,
+                cell: upd.cell,
+            });
         }
 
         let (hovering_wav, mut bank_actions) = self.sampler_ui.poll_drag_and_drop(ctx);
@@ -509,8 +524,12 @@ impl eframe::App for LeviathanApp {
                 }
                 ui.separator();
                 ui.monospace(format!(
-                    "Beat {:06.2} | Row {:02}",
-                    self.latest_cv.beat, self.latest_cv.row
+                    "Oct:{} [-/=] | Step:{} [[/]] | Col:{} | Beat {:06.2} Row {:02X}",
+                    self.cursor.base_octave,
+                    self.cursor.edit_step,
+                    self.cursor.column.label(),
+                    self.latest_cv.beat,
+                    self.latest_cv.row
                 ));
                 ui.separator();
                 ui.small(&self.audio_status);
@@ -519,7 +538,7 @@ impl eframe::App for LeviathanApp {
             });
         });
 
-        let (sel_lane, sel_row) = self.selected_step;
+        let (sel_lane, sel_row) = (self.cursor.lane, self.cursor.row);
         let mut edit_cell = self.pattern.lanes[sel_lane][sel_row];
         let mut cell_dirty = false;
 
@@ -555,7 +574,7 @@ impl eframe::App for LeviathanApp {
                         sel_row,
                         eff_machine.short_name()
                     ));
-                    ui.small("Left-click toggles step; right-click inspects.");
+                    ui.small("Arrows/Tab move; Z-M/Q-U notes; 0-9/A-F hex vel; Del clears.");
 
                     ui.horizontal(|ui| {
                         if ui.checkbox(&mut edit_cell.active, "On").changed() {
@@ -566,7 +585,7 @@ impl eframe::App for LeviathanApp {
                         }
                         ui.label("MIDI");
                         if ui
-                            .add(egui::DragValue::new(&mut edit_cell.midi).range(24..=96))
+                            .add(egui::DragValue::new(&mut edit_cell.midi).range(12..=108))
                             .changed()
                         {
                             cell_dirty = true;
@@ -652,12 +671,19 @@ impl eframe::App for LeviathanApp {
             let _ = self.cmd_tx.push(cmd);
         }
 
+        let cur_lane = self.cursor.lane;
+        let cur_row = self.cursor.row;
+        let cur_col = self.cursor.column;
+        let scroll_to_cursor = self.cursor.moved_this_frame;
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Score v3 Pattern 00 (64 Rows x 6 Lanes — * marks sound-locked steps)");
+            ui.heading(
+                "Pattern 00 — Arrows/PgUp/PgDn/Tab navigate | Z-M & Q-U piano | 00-7F hex vel | ` Air | Del clear",
+            );
             egui::ScrollArea::vertical().show(ui, |ui| {
                 egui::Grid::new("score_v3_grid")
                     .striped(true)
-                    .min_col_width(74.0)
+                    .min_col_width(82.0)
                     .show(ui, |ui| {
                         ui.monospace("ROW");
                         for name in LANE_NAMES {
@@ -677,37 +703,72 @@ impl eframe::App for LeviathanApp {
                             for lane in 0..NUM_LANES {
                                 let cell = &mut self.pattern.lanes[lane][row];
                                 let has_lock = cell.lock.mask != 0 || cell.lock.machine >= 0;
-                                let sep = if has_lock { '*' } else { ' ' };
-                                let label = if cell.active {
+                                let mark = if has_lock { '*' } else { ' ' };
+                                let note_str = if cell.active {
                                     if cell.air {
-                                        format!("AIR{sep}--")
+                                        format!("AIR{mark}")
                                     } else {
-                                        format!(
-                                            "{}{sep}{:02X}",
-                                            midi_label(cell.midi),
-                                            cell.velocity
-                                        )
+                                        format!("{}{mark}", midi_label(cell.midi))
                                     }
-                                } else if has_lock {
-                                    "---*--".to_string()
                                 } else {
-                                    "--- --".to_string()
+                                    format!("---{mark}")
                                 };
-                                let resp = ui.selectable_label(
-                                    cell.active || self.selected_step == (lane, row),
-                                    label,
-                                );
-                                if resp.clicked() {
-                                    self.selected_step = (lane, row);
-                                    cell.active = !cell.active;
-                                    let _ = self.cmd_tx.push(AudioCommand::SetCell {
-                                        lane,
-                                        row,
-                                        cell: *cell,
-                                    });
-                                } else if resp.secondary_clicked() {
-                                    self.selected_step = (lane, row);
-                                }
+                                let vel_str = if cell.active {
+                                    format!("{:02X}", cell.velocity)
+                                } else {
+                                    "--".to_string()
+                                };
+
+                                let is_note_cur =
+                                    cur_lane == lane && cur_row == row && cur_col == SubColumn::Note;
+                                let is_vel_cur = cur_lane == lane
+                                    && cur_row == row
+                                    && cur_col == SubColumn::Velocity;
+
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 2.0_f32;
+                                    let r_note = ui.selectable_label(
+                                        is_note_cur,
+                                        egui::RichText::new(note_str).monospace().color(
+                                            if cell.active {
+                                                egui::Color32::from_rgb(220, 235, 255)
+                                            } else {
+                                                egui::Color32::from_rgb(125, 130, 140)
+                                            },
+                                        ),
+                                    );
+                                    if r_note.clicked() {
+                                        self.cursor.select(lane, row, SubColumn::Note);
+                                    }
+                                    if r_note.double_clicked() {
+                                        cell.active = !cell.active;
+                                        let _ = self.cmd_tx.push(AudioCommand::SetCell {
+                                            lane,
+                                            row,
+                                            cell: *cell,
+                                        });
+                                    }
+                                    if is_note_cur && scroll_to_cursor {
+                                        r_note.scroll_to_me(None);
+                                    }
+
+                                    let r_vel = ui.selectable_label(
+                                        is_vel_cur,
+                                        egui::RichText::new(vel_str).monospace().color(
+                                            if cell.active {
+                                                egui::Color32::from_rgb(130, 215, 175)
+                                            } else {
+                                                egui::Color32::from_rgb(105, 110, 120)
+                                            },
+                                        ),
+                                    );
+                                    if r_vel.clicked() {
+                                        self.cursor.select(lane, row, SubColumn::Velocity);
+                                    }
+                                    if is_vel_cur && scroll_to_cursor {
+                                        r_vel.scroll_to_me(None);
+                                    }
+                                });
                             }
                             ui.end_row();
                         }
@@ -724,7 +785,7 @@ impl eframe::App for LeviathanApp {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1260.0, 840.0])
+            .with_inner_size([1280.0, 840.0])
             .with_drag_and_drop(true),
         ..eframe::NativeOptions::default()
     };
@@ -749,4 +810,4 @@ mod tests {
         assert_eq!(param_labels(MachineKind::VarSampler)[1], "P1 ChipClk");
         assert_eq!(midi_label(60), "C-4");
     }
-                        }
+                                }
