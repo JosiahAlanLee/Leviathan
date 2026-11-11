@@ -438,7 +438,7 @@ impl LeviathanApp {
 
 impl eframe::App for LeviathanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if !ctx.egui_wants_keyboard_input()
+        if !ctx.wants_keyboard_input(
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space))
         {
             self.playing = !self.playing;
