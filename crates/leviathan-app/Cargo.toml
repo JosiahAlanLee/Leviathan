@@ -14,4 +14,4 @@ leviathan-dsp = { workspace = true, features = ["std"] }
 leviathan-gpu = { workspace = true }
 rtrb = { workspace = true }
 serde = { workspace = true, features = ["std"] }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["float_roundtrip"] }

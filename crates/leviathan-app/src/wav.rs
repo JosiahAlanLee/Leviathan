@@ -164,22 +164,7 @@ pub fn decode_wav_bytes(name: &str, bytes: &[u8]) -> Result<DecodedWav, String> 
         (pcm, eff_sr)
     };
 
-    let mut peaks = [0.0_f32; 64];
-    for (bin, slot) in peaks.iter_mut().enumerate() {
-        let i0 = (bin * pcm_vec.len()) / 64;
-        let i1 = (((bin + 1) * pcm_vec.len()) / 64)
-            .max(i0 + 1)
-            .min(pcm_vec.len());
-        let mut max_abs = 0.0_f32;
-        for &s in &pcm_vec[i0..i1] {
-            let a = (s as f32 / 32_768.0).abs();
-            if a > max_abs {
-                max_abs = a;
-            }
-        }
-        *slot = max_abs.clamp(0.0, 1.0);
-    }
-
+    let peaks = sample_peaks(&pcm_vec);
     Ok(DecodedWav {
         name: name.to_string(),
         samples: Arc::from(pcm_vec.into_boxed_slice()),
@@ -188,6 +173,26 @@ pub fn decode_wav_bytes(name: &str, bytes: &[u8]) -> Result<DecodedWav, String> 
         original_sr: sample_rate,
         peaks,
     })
+}
+
+pub fn sample_peaks(pcm: &[i16]) -> [f32; 64] {
+    let mut peaks = [0.0_f32; 64];
+    for (bin, slot) in peaks.iter_mut().enumerate() {
+        let i0 = (bin * pcm.len()) / 64;
+        let i1 = (((bin + 1) * pcm.len()) / 64)
+            .max(i0 + 1)
+            .min(pcm.len());
+        let mut max_abs = 0.0_f32;
+        for &s in &pcm[i0..i1] {
+            let a = (s as f32 / 32_768.0).abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        }
+        *slot = max_abs.clamp(0.0, 1.0);
+    }
+
+    peaks
 }
 
 #[cfg(test)]

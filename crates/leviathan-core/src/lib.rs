@@ -1,5 +1,11 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
+#[cfg(feature = "serde")]
+mod pattern_serde;
+mod song;
+
+pub use song::{LaunchTarget, PatternChain, SongPlayer, SongStatus, MAX_CHAIN_ENTRIES};
+
 pub const MAX_PATTERNS: usize = 128;
 pub const NUM_LANES: usize = 6;
 pub const ROWS_PER_PATTERN: usize = 64;
@@ -153,10 +159,13 @@ impl Default for AutomationRow {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Pattern {
     pub length: usize,
     pub rate: PlaybackRate,
+    #[cfg_attr(feature = "serde", serde(with = "pattern_serde::lanes"))]
     pub lanes: [[NoteCell; ROWS_PER_PATTERN]; NUM_LANES],
+    #[cfg_attr(feature = "serde", serde(with = "pattern_serde::automation"))]
     pub automation: [AutomationRow; ROWS_PER_PATTERN],
 }
 
@@ -168,6 +177,27 @@ impl Default for Pattern {
             lanes: [[NoteCell::default(); ROWS_PER_PATTERN]; NUM_LANES],
             automation: [AutomationRow::default(); ROWS_PER_PATTERN],
         }
+    }
+}
+
+impl Pattern {
+    fn timing(&self) -> PatternTiming {
+        PatternTiming {
+            rows: self.length.clamp(1, ROWS_PER_PATTERN),
+            rate: self.rate,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PatternTiming {
+    rows: usize,
+    rate: PlaybackRate,
+}
+
+impl PatternTiming {
+    fn duration_beats(&self) -> f64 {
+        self.rows as f64 / self.rate.rows_per_beat()
     }
 }
 
@@ -272,12 +302,46 @@ pub struct TrackerEvaluator {
     pub playing: bool,
     pub fill_active: bool,
     pub active_pattern: usize,
-    sample_cursor: u64,
+    clock: SampleClock,
     cycle_start_beat: f64,
     held_pitch_v: [f32; NUM_LANES],
     held_vel_v: [f32; NUM_LANES],
     held_locks: [SoundLock; NUM_LANES],
     sequence: u64,
+}
+
+struct SampleClock {
+    anchor_beat: f64,
+    elapsed_samples: u64,
+    bpm: f64,
+    sample_rate: f64,
+}
+
+impl SampleClock {
+    fn new(config: &EngineConfig) -> Self {
+        Self {
+            anchor_beat: 0.0,
+            elapsed_samples: 0,
+            bpm: config.bpm,
+            sample_rate: config.sample_rate,
+        }
+    }
+
+    fn beat(&self) -> f64 {
+        self.anchor_beat + (self.elapsed_samples as f64 * self.bpm) / (60.0 * self.sample_rate)
+    }
+
+    fn take_sample(&mut self, config: &EngineConfig) -> f64 {
+        let beat = self.beat();
+        if self.bpm != config.bpm || self.sample_rate != config.sample_rate {
+            self.anchor_beat = beat;
+            self.elapsed_samples = 0;
+            self.bpm = config.bpm;
+            self.sample_rate = config.sample_rate;
+        }
+        self.elapsed_samples = self.elapsed_samples.wrapping_add(1);
+        beat
+    }
 }
 
 impl Default for TrackerEvaluator {
@@ -288,12 +352,13 @@ impl Default for TrackerEvaluator {
 
 impl TrackerEvaluator {
     pub fn new(config: EngineConfig) -> Self {
+        let clock = SampleClock::new(&config);
         Self {
             config,
             playing: false,
             fill_active: false,
             active_pattern: 0,
-            sample_cursor: 0,
+            clock,
             cycle_start_beat: 0.0,
             held_pitch_v: [0.0; NUM_LANES],
             held_vel_v: [0.0; NUM_LANES],
@@ -303,11 +368,31 @@ impl TrackerEvaluator {
     }
 
     pub fn reset_transport(&mut self) {
-        self.sample_cursor = 0;
+        self.clock = SampleClock::new(&self.config);
         self.cycle_start_beat = 0.0;
     }
 
     pub fn step_sample(&mut self, pattern: &Pattern) -> CvFrame {
+        let beat = self.take_sample();
+        self.evaluate_sample(pattern, pattern.timing(), beat, 0.0, 0)
+    }
+
+    fn take_sample(&mut self) -> f64 {
+        if self.playing {
+            self.clock.take_sample(&self.config)
+        } else {
+            self.clock.beat()
+        }
+    }
+
+    fn evaluate_sample(
+        &mut self,
+        pattern: &Pattern,
+        timing: PatternTiming,
+        beat: f64,
+        pattern_start_beat: f64,
+        previous_plays: u32,
+    ) -> CvFrame {
         let v_high = self.config.v_high;
         if !self.playing {
             return CvFrame {
@@ -319,9 +404,6 @@ impl TrackerEvaluator {
             };
         }
 
-        let beat = (self.sample_cursor as f64 * self.config.bpm) / (60.0 * self.config.sample_rate);
-        self.sample_cursor = self.sample_cursor.wrapping_add(1);
-
         let clock_high = fract_positive(beat * self.config.ppqn as f64) < 0.5;
         let clock_v = if clock_high { v_high } else { 0.0 };
 
@@ -332,11 +414,11 @@ impl TrackerEvaluator {
             0.0
         };
 
-        let pat_len = pattern.length.clamp(1, ROWS_PER_PATTERN);
-        let total_rows = beat * pattern.rate.rows_per_beat();
+        let pat_len = timing.rows;
+        let total_rows = (beat - pattern_start_beat).max(0.0) * timing.rate.rows_per_beat();
         let row_index_abs = total_rows as u64;
         let row = (row_index_abs as usize) % pat_len;
-        let bar_count = (row_index_abs / pat_len as u64) as u32;
+        let bar_count = previous_plays.wrapping_add((row_index_abs / pat_len as u64) as u32);
         let row_phase = fract_positive(total_rows) as f32;
 
         let mut gate_v = [0.0_f32; NUM_LANES];

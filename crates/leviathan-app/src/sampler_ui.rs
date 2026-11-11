@@ -59,8 +59,7 @@ pub struct SamplerBankUi {
     pub path_input: String,
     pub status_msg: String,
     pub slots: [BankSlotMeta; NUM_BANKS],
-    /// Retains Arc buffers on the UI thread so the RT audio callback never deallocates.
-    retained_arcs: Vec<Arc<[i16]>>,
+    pub samples: [Option<DecodedWav>; NUM_BANKS],
 }
 
 impl Default for SamplerBankUi {
@@ -70,7 +69,7 @@ impl Default for SamplerBankUi {
             path_input: String::new(),
             status_msg: "Drop .wav file(s) anywhere on window to load into B0-B3.".to_string(),
             slots: core::array::from_fn(BankSlotMeta::rom_default),
-            retained_arcs: Vec::new(),
+            samples: core::array::from_fn(|_| None),
         }
     }
 }
@@ -78,6 +77,16 @@ impl Default for SamplerBankUi {
 impl SamplerBankUi {
     fn apply_decoded(&mut self, bank: usize, wav: DecodedWav) -> BankAction {
         let b = bank % NUM_BANKS;
+        let action = BankAction::Load {
+            bank: b,
+            samples: Arc::clone(&wav.samples),
+            c4_rate_hz: wav.c4_rate_hz,
+        };
+        self.set_sample(b, wav);
+        action
+    }
+
+    fn set_sample(&mut self, b: usize, wav: DecodedWav) {
         self.slots[b] = BankSlotMeta {
             label: wav.name.clone(),
             frames: wav.samples.len(),
@@ -91,15 +100,17 @@ impl SamplerBankUi {
             wav.samples.len(),
             wav.original_sr
         );
-        self.retained_arcs.push(Arc::clone(&wav.samples));
-        if self.retained_arcs.len() > 32 {
-            self.retained_arcs.retain(|a| Arc::strong_count(a) > 1);
+        self.samples[b] = Some(wav);
+    }
+
+    pub fn restore(&mut self, samples: [Option<DecodedWav>; NUM_BANKS]) {
+        *self = Self::default();
+        for (bank, sample) in samples.into_iter().enumerate() {
+            if let Some(sample) = sample {
+                self.set_sample(bank, sample);
+            }
         }
-        BankAction::Load {
-            bank: b,
-            samples: wav.samples,
-            c4_rate_hz: wav.c4_rate_hz,
-        }
+        self.status_msg = "Restored project sample banks.".to_string();
     }
 
     pub fn poll_drag_and_drop(&mut self, ctx: &egui::Context) -> (bool, Vec<BankAction>) {
@@ -160,6 +171,7 @@ impl SamplerBankUi {
             if ui.button("Reset ROM").clicked() {
                 let b = self.active_bank;
                 self.slots[b] = BankSlotMeta::rom_default(b);
+                self.samples[b] = None;
                 self.status_msg = format!("Restored B{b} to procedural ROM wave.");
                 actions.push(BankAction::ResetRom { bank: b });
             }

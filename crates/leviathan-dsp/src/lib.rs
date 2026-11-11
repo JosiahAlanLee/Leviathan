@@ -208,15 +208,30 @@ pub struct SynthRack {
 
 impl SynthRack {
     pub fn new(sample_rate: f32) -> Self {
+        Self {
+            sample_rate: sample_rate.max(8_000.0),
+            voices: Self::fresh_voices(),
+            sample_bank: SampleBank::new(),
+            counter: ByteBusCounter::default(),
+        }
+    }
+
+    fn fresh_voices() -> [VoiceState; NUM_LANES] {
         let mut voices = core::array::from_fn(|_| VoiceState::default());
         for (i, v) in voices.iter_mut().enumerate() {
             v.rng ^= (i as u32 + 1).wrapping_mul(0x85eb_ca6b);
         }
-        Self {
-            sample_rate: sample_rate.max(8_000.0),
-            voices,
-            sample_bank: SampleBank::new(),
-            counter: ByteBusCounter::default(),
+        voices
+    }
+
+    pub fn reset_voices(&mut self) {
+        self.voices = Self::fresh_voices();
+        self.counter = ByteBusCounter::default();
+    }
+
+    pub fn retrigger_gates(&mut self) {
+        for voice in &mut self.voices {
+            voice.prev_gate = false;
         }
     }
 
