@@ -389,6 +389,7 @@ impl LeviathanApp {
                     self.selected_pattern,
                     &self.chain,
                     &self.sampler_ui.samples,
+                    self.viewport.custom_shader(),
                 );
                 self.project_ui.finish(path, "Saved", result);
             }
@@ -412,6 +413,7 @@ impl LeviathanApp {
         self.selected_pattern = project.selected_pattern;
         self.chain = project.chain;
         self.sampler_ui.restore(project.samples);
+        self.viewport.restore_custom_shader(project.custom_shader);
         self.playing = false;
         self.fill_active = false;
         self.inspector_drag_recorded = false;
@@ -495,7 +497,9 @@ impl eframe::App for LeviathanApp {
         }
 
         let (hovering_wav, mut bank_actions) = self.sampler_ui.poll_drag_and_drop(ctx);
-
+        let hovering_wgsl = self.viewport.poll_shader_drop(ctx);
+        let now_secs = ctx.input(|i| i.time);
+        self.viewport.poll_hot_reload(now_secs);
         if let Some(player) = self.offline_player.as_mut() {
             self.latest_cv = player.step_sample(&self.patterns).0;
             self.latest_song = player.status();
@@ -596,6 +600,8 @@ impl eframe::App for LeviathanApp {
                         }
                     });
 
+                    ui.separator();
+                    self.viewport.draw_shader_controls(ui, hovering_wgsl);
                     bank_actions.extend(self.sampler_ui.draw(ui, hovering_wav));
 
                     ui.separator();
