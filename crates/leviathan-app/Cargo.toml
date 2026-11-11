@@ -1,0 +1,17 @@
+[package]
+name = "leviathan-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Single-binary Rust A/V tracker workstation (Score v3 + DSP + wgpu + egui)"
+
+[dependencies]
+cpal = { workspace = true }
+eframe = { workspace = true }
+leviathan-core = { workspace = true, features = ["std", "serde"] }
+leviathan-dsp = { workspace = true, features = ["std"] }
+leviathan-gpu = { workspace = true }
+rtrb = { workspace = true }
+serde = { workspace = true, features = ["std"] }
+serde_json = { workspace = true }
