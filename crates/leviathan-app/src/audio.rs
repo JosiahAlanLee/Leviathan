@@ -62,7 +62,7 @@ impl AudioCommand {
     }
 }
 
-pub struct AudioProject {
+pub struct Audio
     generation: u64,
     bpm: f64,
     master_send: f32,
@@ -72,7 +72,7 @@ pub struct AudioProject {
     sample_bank: SampleBank,
 }
 
-impl AudioProject {
+impl Audio
     pub fn prepare(project: &Project, generation: u64) -> Self {
         let mut sample_bank = SampleBank::new();
         for (bank, sample) in project.samples.iter().enumerate() {
@@ -482,6 +482,7 @@ mod tests {
             selected_pattern: 1,
             chain,
             samples,
+            custom_shader: None,
         };
         audio.send(AudioCommand::SetPlaying(true));
         audio.send(AudioCommand::ReplaceProject(Arc::new(
@@ -530,6 +531,7 @@ mod tests {
             selected_pattern: PATTERN_BANK_CAPACITY + 2,
             chain: PatternChain::default(),
             samples: core::array::from_fn(|_| None),
+            custom_shader: None,
         };
         audio.send(AudioCommand::ReplaceProject(Arc::new(
             AudioProject::prepare(&oversized, 2),
