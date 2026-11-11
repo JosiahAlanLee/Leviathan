@@ -364,4 +364,4 @@ mod tests {
         }
         assert_eq!(seq, [1, 2, 1, 0, 1]);
     }
-}, NUM_LANES};
+}
