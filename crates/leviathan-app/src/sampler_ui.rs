@@ -13,6 +13,14 @@ const ROM_LABELS: [&str; NUM_BANKS] = [
     "ROM 3: Crunch Snare",
 ];
 
+fn is_wgsl_file(name: &str, path: Option<&Path>) -> bool {
+    leviathan_gpu::is_wgsl_filename(name)
+        || path
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(leviathan_gpu::is_wgsl_filename)
+}
+
 #[derive(Clone, Debug)]
 pub enum BankAction {
     Load {
@@ -40,7 +48,13 @@ impl BankSlotMeta {
             let t = i as f32 / 64.0;
             *slot = match bank {
                 0 => (1.0 - 0.75 * t) * 0.85,
-                1 => if (i % 8) < 3 { 0.80 } else { 0.45 },
+                1 => {
+                    if (i % 8) < 3 {
+                        0.80
+                    } else {
+                        0.45
+                    }
+                }
                 2 => 0.55 + 0.30 * (t * core::f32::consts::TAU * 2.0).sin().abs(),
                 _ => (1.0 - 0.80 * t) * 0.90,
             };
@@ -94,7 +108,8 @@ impl SamplerBankUi {
             peaks: wav.peaks,
         };
         self.status_msg = format!(
-            "Loaded B{b}: {} ({} -> {} fr @ {} Hz)",
+            "Loaded B{}: {} ({} -> {} fr @ {} Hz)",
+            b,
             wav.name,
             wav.original_frames,
             wav.samples.len(),
@@ -114,12 +129,22 @@ impl SamplerBankUi {
     }
 
     pub fn poll_drag_and_drop(&mut self, ctx: &egui::Context) -> (bool, Vec<BankAction>) {
-        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        let hovering = ctx.input(|i| {
+            i.raw
+                .hovered_files
+                .iter()
+                .any(|f| !is_wgsl_file("", f.path.as_deref()))
+        });
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         let mut actions = Vec::new();
+        let mut wav_offset = 0usize;
 
-        for (offset, df) in dropped.iter().enumerate() {
-            let target_bank = (self.active_bank + offset) % NUM_BANKS;
+        for df in &dropped {
+            if is_wgsl_file(&df.name, df.path.as_deref()) {
+                continue;
+            }
+            let target_bank = (self.active_bank + wav_offset) % NUM_BANKS;
+            wav_offset += 1;
             let res = if let Some(bytes) = df.bytes.as_deref() {
                 let label = if df.name.is_empty() {
                     "dropped.wav"
@@ -189,7 +214,7 @@ impl SamplerBankUi {
             let rect = resp.rect;
             let mid_y = rect.center().y;
             let half_h = rect.height() * 0.44;
-                    let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(95, 195, 250));
+            let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(95, 195, 250));
 
             for (i, &pk) in meta.peaks.iter().enumerate() {
                 let x = rect.left() + (i as f32 + 0.5) * (rect.width() / 64.0);
@@ -222,5 +247,45 @@ impl SamplerBankUi {
 
         ui.small(&self.status_msg);
         actions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wgsl_file_drops_do_not_trigger_wav_bank_errors() {
+        let mut bank_ui = SamplerBankUi::default();
+        let initial_status = bank_ui.status_msg.clone();
+        let ctx = egui::Context::default();
+
+        let mut raw = egui::RawInput::default();
+        raw.hovered_files.push(egui::HoveredFile {
+            path: Some(std::path::PathBuf::from("live_patch.wgsl")),
+            ..Default::default()
+        });
+        raw.dropped_files.push(egui::DroppedFile {
+            name: "live_patch.wgsl".to_string(),
+            bytes: Some(Arc::from(
+                leviathan_gpu::STARTER_SHADER_TEMPLATE_WGSL.as_bytes(),
+            )),
+            ..Default::default()
+        });
+
+        let mut hovering_wav = true;
+        let mut actions = Vec::new();
+        let _ = ctx.run(raw, |ctx| {
+            let (hov, act) = bank_ui.poll_drag_and_drop(ctx);
+            hovering_wav = hov;
+            actions = act;
+        });
+
+        assert!(!hovering_wav, ".wgsl hover must not trigger WAV hover banner");
+        assert!(actions.is_empty(), ".wgsl drop must not emit WAV BankAction");
+        assert_eq!(
+            bank_ui.status_msg, initial_status,
+            ".wgsl drop must not overwrite status_msg with WAV drop error"
+        );
     }
 }
