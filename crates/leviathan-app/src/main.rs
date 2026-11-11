@@ -238,7 +238,7 @@ impl RtAudioWorker {
                     }
                 }
                 AudioCommand::SetPattern(snap) => {
-                    self.pattern.clone_from(&snap);
+                    (*self.pattern).clone_from(&snap);
                 }
                 AudioCommand::LoadSampleBank {
                     bank,
@@ -902,4 +902,4 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(LeviathanApp::new(cc)))),
     )
-                                       }
+                                                      }
