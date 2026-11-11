@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use leviathan_core::{
-    CvFrame, EngineConfig, LaunchTarget, NoteCell, Pattern, PatternChain, SongPlayer, SongStatus,
-    NUM_LANES, ROWS_PER_PATTERN,
+    AutomationRow, CvFrame, EngineConfig, LaunchTarget, NoteCell, Pattern, PatternChain,
+    SongPlayer, SongStatus, NUM_LANES, ROWS_PER_PATTERN,
 };
 use leviathan_dsp::{sampler::SampleBank, MasterPeaks, SynthRack};
 
@@ -23,6 +23,11 @@ pub enum AudioCommand {
         lane: usize,
         row: usize,
         cell: NoteCell,
+    },
+    SetAutomation {
+        pattern: usize,
+        row: usize,
+        automation: AutomationRow,
     },
     SetPattern {
         index: usize,
@@ -236,6 +241,15 @@ impl RtAudioWorker {
                         self.patterns[pattern].lanes[lane][row] = cell;
                     }
                 }
+                AudioCommand::SetAutomation {
+                    pattern,
+                    row,
+                    automation,
+                } => {
+                    if pattern < self.pattern_count && row < ROWS_PER_PATTERN {
+                        self.patterns[pattern].automation[row] = automation;
+                    }
+                }
                 AudioCommand::SetPattern { index, pattern } => {
                     if index <= self.pattern_count && index < self.patterns.len() {
                         self.patterns[index].clone_from(&pattern);
@@ -395,7 +409,7 @@ pub fn try_start_audio(
 mod tests {
     use super::*;
     use crate::wav::{sample_peaks, DecodedWav};
-    use leviathan_core::{AutomationRow, PlaybackRate};
+    use leviathan_core::PlaybackRate;
 
     #[test]
     fn full_command_ring_preserves_order_and_snapshot_ownership() {
@@ -580,4 +594,33 @@ mod tests {
         assert!(reported.output[0] >= peaks.output[0] && reported.output[1] >= peaks.output[1]);
         assert_eq!(worker.synth.master_peaks(), MasterPeaks::default());
     }
-}
+    #[test] 
+    fn set_automation_updates_live_cv_and_bytebus_telemetry() {
+        let (tx, rx) = rtrb::RingBuffer::new(8);
+        let (tel_tx, mut tel_rx) = rtrb::RingBuffer::new(16);
+        let mut audio = AudioControl::new(tx);
+        let mut worker = RtAudioWorker::new(Pattern::default(), 100.0, rx, tel_tx);
+
+        audio.send(AudioCommand::SetAutomation {
+            pattern: 0,
+            row: 0,
+            automation: AutomationRow {
+                z: 0.8,
+                roll: -0.5,
+                feedback: 0.6,
+                byte_word: 0b0000_0101,
+            },
+        });
+        audio.send(AudioCommand::SetPlaying(true));
+        worker.drain_commands();
+        worker.next_stereo();
+
+        let telemetry = tel_rx.pop().unwrap();
+        assert!((telemetry.cv.z_v - 8.0).abs() < 1e-4);
+        assert!((telemetry.cv.roll_v - (-2.5)).abs() < 1e-4);
+        assert!((telemetry.cv.feedback_v - 6.0).abs() < 1e-4);
+        assert!(telemetry.cv.bytebus_v[0] > 5.0);
+        assert!(telemetry.cv.bytebus_v[1] < 5.0);
+        assert!(telemetry.cv.bytebus_v[2] > 5.0);
+    }
+            }

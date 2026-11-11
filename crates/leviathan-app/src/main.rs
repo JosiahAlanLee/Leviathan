@@ -1,6 +1,7 @@
 mod audio;
 mod gpu_view;
 mod master_ui;
+mod inspector_ui;
 mod project;
 mod sampler_ui;
 mod session_ui;
@@ -12,9 +13,10 @@ use std::sync::Arc;
 
 use eframe::egui;
 use gpu_view::FeedbackViewport;
+use inspector_ui::{InspectorEdits, LANE_NAMES};
 use leviathan_core::{
-    CvFrame, EngineConfig, FillCondition, LaunchTarget, NoteCell, Pattern, PatternChain, SongPlayer,
-    SongStatus, SoundLock, NUM_LANES, ROWS_PER_PATTERN,
+    CvFrame, EngineConfig, FillCondition, LaunchTarget, NoteCell, Pattern, PatternChain,
+    SongPlayer, SongStatus, SoundLock, NUM_LANES, ROWS_PER_PATTERN,
 };
 use leviathan_dsp::{MachineKind, MasterPeaks};
 
@@ -24,53 +26,6 @@ use sampler_ui::{BankAction, SamplerBankUi};
 use session_ui::{ArrangementAction, ProjectAction, ProjectUi};
 use tracker_edit::EditHistory;
 use tracker_keys::{PatternSync, SubColumn, TrackerCursor};
-
-const LANE_NAMES: [&str; NUM_LANES] = ["0 KICK", "1 FM4", "2 SUB", "3 AIR", "4 SMPL", "5 ACID"];
-
-const ALL_MACHINES: [MachineKind; 7] = [
-    MachineKind::KickDrum,
-    MachineKind::FourOpFm,
-    MachineKind::SubBass,
-    MachineKind::NoiseWash,
-    MachineKind::VarSampler,
-    MachineKind::AcidLead,
-    MachineKind::ChordStab,
-];
-
-fn param_labels(machine: MachineKind) -> [&'static str; 8] {
-    match machine {
-        MachineKind::VarSampler => [
-            "P0 Decay",
-            "P1 ChipClk",
-            "P2 Cutoff",
-            "P3 WaveBank",
-            "P4 LpStart",
-            "P5 LpWindow",
-            "P6 LpScan",
-            "P7 Mode/Bit",
-        ],
-        MachineKind::FourOpFm => [
-            "P0 Decay",
-            "P1 FmIndex",
-            "P2 Cutoff",
-            "P3 Alg(0-3)",
-            "P4 C:M Ratio",
-            "P5 ModDecay",
-            "P6 Op4 Fbk",
-            "P7 Detune",
-        ],
-        _ => [
-            "P0 Decay",
-            "P1 Drive",
-            "P2 Cutoff",
-            "P3 Aux3",
-            "P4 Aux4",
-            "P5 Aux5",
-            "P6 Aux6",
-            "P7 Aux7",
-        ],
-    }
-}
 
 fn starter_electro_pattern() -> Pattern {
     let mut pat = Pattern::default();
@@ -317,12 +272,80 @@ impl LeviathanApp {
         }
     }
 
+    fn record_inspector_undo_once(&mut self, ctx: &egui::Context, selected: usize) {
+        if !self.inspector_drag_recorded {
+            self.histories[selected].record_before_edit(&self.patterns[selected]);
+            if ctx.input(|i| i.pointer.any_down()) {
+                self.inspector_drag_recorded = true;
+            }
+        }
+    }
+
+    fn apply_inspector_edits(
+        &mut self,
+        ctx: &egui::Context,
+        selected: usize,
+        lane: usize,
+        row: usize,
+        edits: InspectorEdits,
+    ) {
+        if edits.cell.is_none()
+            && edits.automation.is_none()
+            && edits.pattern_length.is_none()
+            && edits.pattern_rate.is_none()
+        {
+            return;
+        }
+        self.record_inspector_undo_once(ctx, selected);
+
+        let mut full_sync = false;
+        if let Some(len) = edits.pattern_length {
+            self.patterns[selected].length = len.clamp(1, ROWS_PER_PATTERN);
+            if self.cursor.row >= self.patterns[selected].length {
+                self.cursor.row = self.patterns[selected].length - 1;
+            }
+            full_sync = true;
+        }
+        if let Some(rate) = edits.pattern_rate {
+            self.patterns[selected].rate = rate;
+            full_sync = true;
+        }
+        if let Some(cell) = edits.cell {
+            self.patterns[selected].lanes[lane][row] = cell;
+            if !full_sync {
+                self.send_audio(AudioCommand::SetCell {
+                    pattern: selected,
+                    lane,
+                    row,
+                    cell,
+                });
+            }
+        }
+        if let Some(automation) = edits.automation {
+            self.patterns[selected].automation[row] = automation;
+            if !full_sync {
+                self.send_audio(AudioCommand::SetAutomation {
+                    pattern: selected,
+                    row,
+                    automation,
+                });
+            }
+        }
+        if full_sync {
+            self.push_full_pattern(selected);
+        }
+    }
+
     fn apply_arrangement_action(&mut self, action: ArrangementAction) {
         let index = self.selected_pattern;
         match action {
             ArrangementAction::Select(index) => self.select_pattern(index),
             ArrangementAction::AddPattern { clone } => {
-                let pattern = if clone { self.patterns[index].clone() } else { Pattern::default() };
+                let pattern = if clone {
+                    self.patterns[index].clone()
+                } else {
+                    Pattern::default()
+                };
                 let next = self.patterns.len();
                 self.patterns.push(pattern);
                 self.histories.push(EditHistory::default());
@@ -388,7 +411,10 @@ impl LeviathanApp {
         self.inspector_drag_recorded = false;
         self.cursor = TrackerCursor::default();
         self.latest_cv = CvFrame::default();
-        self.latest_song = SongStatus { pattern: self.selected_pattern, ..SongStatus::default() };
+        self.latest_song = SongStatus {
+            pattern: self.selected_pattern,
+            ..SongStatus::default()
+        };
         self.send_audio(AudioCommand::ReplaceProject(prepared));
     }
 }
@@ -410,7 +436,12 @@ impl eframe::App for LeviathanApp {
             .show(ctx, |ui| {
                 let file = self.project_ui.toolbar(ui);
                 let arrangement = session_ui::draw_arrangement(
-                    ui, &self.patterns, self.selected_pattern, &self.chain, self.latest_song, self.playing,
+                    ui,
+                    &self.patterns,
+                    self.selected_pattern,
+                    &self.chain,
+                    self.latest_song,
+                    self.playing,
                 );
                 (file, arrangement)
             })
@@ -422,6 +453,7 @@ impl eframe::App for LeviathanApp {
                 self.apply_arrangement_action(action);
             }
         }
+
         let selected = self.selected_pattern;
 
         if !ctx.input(|i| i.pointer.any_down()) {
@@ -526,8 +558,11 @@ impl eframe::App for LeviathanApp {
         });
 
         let (sel_lane, sel_row) = (self.cursor.lane, self.cursor.row);
-        let mut edit_cell = self.patterns[selected].lanes[sel_lane][sel_row];
-        let mut cell_dirty = false;
+        let cur_cell = self.patterns[selected].lanes[sel_lane][sel_row];
+        let cur_auto = self.patterns[selected].automation[sel_row];
+        let cur_len = self.patterns[selected].length;
+        let cur_rate = self.patterns[selected].rate;
+        let mut inspector_edits = InspectorEdits::default();
 
         egui::SidePanel::right("visual_and_bus_panel")
             .min_width(376.0)
@@ -554,102 +589,13 @@ impl eframe::App for LeviathanApp {
                     bank_actions.extend(self.sampler_ui.draw(ui, hovering_wav));
 
                     ui.separator();
-                    let eff_machine = MachineKind::from_lane_and_lock(sel_lane, &edit_cell.lock);
-                    ui.heading(format!(
-                        "Step Lock — {} Row {:02X} ({})",
-                        LANE_NAMES[sel_lane],
-                        sel_row,
-                        eff_machine.short_name()
-                    ));
-                    ui.small(
-                        "Shift+Arrows/Click select; Ctrl+Z/Y undo/redo; Ctrl+C/X/V; Ctrl+Up/Dn transpose.",
+                    inspector_edits = inspector_ui::draw(
+                        ui, sel_lane, sel_row, cur_cell, cur_auto, cur_len, cur_rate,
                     );
-
-                    ui.horizontal(|ui| {
-                        if ui.checkbox(&mut edit_cell.active, "On").changed() {
-                            cell_dirty = true;
-                        }
-                        if ui.checkbox(&mut edit_cell.air, "Air").changed() {
-                            cell_dirty = true;
-                        }
-                        ui.label("MIDI");
-                        if ui
-                            .add(egui::DragValue::new(&mut edit_cell.midi).range(12..=108))
-                            .changed()
-                        {
-                            cell_dirty = true;
-                        }
-                        ui.label("Vel");
-                        if ui
-                            .add(egui::DragValue::new(&mut edit_cell.velocity).range(1..=127))
-                            .changed()
-                        {
-                            cell_dirty = true;
-                        }
-                    });
-
-                    ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .selectable_label(edit_cell.lock.machine < 0, "Lane")
-                            .clicked()
-                        {
-                            edit_cell.lock.machine = -1;
-                            cell_dirty = true;
-                        }
-                        for m in ALL_MACHINES {
-                            let code = m as i16;
-                            if ui
-                                .selectable_label(edit_cell.lock.machine == code, m.short_name())
-                                .clicked()
-                            {
-                                edit_cell.lock.machine = code;
-                                cell_dirty = true;
-                            }
-                        }
-                    });
-
-                    let labels = param_labels(eff_machine);
-                    for (slot, &name) in labels.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            let mut locked = ((edit_cell.lock.mask >> slot) & 1) != 0;
-                            if ui.checkbox(&mut locked, "").changed() {
-                                if locked {
-                                    edit_cell.lock.mask |= 1 << slot;
-                                } else {
-                                    edit_cell.lock.mask &= !(1 << slot);
-                                }
-                                cell_dirty = true;
-                            }
-                            if ui
-                                .add(
-                                    egui::Slider::new(&mut edit_cell.lock.values[slot], 0.0..=1.0)
-                                        .text(name),
-                                )
-                                .changed()
-                            {
-                                edit_cell.lock.mask |= 1 << slot;
-                                cell_dirty = true;
-                            }
-                        });
-                    }
                 });
             });
 
-        if cell_dirty {
-            if !self.inspector_drag_recorded {
-                self.histories[selected].record_before_edit(&self.patterns[selected]);
-                if ctx.input(|i| i.pointer.any_down()) {
-                    self.inspector_drag_recorded = true;
-                }
-            }
-            self.patterns[selected].lanes[sel_lane][sel_row] = edit_cell;
-            self.send_audio(AudioCommand::SetCell {
-                pattern: selected,
-                lane: sel_lane,
-                row: sel_row,
-                cell: edit_cell,
-            });
-        }
+        self.apply_inspector_edits(ctx, selected, sel_lane, sel_row, inspector_edits);
 
         for action in bank_actions {
             let cmd = match action {
@@ -738,6 +684,7 @@ impl eframe::App for LeviathanApp {
             let cur_col = self.cursor.column;
             let scroll_to_cursor = self.cursor.moved_this_frame;
             let sel_rect = self.cursor.active_rect();
+            let pat_len = self.patterns[selected].length;
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 egui::Grid::new("score_v3_grid")
@@ -760,12 +707,15 @@ impl eframe::App for LeviathanApp {
                             } else {
                                 format!("  {:02X}", row)
                             };
-                            ui.monospace(row_prefix);
+                            let mut row_rt = egui::RichText::new(row_prefix).monospace();
+                            if row >= pat_len {
+                                row_rt = row_rt.color(egui::Color32::from_rgb(90, 95, 105));
+                            }
+                            ui.label(row_rt);
 
                             for lane in 0..NUM_LANES {
                                 let cell = self.patterns[selected].lanes[lane][row];
-                                let has_lock = cell.lock.mask != 0 || cell.lock.machine >= 0;
-                                let mark = if has_lock { '*' } else { ' ' };
+                                let mark = inspector_ui::step_marker(&cell);
                                 let note_str = if cell.active {
                                     if cell.air {
                                         format!("AIR{mark}")
@@ -792,6 +742,8 @@ impl eframe::App for LeviathanApp {
                                 let mut note_rt = egui::RichText::new(note_str).monospace().color(
                                     if in_block {
                                         egui::Color32::from_rgb(245, 250, 255)
+                                    } else if row >= pat_len {
+                                        egui::Color32::from_rgb(90, 95, 105)
                                     } else if cell.active {
                                         egui::Color32::from_rgb(220, 235, 255)
                                     } else {
@@ -801,6 +753,8 @@ impl eframe::App for LeviathanApp {
                                 let mut vel_rt = egui::RichText::new(vel_str).monospace().color(
                                     if in_block {
                                         egui::Color32::from_rgb(175, 240, 205)
+                                    } else if row >= pat_len {
+                                        egui::Color32::from_rgb(80, 85, 95)
                                     } else if cell.active {
                                         egui::Color32::from_rgb(130, 215, 175)
                                     } else {
@@ -822,7 +776,8 @@ impl eframe::App for LeviathanApp {
                                         self.cursor.select(lane, row, SubColumn::Note, shift_held);
                                     }
                                     if r_note.double_clicked() {
-                                        self.histories[selected].record_before_edit(&self.patterns[selected]);
+                                        self.histories[selected]
+                                            .record_before_edit(&self.patterns[selected]);
                                         let target = &mut self.patterns[selected].lanes[lane][row];
                                         target.active = !target.active;
                                         let updated = *target;
@@ -867,7 +822,7 @@ fn main() -> eframe::Result<()> {
         ..eframe::NativeOptions::default()
     };
     eframe::run_native(
-        "Leviathan — Rust A/V Tracker",
+        "Leviathan -- Rust A/V Tracker",
         options,
         Box::new(|cc| Ok(Box::new(LeviathanApp::new(cc)))),
     )
@@ -880,12 +835,21 @@ mod tests {
     use leviathan_core::PlaybackRate;
 
     fn key(key: Key, modifiers: Modifiers) -> Event {
-        Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+        Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
     }
 
     fn frame(ctx: &egui::Context, app: &mut LeviathanApp, events: Vec<Event>) {
         let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 840.0))),
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 840.0),
+            )),
             events,
             ..egui::RawInput::default()
         };
@@ -901,8 +865,15 @@ mod tests {
 
     #[test]
     fn save_and_open_shortcuts_restore_the_tracker_session() {
-        let path = std::env::temp_dir().join(format!("leviathan-ui-{}.leviathan.json", std::process::id()));
-        let cmd = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
+        let path = std::env::temp_dir().join(format!(
+            "leviathan-ui-{}.leviathan.json",
+            std::process::id()
+        ));
+        let cmd = Modifiers {
+            ctrl: true,
+            command: true,
+            ..Modifiers::NONE
+        };
         let ctx = egui::Context::default();
         let mut app = offline_app(&ctx);
         app.apply_arrangement_action(ArrangementAction::AppendToChain);
@@ -913,7 +884,14 @@ mod tests {
 
         frame(&ctx, &mut app, vec![key(Key::S, cmd)]);
         assert!(app.project_ui.dialog_open());
-        frame(&ctx, &mut app, vec![key(Key::A, cmd), Event::Text(path.to_string_lossy().into_owned())]);
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                key(Key::A, cmd),
+                Event::Text(path.to_string_lossy().into_owned()),
+            ],
+        );
         frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
         assert!(!app.project_ui.dialog_open());
         assert!(path.is_file());
@@ -923,7 +901,11 @@ mod tests {
         let mut app = offline_app(&ctx);
         frame(&ctx, &mut app, vec![key(Key::O, cmd)]);
         assert!(app.project_ui.dialog_open());
-        frame(&ctx, &mut app, vec![Event::Text(path.to_string_lossy().into_owned())]);
+        frame(
+            &ctx,
+            &mut app,
+            vec![Event::Text(path.to_string_lossy().into_owned())],
+        );
         frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
         std::fs::remove_file(path).unwrap();
         assert_eq!(app.selected_pattern, 1);
@@ -932,4 +914,4 @@ mod tests {
         assert_eq!(app.master_send, 0.35);
         assert!(!app.playing);
     }
-}
+                                    }

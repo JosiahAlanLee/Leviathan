@@ -41,7 +41,7 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
 - **Acceptance**: Core and callback tests cover mixed-rate launches, repeated chain entries, tempo continuity, and the first note and automation value of the incoming pattern.
 
 ### `T4` — Step Conditions (`Prob`, `Fill`, `Gate`, `Rate`) & Visual Automation Inspector
-- **Status**: `OPEN`
+- **Status**: `DONE` (implemented `inspector_ui.rs` with step `Prob`/`Fill`/`Gate`, pattern `Rows`/`Rate`, per-row `VisualAutomation` + `ByteBus` bit toggles, and lock-free `AudioCommand::SetAutomation`)
 - **Owned Files**: new `crates/leviathan-app/src/inspector_ui.rs`, `crates/leviathan-app/src/main.rs`
 - **Goal**: Expose the Score v3 fields already evaluated by `leviathan-core` that aren't yet editable in the right-hand panel: `NoteCell.probability` (`0..=100%`), `NoteCell.fill` (`Always`, `WhenFill`, `WhenNotFill`), `NoteCell.gate_fraction`, lane clock rate multipliers, and per-row `VisualAutomation` (`z`, `roll`, `feedback`, `bytebus`).
 - **Scope & Constraints**:
