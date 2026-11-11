@@ -1,0 +1,14 @@
+[package]
+name = "leviathan-dsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Zero-allocation no_std internal synthesis rack and ByteBus logic for Leviathan"
+
+[features]
+default = ["std"]
+std = ["leviathan-core/std"]
+
+[dependencies]
+leviathan-core = { workspace = true }
