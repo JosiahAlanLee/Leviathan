@@ -51,7 +51,7 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
   - All `NoteCell` conditional fields and row `VisualAutomation` values are editable in UI and reflected in live `CvFrame` telemetry; 0 warnings.
 
 ### `T5` — `#![no_std]` Stereo Master Bus (Delay, Soft-Clip Limiter & Peak Telemetry)
-- **Status**: `IN REVIEW` (implementation `2bb4cb8`)
+- **Status**: `DONE (merged in PR #2 — fixed-size #![no_std] stereo delay, DC blocker, linked soft-knee limiter, and L/R peak + CLIP meters)`
 - **Owned Files**: new `crates/leviathan-dsp/src/master.rs`, `crates/leviathan-dsp/src/lib.rs`, transport meter readout in `crates/leviathan-app/src/main.rs`
 - **Goal**: Add glue, spatial width, and overload protection to `SynthRack::render_stereo` without heap allocation.
 - **Scope & Constraints**:
@@ -62,7 +62,7 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
   - `no_std` check passes (`cargo check -p leviathan-dsp --no-default-features`), unit test verifies bounded `[-1.0, 1.0]` output under hot 6-lane chord input, and 0 warnings.
 
 ### `T6` — Non-Blocking `SoundLinkPacket` Loopback UDP Bridge
-- **Status**: `OPEN`
+- **Status**: `DONE (implemented safe little-endian 336-byte SoundLinkPacket non-blocking loopback UDP sender in link.rs with transport LINK toggle/port and loopback unit tests)`
 - **Owned Files**: new `crates/leviathan-app/src/link.rs`, toggle in `crates/leviathan-app/src/main.rs`
 - **Goal**: Broadcast the existing 336-byte `#[repr(C)]` `SoundLinkPacket` (`leviathan-core`) over loopback UDP for external shader/hardware receivers without touching the `cpal` thread.
 - **Scope & Constraints**:
