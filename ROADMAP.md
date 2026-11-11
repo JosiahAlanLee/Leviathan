@@ -12,7 +12,7 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
 - [x] **M9**: 64-step `EditHistory` (`Ctrl+Z`/`Ctrl+Y`/`Ctrl+Shift+Z`), `Shift+Arrows`/`Shift+Click`/`Ctrl+A` block selection, `Ctrl+C`/`X`/`V` block copy/cut/paste, `±1`/`±12` semitone transpose (`Ctrl+Up`/`Down`), and lock-free `AudioCommand::SetPattern` sync (`tracker_edit.rs`, `tracker_keys.rs`, `main.rs`).
 - [x] **T1**: Hardware `wgpu` ping-pong feedback render pipeline (`gpu_view.rs`).
 
-## Active Backlog (Scoped for Multi-Agent Handoff)
+## Wave 1 Completed Tickets (T1–T6)
 
 ### `T1` — Hardware `wgpu` Ping-Pong Feedback Render Pipeline
 - **Status**: `DONE` (implemented 640x360 `Rgba8Unorm` ping-pong `wgpu` pipeline in `gpu_view.rs` with native `egui_wgpu` texture swap and automatic `FeedbackSurface` CPU fallback)
@@ -69,3 +69,52 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
   - Never perform socket calls on the `cpal` audio thread; forward telemetry over a lock-free ring or UI-thread poller to a non-blocking `std::net::UdpSocket` sender.
 - **Acceptance Criteria**:
   - Loopback UDP unit test verifying a 336-byte packet encodes, transmits, and validates magic/version headers cleanly; 0 warnings.
+## Wave 2 Active Backlog (T7–T10 — Scoped for Multi-Agent Handoff)
+
+**Recommended Parallel Split**:
+- `T8` (`export.rs` / `wav.rs`) and `T10` (`leviathan-gpu` / `gpu_view.rs`) own nearly disjoint subsystems and can run in parallel across branches with minimal merge overlap.
+- `T7` (`SynthRack` / `audio.rs` mute-solo) and `T9` (`midi.rs` / `Cargo.toml` / `audio.rs`) both hook into `audio.rs` and `main.rs`, so run them sequentially or rebase cleanly.
+
+### `T7` — Lock-Free Per-Lane Mute & Solo Controls (`M` / `S` Toggles & Shortcuts)
+- **Status**: `OPEN`
+- **Owned Files**: `crates/leviathan-dsp/src/lib.rs`, `crates/leviathan-app/src/audio.rs`, `crates/leviathan-app/src/tracker_keys.rs`, `crates/leviathan-app/src/project.rs`, `crates/leviathan-app/src/main.rs`
+- **Goal**: Add instant per-lane `Mute` (`M`) and `Solo` (`S`) controls in the 6-lane tracker header plus keyboard shortcuts (`Alt+1`..`Alt+6` mute lane, `Alt+Shift+1`..`Alt+Shift+6` solo lane, `Alt+0` clear all) without audio clicks.
+- **Scope & Constraints**:
+  - Compute a 6-bit `audible_mask: u8` (default `0b0011_1111`; when any lane is soloed, only soloed unmuted lanes remain audible) and send zero-allocation `AudioCommand::SetLaneAudibleMask(u8)` over `rtrb`.
+  - Apply smooth per-lane gain ramping (`~3–5 ms` one-pole slew) inside `SynthRack` (`#![no_std]`) so muting/soloing a sustained bass or FM voice never produces a discontinuity click.
+  - Persist `mute_mask: u8` and `solo_mask: u8` in `.leviathan.json` using `#[serde(default)]` so older projects open with all 6 lanes unmuted.
+- **Acceptance Criteria**:
+  - Unit tests covering mute/solo mask precedence, click-free/bounded `SynthRack` gain slew, and `#[serde(default)]` project round-trip; 0 compiler warnings.
+
+### `T8` — Clean-Room Offline WAV Bounce & Per-Lane Stem Export
+- **Status**: `OPEN`
+- **Owned Files**: new `crates/leviathan-app/src/export.rs`, `crates/leviathan-app/src/wav.rs`, export dialog/button hook in `crates/leviathan-app/src/session_ui.rs` and `crates/leviathan-app/src/main.rs`
+- **Goal**: Bounce the selected `Pattern` or full `PatternChain` faster-than-realtime to stereo RIFF/WAV files (`16-bit PCM` or `32-bit IEEE float`, selectable `44.1` / `48` / `96 kHz` sample rate, loop count, and delay-tail seconds), with an optional 6-lane stem export mode.
+- **Scope & Constraints**:
+  - Implement a clean-room RIFF/WAV encoder in `wav.rs` / `export.rs` (zero extra crate dependencies, matching the clean-room WAV decoder in `wav.rs`) with atomic temp-file writes.
+  - Run offline rendering on an isolated `SongPlayer` + `SynthRack` instance (cloned from current patterns, chain, BPM, `master_send`, and `SampleBank`) on a background `std::thread` with atomic progress reporting so live `cpal` audio and `egui` frames never stall.
+  - In stem mode, write individual lane files (`0-kick` through `5-acid`) plus the master bus mix.
+- **Acceptance Criteria**:
+  - Round-trip unit test rendering a multi-lane pattern to both `16-bit PCM` and `32-bit float` WAV bytes and decoding them back via `wav::decode_wav_bytes` with verified frame counts, sample rates, and non-silent peaks; 0 compiler warnings.
+
+### `T9` — External MIDI Input (Live Audition, Step Record & MIDI Transport)
+- **Status**: `OPEN`
+- **Owned Files**: `Cargo.toml`, `crates/leviathan-app/Cargo.toml`, new `crates/leviathan-app/src/midi.rs`, `crates/leviathan-app/src/audio.rs`, `crates/leviathan-app/src/main.rs`
+- **Goal**: Support hardware/virtual MIDI input ports (`midir`) for live voice audition on the active lane, step-record note/velocity entry into the tracker grid, and MIDI `Start` (`0xFA`) / `Continue` (`0xFB`) / `Stop` (`0xFC`) transport sync.
+- **Scope & Constraints**:
+  - Keep `leviathan-core` and `leviathan-dsp` strictly `#![no_std]` with zero MIDI crate dependencies (`AGENTS.md` hexagonal boundary).
+  - Never lock a `Mutex` inside the `midir` input callback: parse raw 1–3 byte MIDI messages (`NoteOn`, `NoteOff` including `NoteOn` with velocity `0`, and `0xFA`/`0xFB`/`0xFC` real-time transport) into a small `Copy` `MidiEvent` pushed over a bounded `rtrb::RingBuffer`.
+  - Support live note audition on `RtAudioWorker` when stopped or playing, and degrade cleanly with `"MIDI: No ports"` when no MIDI hardware/ALSA sequencer is available (headless CI on Linux, macOS, and Windows).
+- **Acceptance Criteria**:
+  - Unit tests for the clean-room MIDI byte parser (`NoteOn`, `vel=0` `NoteOff`, `Start`/`Stop`, ignored SysEx/malformed bytes) and headless port-enumeration fallback; 0 compiler warnings across all 3 OS runners.
+
+### `T10` — Custom User WGSL Shader Loading, Validation & Live Hot-Reload
+- **Status**: `OPEN`
+- **Owned Files**: `crates/leviathan-gpu/src/lib.rs`, `crates/leviathan-app/src/gpu_view.rs`, `crates/leviathan-app/src/project.rs`, `crates/leviathan-app/src/main.rs`
+- **Goal**: Allow users to drop or open custom `.wgsl` fragment shaders (matching Leviathan's 64-byte `VisualUniforms` + `prev_tex` + `prev_sampler` `@group(0)` ABI), automatically hot-reload when the `.wgsl` file's modification timestamp changes on disk, and keep the previous working pipeline alive if a shader edit fails validation.
+- **Scope & Constraints**:
+  - Route `.wgsl` file drag-and-drop events to `FeedbackViewport` while keeping `.wav` drops routed to `SamplerBankUi`.
+  - Guard custom shader compilation with `wgpu` validation error scopes (`push_error_scope(wgpu::ErrorFilter::Validation)` / `pop_error_scope`) or pre-flight entry-point checks so syntax/type errors while live-coding **never panic the app**—display the shader error banner in the side panel while continuing to render the last valid shader.
+  - Add `"Export Starter .wgsl"` and `"Reset Built-In Shader"` buttons, and persist optional custom shader source/path in `.leviathan.json` via `#[serde(default)]`.
+- **Acceptance Criteria**:
+  - Unit tests verifying starter WGSL template ABI markers, `.wgsl` vs `.wav` drop routing, fallback retention on invalid shader input, and `#[serde(default)]` project round-trip; 0 compiler warnings.
