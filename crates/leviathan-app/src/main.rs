@@ -335,22 +335,22 @@ impl eframe::App for LeviathanApp {
             self.latest_cv = ev.step_sample(&self.pattern);
         }
 
-        let uniforms = VisualUniforms::from_cv(
+                let surf_w = self.surface.width;
+                let surf_h = self.surface.height;
+                let uniforms = VisualUniforms::from_cv(
             &self.latest_cv,
             self.frame_index,
-            self.surface.width as u32,
-            self.surface.height as u32,
+            surf_w as u32,
+            surf_h as u32,
         );
         self.frame_index = self.frame_index.wrapping_add(1);
         let rgba = self.surface.step(&uniforms);
-        let color_img = egui::ColorImage::from_rgba_unmultiplied(
-            [self.surface.width, self.surface.height],
-            rgba,
-        );
+                let color_img = egui::ColorImage::from_rgba_unmultiplied([surf_w, surf_h], rgba);
         let tex = self.preview_tex.get_or_insert_with(|| {
             ctx.load_texture("feedback_surface", color_img.clone(), egui::TextureOptions::LINEAR)
         });
-        tex.set(color_img, egui::TextureOptions::LINEAR);
+                tex.set(color_img, egui::TextureOptions::LINEAR);
+        let tex_id = tex.id();
 
         egui::TopBottomPanel::top("transport_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -398,7 +398,7 @@ impl eframe::App for LeviathanApp {
             .min_width(360.0)
             .show(ctx, |ui| {
                 ui.heading("Live Feedback Surface");
-                ui.image((tex.id(), egui::vec2(344.0, 194.0)));
+                ui.image((tex_id, egui::vec2(344.0, 194.0)));
                 ui.separator();
                 ui.heading("CV & Automation");
                 ui.monospace(format!(
