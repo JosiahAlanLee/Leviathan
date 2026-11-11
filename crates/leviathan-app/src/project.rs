@@ -5,9 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use leviathan_core::{Pattern, PatternChain, MAX_CHAIN_ENTRIES, ROWS_PER_PATTERN};
-use leviathan_dsp::sampler::{MAX_WAVE_LEN, NUM_BANKS};
+use leviathan_dsp::sampler::{SampleBank, MAX_WAVE_LEN, NUM_BANKS};
 use serde::{Deserialize, Serialize};
 
+use crate::lane_mix::LaneMix;
 use crate::wav::{sample_peaks, DecodedWav};
 
 pub const PATTERN_BANK_CAPACITY: usize = 16;
@@ -17,10 +18,23 @@ const MAX_PROJECT_BYTES: u64 = 8 * 1024 * 1024;
 pub struct Project {
     pub bpm: f64,
     pub master_send: f32,
+    pub lane_mix: LaneMix,
     pub patterns: Vec<Pattern>,
     pub selected_pattern: usize,
     pub chain: PatternChain,
     pub samples: [Option<DecodedWav>; NUM_BANKS],
+}
+
+impl Project {
+    pub fn sample_bank(&self) -> SampleBank {
+        let mut bank = SampleBank::new();
+        for (index, sample) in self.samples.iter().enumerate() {
+            if let Some(sample) = sample {
+                bank.load_pcm_with_rate(index, &sample.samples, sample.c4_rate_hz);
+            }
+        }
+        bank
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -29,6 +43,8 @@ struct ProjectFile {
     bpm: f64,
     #[serde(default)]
     master_send: f32,
+    #[serde(flatten)]
+    lane_mix: LaneMix,
     patterns: Vec<Pattern>,
     selected_pattern: usize,
     chain: Vec<u8>,
@@ -89,6 +105,9 @@ impl ProjectFile {
         if !(0.0..=1.0).contains(&self.master_send) {
             return Err("Master delay send must be between 0 and 1".to_string());
         }
+        if !self.lane_mix.is_valid() {
+            return Err("Invalid lane mute or solo mask".to_string());
+        }
         if !(1..=PATTERN_BANK_CAPACITY).contains(&self.patterns.len())
             || self.selected_pattern >= self.patterns.len()
         {
@@ -119,6 +138,7 @@ impl ProjectFile {
         Ok(Project {
             bpm: self.bpm,
             master_send: self.master_send,
+            lane_mix: self.lane_mix,
             patterns: self.patterns,
             selected_pattern: self.selected_pattern,
             chain,
@@ -169,23 +189,18 @@ pub fn load(path: &Path) -> Result<Project, String> {
     file.into_project()
 }
 
-pub fn save(
-    path: &Path,
-    bpm: f64,
-    master_send: f32,
-    patterns: &[Pattern],
-    selected_pattern: usize,
-    chain: &PatternChain,
-    samples: &[Option<DecodedWav>; NUM_BANKS],
-) -> Result<(), String> {
+pub fn save(path: &Path, project: Project) -> Result<(), String> {
     let project = ProjectFile {
         version: PROJECT_VERSION,
-        bpm,
-        master_send,
-        patterns: patterns.to_vec(),
-        selected_pattern,
-        chain: chain.as_slice().to_vec(),
-        sample_banks: core::array::from_fn(|bank| samples[bank].as_ref().map(SampleFile::from)),
+        bpm: project.bpm,
+        master_send: project.master_send,
+        lane_mix: project.lane_mix,
+        patterns: project.patterns,
+        selected_pattern: project.selected_pattern,
+        chain: project.chain.as_slice().to_vec(),
+        sample_banks: core::array::from_fn(|bank| {
+            project.samples[bank].as_ref().map(SampleFile::from)
+        }),
     };
     let mut bytes = serde_json::to_vec(&project).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
@@ -263,14 +278,28 @@ mod tests {
             peaks: sample_peaks(&pcm),
             samples: Arc::clone(&pcm),
         });
-        save(&path, 120.0, 0.0, &patterns, 0, &chain, &samples).unwrap();
+        let snapshot = |bpm, master_send, selected_pattern, lane_mix| Project {
+            bpm,
+            master_send,
+            lane_mix,
+            selected_pattern,
+            chain,
+            patterns: patterns.to_vec(),
+            samples: samples.clone(),
+        };
+        save(&path, snapshot(120.0, 0.0, 0, LaneMix::default())).unwrap();
         let bpm = f64::from_bits(120.0_f64.to_bits() + 1);
         let send = 0.37_f32;
-        save(&path, bpm, send, &patterns, 1, &chain, &samples).unwrap();
+        let mix = LaneMix {
+            mute_mask: 0b10,
+            solo_mask: 0b1010,
+        };
+        save(&path, snapshot(bpm, send, 1, mix)).unwrap();
         let project = load(&path).unwrap();
         fs::remove_file(path).unwrap();
         assert_eq!(project.bpm.to_bits(), bpm.to_bits());
         assert_eq!(project.master_send.to_bits(), send.to_bits());
+        assert_eq!(project.lane_mix, mix);
         assert_eq!(project.selected_pattern, 1);
         assert_eq!(project.chain, chain);
         for (original, loaded) in patterns.iter().zip(&project.patterns) {
@@ -297,6 +326,7 @@ mod tests {
             version: PROJECT_VERSION + 1,
             bpm: 120.0,
             master_send: 0.0,
+            lane_mix: LaneMix::default(),
             patterns: vec![Pattern::default()],
             selected_pattern: 0,
             chain: vec![1],
@@ -322,6 +352,7 @@ mod tests {
             version: PROJECT_VERSION,
             bpm: 120.0,
             master_send: 0.0,
+            lane_mix: LaneMix::default(),
             patterns: vec![pat],
             selected_pattern: 0,
             chain: vec![],
@@ -332,20 +363,32 @@ mod tests {
     }
 
     #[test]
-    fn older_projects_default_to_dry_and_invalid_send_is_rejected() {
+    fn older_projects_default_to_dry_and_unmuted() {
         let project = ProjectFile {
             version: PROJECT_VERSION,
             bpm: 120.0,
             master_send: 0.5,
+            lane_mix: LaneMix {
+                mute_mask: 1,
+                solo_mask: 2,
+            },
             patterns: vec![Pattern::default()],
             selected_pattern: 0,
             chain: vec![],
             sample_banks: core::array::from_fn(|_| None),
         };
         let mut json = serde_json::to_value(project).unwrap();
-        json.as_object_mut().unwrap().remove("master_send");
+        let fields = json.as_object_mut().unwrap();
+        for field in ["master_send", "mute_mask", "solo_mask"] {
+            assert!(fields.remove(field).is_some());
+        }
         let old: ProjectFile = serde_json::from_value(json.clone()).unwrap();
-        assert_eq!(old.into_project().unwrap().master_send, 0.0);
+        let old = old.into_project().unwrap();
+        assert_eq!(old.master_send, 0.0);
+        assert_eq!(old.lane_mix, LaneMix::default());
+        json["solo_mask"] = serde_json::json!(0x80);
+        assert!(project_error(&json).contains("mute or solo mask"));
+        json["solo_mask"] = serde_json::json!(0);
         json["master_send"] = serde_json::json!(1.25);
         assert!(project_error(&json).contains("Master delay send"));
     }

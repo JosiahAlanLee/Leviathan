@@ -1,3 +1,4 @@
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -193,6 +194,109 @@ pub fn sample_peaks(pcm: &[i16]) -> [f32; 64] {
     }
 
     peaks
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WavEncoding {
+    Pcm16,
+    Float32,
+}
+
+impl WavEncoding {
+    fn bits(self) -> u16 {
+        match self {
+            Self::Pcm16 => 16,
+            Self::Float32 => 32,
+        }
+    }
+
+    fn riff_overhead(self) -> u32 {
+        match self {
+            Self::Pcm16 => 36,
+            Self::Float32 => 50,
+        }
+    }
+
+    fn frame_bytes(self) -> u16 {
+        self.bits() / 8 * 2
+    }
+
+    pub fn max_frames(self) -> u32 {
+        (u32::MAX - self.riff_overhead()) / u32::from(self.frame_bytes())
+    }
+}
+
+pub struct StereoWav<W: Write> {
+    writer: W,
+    encoding: WavEncoding,
+    remaining: u32,
+}
+
+impl<W: Write> StereoWav<W> {
+    pub fn new(mut writer: W, encoding: WavEncoding, rate: u32, frames: u32) -> io::Result<Self> {
+        if frames > encoding.max_frames() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Export exceeds RIFF/WAV size"));
+        }
+        let block_align = encoding.frame_bytes();
+        let byte_rate = rate
+            .checked_mul(u32::from(block_align))
+            .filter(|&bytes| bytes > 0)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid WAV sample rate"))?;
+        let data_size = frames * u32::from(block_align);
+        let float = encoding == WavEncoding::Float32;
+        let format_tag = if float { 3_u16 } else { 1_u16 };
+        let format_size = if float { 18_u32 } else { 16_u32 };
+
+        writer.write_all(b"RIFF")?;
+        writer.write_all(&(encoding.riff_overhead() + data_size).to_le_bytes())?;
+        writer.write_all(b"WAVEfmt ")?;
+        writer.write_all(&format_size.to_le_bytes())?;
+        writer.write_all(&format_tag.to_le_bytes())?;
+        writer.write_all(&2_u16.to_le_bytes())?;
+        writer.write_all(&rate.to_le_bytes())?;
+        writer.write_all(&byte_rate.to_le_bytes())?;
+        writer.write_all(&block_align.to_le_bytes())?;
+        writer.write_all(&encoding.bits().to_le_bytes())?;
+        if float {
+            writer.write_all(&0_u16.to_le_bytes())?;
+            writer.write_all(b"fact")?;
+            writer.write_all(&4_u32.to_le_bytes())?;
+            writer.write_all(&frames.to_le_bytes())?;
+        }
+        writer.write_all(b"data")?;
+        writer.write_all(&data_size.to_le_bytes())?;
+        Ok(Self { writer, encoding, remaining: frames })
+    }
+
+    pub fn write_frame(&mut self, frame: [f32; 2]) -> io::Result<()> {
+        if self.remaining == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Too many WAV frames"));
+        }
+        let [left, right] = frame.map(|s| if s.is_finite() { s } else { 0.0 });
+        let mut bytes = [0; 8];
+        match self.encoding {
+            WavEncoding::Pcm16 => {
+                let pcm16 = |s: f32| (s.clamp(-1.0, 1.0) * 32_768.0).round() as i16;
+                bytes[..2].copy_from_slice(&pcm16(left).to_le_bytes());
+                bytes[2..4].copy_from_slice(&pcm16(right).to_le_bytes());
+            }
+            WavEncoding::Float32 => {
+                bytes[..4].copy_from_slice(&left.to_le_bytes());
+                bytes[4..8].copy_from_slice(&right.to_le_bytes());
+            }
+        }
+        self.writer.write_all(&bytes[..usize::from(self.encoding.frame_bytes())])?;
+        self.remaining -= 1;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> io::Result<W> {
+        if self.remaining != 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "WAV export ended early"));
+        }
+        self.writer.flush()?;
+        Ok(self.writer)
+    }
 }
 
 #[cfg(test)]
