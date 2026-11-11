@@ -177,7 +177,7 @@ impl SamplerBankUi {
             let rect = resp.rect;
             let mid_y = rect.center().y;
             let half_h = rect.height() * 0.44;
-            let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(95, 195, 250));
+                    let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(95, 195, 250));
 
             for (i, &pk) in meta.peaks.iter().enumerate() {
                 let x = rect.left() + (i as f32 + 0.5) * (rect.width() / 64.0);
