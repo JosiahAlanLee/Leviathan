@@ -132,7 +132,10 @@ fn validate_pattern(pattern: &Pattern) -> Result<(), &'static str> {
         {
             return Err("Invalid note cell");
         }
-        if cell.lock.mask > 0xff || cell.lock.values.iter().any(|value| !value.is_finite()) {
+        if !(-1..=6).contains(&cell.lock.machine)
+            || cell.lock.mask > 0xff
+            || cell.lock.values.iter().any(|value| !value.is_finite())
+        {
             return Err("Invalid sound lock");
         }
     }
@@ -297,6 +300,22 @@ mod tests {
             .unwrap()
             .pop();
         assert!(project_error(&json).contains("64 rows"));
+    }
+
+    #[test]
+    fn rejects_out_of_range_sound_lock_machine() {
+        let mut pat = Pattern::default();
+        pat.lanes[0][0].lock.machine = 7;
+        let project = ProjectFile {
+            version: PROJECT_VERSION,
+            bpm: 120.0,
+            patterns: vec![pat],
+            selected_pattern: 0,
+            chain: vec![],
+            sample_banks: core::array::from_fn(|_| None),
+        };
+        let json = serde_json::to_value(&project).unwrap();
+        assert!(project_error(&json).contains("Invalid sound lock"));
     }
 
     fn project_error(json: &serde_json::Value) -> String {
