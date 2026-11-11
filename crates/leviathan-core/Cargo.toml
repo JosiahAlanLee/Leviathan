@@ -1,0 +1,15 @@
+[package]
+name = "leviathan-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Clean-room no_std Score v3, CV, ByteBus, and SoundLink core engine"
+
+[features]
+default = ["std", "serde"]
+std = []
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { workspace = true, optional = true }
