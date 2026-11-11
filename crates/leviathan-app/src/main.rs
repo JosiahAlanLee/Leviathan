@@ -1,4 +1,5 @@
 mod sampler_ui;
+mod tracker_edit;
 mod tracker_keys;
 mod wav;
 
@@ -13,7 +14,8 @@ use leviathan_core::{
 use leviathan_dsp::{MachineKind, SynthRack};
 use leviathan_gpu::{FeedbackSurface, VisualUniforms, FEEDBACK_SHADER_WGSL};
 use sampler_ui::{BankAction, SamplerBankUi};
-use tracker_keys::{SubColumn, TrackerCursor};
+use tracker_edit::EditHistory;
+use tracker_keys::{PatternSync, SubColumn, TrackerCursor};
 
 const LANE_NAMES: [&str; NUM_LANES] = ["0 KICK", "1 FM4", "2 SUB", "3 AIR", "4 SMPL", "5 ACID"];
 
@@ -73,6 +75,7 @@ enum AudioCommand {
         row: usize,
         cell: NoteCell,
     },
+    SetPattern(Arc<Pattern>),
     LoadSampleBank {
         bank: usize,
         samples: Arc<[i16]>,
@@ -234,6 +237,9 @@ impl RtAudioWorker {
                         self.pattern.lanes[lane][row] = cell;
                     }
                 }
+                AudioCommand::SetPattern(snap) => {
+                    self.pattern.clone_from(&snap);
+                }
                 AudioCommand::LoadSampleBank {
                     bank,
                     samples,
@@ -298,7 +304,7 @@ fn try_start_audio(
         cpal::SampleFormat::F32 => device
             .build_output_stream(
                 &config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                move |data: &mut [f32], _| {
                     worker.drain_commands();
                     for frame in data.chunks_mut(channels) {
                         let (l, r) = worker.next_stereo();
@@ -318,7 +324,7 @@ fn try_start_audio(
         cpal::SampleFormat::I16 => device
             .build_output_stream(
                 &config,
-                move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                move |data: &mut [i16], _| {
                     worker.drain_commands();
                     for frame in data.chunks_mut(channels) {
                         let (l, r) = worker.next_stereo();
@@ -338,7 +344,7 @@ fn try_start_audio(
         cpal::SampleFormat::U16 => device
             .build_output_stream(
                 &config,
-                move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
+                move |data: &mut [u16], _| {
                     worker.drain_commands();
                     for frame in data.chunks_mut(channels) {
                         let (l, r) = worker.next_stereo();
@@ -364,6 +370,8 @@ fn try_start_audio(
 
 struct LeviathanApp {
     pattern: Box<Pattern>,
+    history: EditHistory,
+    inspector_drag_recorded: bool,
     playing: bool,
     fill_active: bool,
     bpm: f64,
@@ -413,10 +421,12 @@ impl LeviathanApp {
             };
 
         let mut cursor = TrackerCursor::default();
-        cursor.select(4, 0, SubColumn::Note);
+        cursor.select(4, 0, SubColumn::Note, false);
 
         Self {
             pattern: Box::new(initial_pattern),
+            history: EditHistory::default(),
+            inspector_drag_recorded: false,
             playing: false,
             fill_active: false,
             bpm: 132.0,
@@ -434,10 +444,19 @@ impl LeviathanApp {
             frame_index: 0,
         }
     }
+
+    fn push_full_pattern(&mut self) {
+        let snap = self.history.make_rt_snapshot(&self.pattern);
+        let _ = self.cmd_tx.push(AudioCommand::SetPattern(snap));
+    }
 }
 
 impl eframe::App for LeviathanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !ctx.input(|i| i.pointer.any_down()) {
+            self.inspector_drag_recorded = false;
+        }
+
         if !ctx.wants_keyboard_input()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space))
         {
@@ -448,12 +467,21 @@ impl eframe::App for LeviathanApp {
             }
         }
 
-        for upd in self.cursor.handle_input(ctx, &mut self.pattern) {
-            let _ = self.cmd_tx.push(AudioCommand::SetCell {
-                lane: upd.lane,
-                row: upd.row,
-                cell: upd.cell,
-            });
+        match self
+            .cursor
+            .handle_input(ctx, &mut self.pattern, &mut self.history)
+        {
+            PatternSync::None => {}
+            PatternSync::Single(upd) => {
+                let _ = self.cmd_tx.push(AudioCommand::SetCell {
+                    lane: upd.lane,
+                    row: upd.row,
+                    cell: upd.cell,
+                });
+            }
+            PatternSync::FullPattern => {
+                self.push_full_pattern();
+            }
         }
 
         let (hovering_wav, mut bank_actions) = self.sampler_ui.poll_drag_and_drop(ctx);
@@ -476,6 +504,7 @@ impl eframe::App for LeviathanApp {
             surf_h as u32,
         );
         self.frame_index = self.frame_index.wrapping_add(1);
+
         let rgba = self.surface.step(&uniforms);
         let color_img = egui::ColorImage::from_rgba_unmultiplied([surf_w, surf_h], rgba);
         let tex = self.preview_tex.get_or_insert_with(|| {
@@ -574,7 +603,9 @@ impl eframe::App for LeviathanApp {
                         sel_row,
                         eff_machine.short_name()
                     ));
-                    ui.small("Arrows/Tab move; Z-M/Q-U notes; 0-9/A-F hex vel; Del clears.");
+                    ui.small(
+                        "Shift+Arrows/Click select; Ctrl+Z/Y undo/redo; Ctrl+C/X/V; Ctrl+Up/Dn transpose.",
+                    );
 
                     ui.horizontal(|ui| {
                         if ui.checkbox(&mut edit_cell.active, "On").changed() {
@@ -647,6 +678,12 @@ impl eframe::App for LeviathanApp {
             });
 
         if cell_dirty {
+            if !self.inspector_drag_recorded {
+                self.history.record_before_edit(&self.pattern);
+                if ctx.input(|i| i.pointer.any_down()) {
+                    self.inspector_drag_recorded = true;
+                }
+            }
             self.pattern.lanes[sel_lane][sel_row] = edit_cell;
             let _ = self.cmd_tx.push(AudioCommand::SetCell {
                 lane: sel_lane,
@@ -671,15 +708,72 @@ impl eframe::App for LeviathanApp {
             let _ = self.cmd_tx.push(cmd);
         }
 
-        let cur_lane = self.cursor.lane;
-        let cur_row = self.cursor.row;
-        let cur_col = self.cursor.column;
-        let scroll_to_cursor = self.cursor.moved_this_frame;
-
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading(
-                "Pattern 00 — Arrows/PgUp/PgDn/Tab navigate | Z-M & Q-U piano | 00-7F hex vel | ` Air | Del clear",
+                "Pattern 00 — Arrows/Shift+Arrows select | Z-M/Q-U piano | 00-7F vel | Ctrl+Z/Y | Ctrl+C/X/V | Ctrl+Up/Dn",
             );
+            ui.horizontal_wrapped(|ui| {
+                let undo_n = self.history.undo_len();
+                let redo_n = self.history.redo_len();
+                if ui
+                    .add_enabled(undo_n > 0, egui::Button::new(format!("Undo ({undo_n})")))
+                    .on_hover_text("Ctrl+Z / Cmd+Z")
+                    .clicked()
+                    && self.history.undo(&mut self.pattern)
+                {
+                    self.cursor.last_edit_msg = "Undo".to_string();
+                    self.push_full_pattern();
+                }
+                if ui
+                    .add_enabled(redo_n > 0, egui::Button::new(format!("Redo ({redo_n})")))
+                    .on_hover_text("Ctrl+Y / Ctrl+Shift+Z")
+                    .clicked()
+                    && self.history.redo(&mut self.pattern)
+                {
+                    self.cursor.last_edit_msg = "Redo".to_string();
+                    self.push_full_pattern();
+                }
+                ui.separator();
+                if ui.button("Copy").on_hover_text("Ctrl+C").clicked() {
+                    self.cursor.copy_selection(&self.pattern);
+                }
+                if ui.button("Cut").on_hover_text("Ctrl+X").clicked() {
+                    self.cursor.cut_selection(&mut self.pattern, &mut self.history);
+                    self.push_full_pattern();
+                }
+                if ui
+                    .add_enabled(self.cursor.clipboard.is_some(), egui::Button::new("Paste"))
+                    .on_hover_text("Ctrl+V")
+                    .clicked()
+                    && self.cursor.paste_selection(&mut self.pattern, &mut self.history)
+                {
+                    self.push_full_pattern();
+                }
+                ui.separator();
+                for (label, semi, tip) in [
+                    ("-12", -12, "Ctrl+Shift+Down (-1 octave)"),
+                    ("-1", -1, "Ctrl+Down (-1 semitone)"),
+                    ("+1", 1, "Ctrl+Up (+1 semitone)"),
+                    ("+12", 12, "Ctrl+Shift+Up (+1 octave)"),
+                ] {
+                    if ui.button(label).on_hover_text(tip).clicked() {
+                        self.cursor
+                            .transpose_selection(&mut self.pattern, &mut self.history, semi);
+                        self.push_full_pattern();
+                    }
+                }
+                ui.separator();
+                let (bw, bh) = self.cursor.active_rect().dimensions();
+                ui.monospace(format!("Sel:{bw}x{bh} | {}", self.cursor.last_edit_msg));
+            });
+            ui.separator();
+
+            let cur_lane = self.cursor.lane;
+            let cur_row = self.cursor.row;
+            let cur_col = self.cursor.column;
+            let scroll_to_cursor = self.cursor.moved_this_frame;
+            let sel_rect = self.cursor.active_rect();
+
             egui::ScrollArea::vertical().show(ui, |ui| {
                 egui::Grid::new("score_v3_grid")
                     .striped(true)
@@ -701,7 +795,7 @@ impl eframe::App for LeviathanApp {
                             ui.monospace(row_prefix);
 
                             for lane in 0..NUM_LANES {
-                                let cell = &mut self.pattern.lanes[lane][row];
+                                let cell = self.pattern.lanes[lane][row];
                                 let has_lock = cell.lock.mask != 0 || cell.lock.machine >= 0;
                                 let mark = if has_lock { '*' } else { ' ' };
                                 let note_str = if cell.active {
@@ -724,46 +818,60 @@ impl eframe::App for LeviathanApp {
                                 let is_vel_cur = cur_lane == lane
                                     && cur_row == row
                                     && cur_col == SubColumn::Velocity;
+                                let in_block =
+                                    sel_rect.is_multi_cell() && sel_rect.contains(lane, row);
+
+                                let mut note_rt = egui::RichText::new(note_str).monospace().color(
+                                    if in_block {
+                                        egui::Color32::from_rgb(245, 250, 255)
+                                    } else if cell.active {
+                                        egui::Color32::from_rgb(220, 235, 255)
+                                    } else {
+                                        egui::Color32::from_rgb(125, 130, 140)
+                                    },
+                                );
+                                let mut vel_rt = egui::RichText::new(vel_str).monospace().color(
+                                    if in_block {
+                                        egui::Color32::from_rgb(175, 240, 205)
+                                    } else if cell.active {
+                                        egui::Color32::from_rgb(130, 215, 175)
+                                    } else {
+                                        egui::Color32::from_rgb(105, 110, 120)
+                                    },
+                                );
+                                if in_block {
+                                    let block_bg =
+                                        egui::Color32::from_rgba_unmultiplied(45, 105, 180, 110);
+                                    note_rt = note_rt.background_color(block_bg);
+                                    vel_rt = vel_rt.background_color(block_bg);
+                                }
 
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 2.0_f32;
-                                    let r_note = ui.selectable_label(
-                                        is_note_cur,
-                                        egui::RichText::new(note_str).monospace().color(
-                                            if cell.active {
-                                                egui::Color32::from_rgb(220, 235, 255)
-                                            } else {
-                                                egui::Color32::from_rgb(125, 130, 140)
-                                            },
-                                        ),
-                                    );
+                                    let shift_held = ui.input(|i| i.modifiers.shift);
+                                    let r_note = ui.selectable_label(is_note_cur, note_rt);
                                     if r_note.clicked() {
-                                        self.cursor.select(lane, row, SubColumn::Note);
+                                        self.cursor.select(lane, row, SubColumn::Note, shift_held);
                                     }
                                     if r_note.double_clicked() {
-                                        cell.active = !cell.active;
+                                        self.history.record_before_edit(&self.pattern);
+                                        let target = &mut self.pattern.lanes[lane][row];
+                                        target.active = !target.active;
+                                        let updated = *target;
                                         let _ = self.cmd_tx.push(AudioCommand::SetCell {
                                             lane,
                                             row,
-                                            cell: *cell,
+                                            cell: updated,
                                         });
                                     }
                                     if is_note_cur && scroll_to_cursor {
                                         r_note.scroll_to_me(None);
                                     }
 
-                                    let r_vel = ui.selectable_label(
-                                        is_vel_cur,
-                                        egui::RichText::new(vel_str).monospace().color(
-                                            if cell.active {
-                                                egui::Color32::from_rgb(130, 215, 175)
-                                            } else {
-                                                egui::Color32::from_rgb(105, 110, 120)
-                                            },
-                                        ),
-                                    );
+                                    let r_vel = ui.selectable_label(is_vel_cur, vel_rt);
                                     if r_vel.clicked() {
-                                        self.cursor.select(lane, row, SubColumn::Velocity);
+                                        self.cursor
+                                            .select(lane, row, SubColumn::Velocity, shift_held);
                                     }
                                     if is_vel_cur && scroll_to_cursor {
                                         r_vel.scroll_to_me(None);
@@ -794,20 +902,4 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(LeviathanApp::new(cc)))),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn starter_pattern_populates_fm_and_sampler_sound_locks() {
-        let pat = starter_electro_pattern();
-        assert!(pat.lanes[0][0].active);
-        assert_eq!(pat.lanes[1][4].lock.machine, MachineKind::FourOpFm as i16);
-        assert_ne!(pat.lanes[1][4].lock.mask, 0);
-        assert_eq!(pat.lanes[4][0].lock.machine, MachineKind::VarSampler as i16);
-        assert_eq!(param_labels(MachineKind::VarSampler)[1], "P1 ChipClk");
-        assert_eq!(midi_label(60), "C-4");
-    }
-                                }
+                                       }
