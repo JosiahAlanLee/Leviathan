@@ -1,3 +1,4 @@
+mod gpu_view;
 mod sampler_ui;
 mod tracker_edit;
 mod tracker_keys;
@@ -7,12 +8,12 @@ use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
+use gpu_view::FeedbackViewport;
 use leviathan_core::{
     CvFrame, EngineConfig, FillCondition, NoteCell, Pattern, SoundLock, TrackerEvaluator,
     NUM_LANES, ROWS_PER_PATTERN,
 };
 use leviathan_dsp::{MachineKind, SynthRack};
-use leviathan_gpu::{FeedbackSurface, VisualUniforms, FEEDBACK_SHADER_WGSL};
 use sampler_ui::{BankAction, SamplerBankUi};
 use tracker_edit::EditHistory;
 use tracker_keys::{PatternSync, SubColumn, TrackerCursor};
@@ -238,7 +239,7 @@ impl RtAudioWorker {
                     }
                 }
                 AudioCommand::SetPattern(snap) => {
-                    (*self.pattern).clone_from(&snap);
+                    self.pattern.clone_from(&snap);
                 }
                 AudioCommand::LoadSampleBank {
                     bank,
@@ -382,26 +383,13 @@ struct LeviathanApp {
     _audio_stream: Option<cpal::Stream>,
     offline_eval: Option<TrackerEvaluator>,
     audio_status: String,
-    gpu_status: String,
     latest_cv: CvFrame,
-    surface: FeedbackSurface,
-    preview_tex: Option<egui::TextureHandle>,
-    frame_index: u32,
+    viewport: FeedbackViewport,
 }
 
 impl LeviathanApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let gpu_status = if let Some(rs) = cc.wgpu_render_state.as_ref() {
-            let _shader = rs
-                .device
-                .create_shader_module(eframe::wgpu::ShaderModuleDescriptor {
-                    label: Some("leviathan_feedback_wgsl"),
-                    source: eframe::wgpu::ShaderSource::Wgsl(FEEDBACK_SHADER_WGSL.into()),
-                });
-            "wgpu + WGSL compiled".to_string()
-        } else {
-            "Software rasterizer".to_string()
-        };
+        let viewport = FeedbackViewport::new(cc);
 
         let initial_pattern = starter_electro_pattern();
         let (cmd_tx, cmd_rx) = rtrb::RingBuffer::<AudioCommand>::new(256);
@@ -437,11 +425,8 @@ impl LeviathanApp {
             _audio_stream,
             offline_eval,
             audio_status,
-            gpu_status,
             latest_cv: CvFrame::default(),
-            surface: FeedbackSurface::new(160, 90),
-            preview_tex: None,
-            frame_index: 0,
+            viewport,
         }
     }
 
@@ -495,27 +480,7 @@ impl eframe::App for LeviathanApp {
             self.latest_cv = ev.step_sample(&self.pattern);
         }
 
-        let surf_w = self.surface.width;
-        let surf_h = self.surface.height;
-        let uniforms = VisualUniforms::from_cv(
-            &self.latest_cv,
-            self.frame_index,
-            surf_w as u32,
-            surf_h as u32,
-        );
-        self.frame_index = self.frame_index.wrapping_add(1);
-
-        let rgba = self.surface.step(&uniforms);
-        let color_img = egui::ColorImage::from_rgba_unmultiplied([surf_w, surf_h], rgba);
-        let tex = self.preview_tex.get_or_insert_with(|| {
-            ctx.load_texture(
-                "feedback_surface",
-                color_img.clone(),
-                egui::TextureOptions::LINEAR,
-            )
-        });
-        tex.set(color_img, egui::TextureOptions::LINEAR);
-        let tex_id = tex.id();
+        let tex_id = self.viewport.render_frame(ctx, &self.latest_cv);
 
         egui::TopBottomPanel::top("transport_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -563,7 +528,7 @@ impl eframe::App for LeviathanApp {
                 ui.separator();
                 ui.small(&self.audio_status);
                 ui.separator();
-                ui.small(&self.gpu_status);
+                ui.small(self.viewport.status_label());
             });
         });
 
@@ -902,4 +867,4 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(LeviathanApp::new(cc)))),
     )
-                                                      }
+}
