@@ -239,7 +239,7 @@ impl RtAudioWorker {
                     }
                 }
                 AudioCommand::SetPattern(snap) => {
-                    self.pattern.clone_from(&snap);
+                    (*self.pattern).clone_from(&*snap);
                 }
                 AudioCommand::LoadSampleBank {
                     bank,
