@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
 
 use leviathan_core::{NoteCell, Pattern, SoundLock, NUM_LANES, ROWS_PER_PATTERN};
 
@@ -136,7 +135,6 @@ pub fn transpose_rect(pattern: &mut Pattern, rect: BlockRect, semitones: i32) ->
 pub struct EditHistory {
     undo_stack: VecDeque<Box<Pattern>>,
     redo_stack: VecDeque<Box<Pattern>>,
-    retained_rt_arcs: Vec<Arc<Pattern>>,
 }
 
 impl EditHistory {
@@ -180,15 +178,6 @@ impl EditHistory {
         self.redo_stack.len()
     }
 
-    /// Allocates an `Arc<Pattern>` retained on the UI thread so the RT audio thread never frees memory.
-    pub fn make_rt_snapshot(&mut self, pattern: &Pattern) -> Arc<Pattern> {
-        let snap = Arc::new(pattern.clone());
-        self.retained_rt_arcs.push(Arc::clone(&snap));
-        if self.retained_rt_arcs.len() > 32 {
-            self.retained_rt_arcs.retain(|a| Arc::strong_count(a) > 1);
-        }
-        snap
-    }
 }
 
 #[cfg(test)]

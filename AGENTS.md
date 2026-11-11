@@ -20,10 +20,10 @@ This guide defines architectural invariants, clean-room licensing rules, pinned 
 
 ## 3. Real-Time Audio & Pinned Crate Gotchas
 
-1. **Real-Time Audio Thread (`RtAudioWorker` in `crates/leviathan-app/src/main.rs`)**:
+1. **Real-Time Audio Thread (`RtAudioWorker` in `crates/leviathan-app/src/audio.rs`)**:
    - Never allocate (`Box::new`, `Vec::push`, `format!`), lock a `Mutex`/`RwLock`, perform file/network I/O, or drop the final reference to an `Arc` inside the `cpal` callback thread.
-   - Retain `Arc<Pattern>` and `Arc<[i16]>` handles on the UI thread (see `EditHistory::make_rt_snapshot` in `tracker_edit.rs` and `SamplerBankUi` in `sampler_ui.rs`) so deallocation only occurs on the UI thread.
-   - Use `AudioCommand::SetPattern(Arc<Pattern>)` (`self.pattern.clone_from(&snap)`) for bulk edits instead of pushing many individual `SetCell` commands into the 256-slot `rtrb` ring buffer.
+   - Route commands through `AudioControl`, which retains pattern, sample and project snapshots on the UI thread and retries commands in order when the ring is full.
+   - Use indexed `AudioCommand::SetPattern` for bulk edits. Use `ReplaceProject` for a validated session so patterns, sample banks and transport change at the same callback boundary.
 2. **Pinned Crate Versions (`Cargo.toml`)**:
    - `eframe = "0.31"` (`egui 0.31`, `wgpu 24`):
      - Use `ctx.wants_keyboard_input()` (not the removed `egui_wants_keyboard_input()`).

@@ -30,6 +30,13 @@ Leviathan uses a strict hexagonal ("ports and adapters") layout so external GPU,
 | Clear / Wipe locks | `Delete` (clear notes) / `Shift+Delete` (clear notes + `SoundLock`s) |
 | Semitone / Octave transpose | `Ctrl + Up/Down` (±1 semitone) / `Ctrl + Shift + Up/Down` (±12 semitones) |
 
+## Projects and pattern chains
+
+- **Save** (`Ctrl/Cmd+S`) stores the pattern bank, chain, tempo, sound locks, visual automation and decoded WAV banks in one `.leviathan.json` file. The first save asks for a path. **Save As** (`Ctrl/Cmd+Shift+S`) chooses a new path.
+- **Open** (`Ctrl/Cmd+O`) restores the session with playback paused. The project carries its own sampler data.
+- **New Pattern** and **Clone** build a bank of up to 16 patterns. Select a pattern to edit it, and set its rate in the pattern bar. While playing, **Queue Pattern** switches at the end of the active pattern. A rate edit to the active pattern takes effect on its next pass.
+- **Add Pattern** appends the selected pattern to the chain. Entries can repeat. **Cue Chain** starts the chain from its first entry when you press Play. **Queue Chain** launches it at the next pattern boundary during playback.
+
 ## Quick Start
 
 ```bash
