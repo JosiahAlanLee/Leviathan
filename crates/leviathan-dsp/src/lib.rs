@@ -190,12 +190,12 @@ impl SynthRack {
             }
             v.prev_gate = gate_high;
 
-            let decay_Lock = if (lock.mask & 1) != 0 {
+            let decay_lock = if (lock.mask & 1) != 0 {
                 lock.values[0].clamp(0.05, 0.98)
             } else {
                 0.35
             };
-            let decay_rate = 1.0 - (dt / (0.04 + 0.65 * decay_Lock));
+            let decay_rate = 1.0 - (dt / (0.04 + 0.65 * decay_lock));
             v.env *= decay_rate;
             v.pitch_env *= 1.0 - (dt / 0.022);
 
