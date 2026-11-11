@@ -1,5 +1,39 @@
 use eframe::egui::{self, Key, Modifiers};
-use leviathan_core::{NoteCell, Pattern, SoundLock, NUM_LANES, ROWS_PER_PATTERN};
+use leviathan_core::{NoteCell, Pattern, NUM_LANES, ROWS_PER_PATTERN};
+
+use crate::tracker_edit::{clear_rect, transpose_rect, BlockClipboard, BlockRect, EditHistory};
+
+const CMD_ONLY: Modifiers = Modifiers {
+    alt: false,
+    ctrl: false,
+    shift: false,
+    mac_cmd: false,
+    command: true,
+};
+
+const CMD_SHIFT: Modifiers = Modifiers {
+    alt: false,
+    ctrl: false,
+    shift: true,
+    mac_cmd: false,
+    command: true,
+};
+
+const CTRL_ONLY: Modifiers = Modifiers {
+    alt: false,
+    ctrl: true,
+    shift: false,
+    mac_cmd: false,
+    command: false,
+};
+
+const CTRL_SHIFT: Modifiers = Modifiers {
+    alt: false,
+    ctrl: true,
+    shift: true,
+    mac_cmd: false,
+    command: false,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubColumn {
@@ -24,6 +58,13 @@ pub struct CellUpdate {
 }
 
 #[derive(Clone, Debug)]
+pub enum PatternSync {
+    None,
+    Single(CellUpdate),
+    FullPattern,
+}
+
+#[derive(Clone, Debug)]
 pub struct TrackerCursor {
     pub lane: usize,
     pub row: usize,
@@ -32,6 +73,9 @@ pub struct TrackerCursor {
     pub edit_step: usize,
     pub vel_high_nibble: bool,
     pub moved_this_frame: bool,
+    pub anchor: Option<(usize, usize)>,
+    pub clipboard: Option<BlockClipboard>,
+    pub last_edit_msg: String,
 }
 
 impl Default for TrackerCursor {
@@ -44,12 +88,14 @@ impl Default for TrackerCursor {
             edit_step: 1,
             vel_high_nibble: true,
             moved_this_frame: false,
+            anchor: None,
+            clipboard: None,
+            last_edit_msg: "Ready".to_string(),
         }
     }
 }
 
 const PIANO_BINDINGS: [(Key, i32); 29] = [
-    // Lower octave (Z-M white keys, S D G H J L ; black keys)
     (Key::Z, 0),
     (Key::S, 1),
     (Key::X, 2),
@@ -67,7 +113,6 @@ const PIANO_BINDINGS: [(Key, i32); 29] = [
     (Key::Period, 14),
     (Key::Semicolon, 15),
     (Key::Slash, 16),
-    // Upper octave (Q-P white keys, 2 3 5 6 7 9 0 black keys)
     (Key::Q, 12),
     (Key::Num2, 13),
     (Key::W, 14),
@@ -141,30 +186,247 @@ pub fn apply_hex_nibble(current_vel: u8, nib: u8, high_nibble: &mut bool) -> (u8
     }
 }
 
+fn consume_cmd(i: &mut egui::InputState, shift: bool, key: Key) -> bool {
+    if shift {
+        i.consume_key(CMD_SHIFT, key) || i.consume_key(CTRL_SHIFT, key)
+    } else {
+        i.consume_key(CMD_ONLY, key) || i.consume_key(CTRL_ONLY, key)
+    }
+}
+
 impl TrackerCursor {
-    pub fn select(&mut self, lane: usize, row: usize, col: SubColumn) {
+    pub fn select(&mut self, lane: usize, row: usize, col: SubColumn, extend_block: bool) {
+        if extend_block {
+            if self.anchor.is_none() {
+                self.anchor = Some((self.lane, self.row));
+            }
+        } else {
+            self.anchor = None;
+        }
         self.lane = lane.min(NUM_LANES - 1);
         self.row = row.min(ROWS_PER_PATTERN - 1);
         self.column = col;
         self.vel_high_nibble = true;
     }
 
+    pub fn active_rect(&self) -> BlockRect {
+        match self.anchor {
+            Some(a) => BlockRect::from_corners(a, (self.lane, self.row)),
+            None => BlockRect::single(self.lane, self.row),
+        }
+    }
+
+    pub fn copy_selection(&mut self, pattern: &Pattern) {
+        let rect = self.active_rect();
+        let (w, h) = rect.dimensions();
+        self.clipboard = Some(BlockClipboard::capture(pattern, rect));
+        self.last_edit_msg = format!("Copied {w}x{h} block");
+    }
+
+    pub fn cut_selection(&mut self, pattern: &mut Pattern, history: &mut EditHistory) {
+        let rect = self.active_rect();
+        let (w, h) = rect.dimensions();
+        history.record_before_edit(pattern);
+        self.clipboard = Some(BlockClipboard::capture(pattern, rect));
+        clear_rect(pattern, rect, true);
+        self.last_edit_msg = format!("Cut {w}x{h} block");
+    }
+
+    pub fn paste_selection(&mut self, pattern: &mut Pattern, history: &mut EditHistory) -> bool {
+        let Some(clip) = self.clipboard.as_ref() else {
+            self.last_edit_msg = "Clipboard empty".to_string();
+            return false;
+        };
+        history.record_before_edit(pattern);
+        clip.paste(pattern, self.lane, self.row);
+        self.last_edit_msg = format!("Pasted {}x{} block", clip.width_lanes, clip.height_rows);
+        true
+    }
+
+    pub fn transpose_selection(
+        &mut self,
+        pattern: &mut Pattern,
+        history: &mut EditHistory,
+        semitones: i32,
+    ) -> bool {
+        let rect = self.active_rect();
+        history.record_before_edit(pattern);
+        let n = transpose_rect(pattern, rect, semitones);
+        self.last_edit_msg = format!("Transposed {n} note(s) by {semitones:+} st");
+        n > 0
+    }
+
+    fn ensure_anchor(&mut self) {
+        if self.anchor.is_none() {
+            self.anchor = Some((self.lane, self.row));
+        }
+    }
+
     fn advance_row(&mut self) {
+        self.anchor = None;
         self.row = (self.row + self.edit_step) % ROWS_PER_PATTERN;
         self.vel_high_nibble = true;
         self.moved_this_frame = true;
     }
 
-    pub fn handle_input(&mut self, ctx: &egui::Context, pattern: &mut Pattern) -> Vec<CellUpdate> {
+    pub fn handle_input(
+        &mut self,
+        ctx: &egui::Context,
+        pattern: &mut Pattern,
+        history: &mut EditHistory,
+    ) -> PatternSync {
         self.moved_this_frame = false;
         if ctx.wants_keyboard_input() {
-            return Vec::new();
+            return PatternSync::None;
         }
 
-        let mut updates = Vec::new();
+        let mut sync = PatternSync::None;
 
         ctx.input_mut(|i| {
-            // Octave & step-size hotkeys
+            let mut ev_copy = false;
+            let mut ev_cut = false;
+            let mut ev_paste = false;
+            i.events.retain(|ev| match ev {
+                egui::Event::Copy => {
+                    ev_copy = true;
+                    false
+                }
+                egui::Event::Cut => {
+                    ev_cut = true;
+                    false
+                }
+                egui::Event::Paste(_) => {
+                    ev_paste = true;
+                    false
+                }
+                _ => true,
+            });
+
+            // 1. Undo / Redo / Select-All / Clipboard / Transpose shortcuts (most-specific first)
+            if consume_cmd(i, true, Key::Z) || consume_cmd(i, false, Key::Y) {
+                if history.redo(pattern) {
+                    self.last_edit_msg = "Redo".to_string();
+                    sync = PatternSync::FullPattern;
+                }
+                return;
+            }
+            if consume_cmd(i, false, Key::Z) {
+                if history.undo(pattern) {
+                    self.last_edit_msg = "Undo".to_string();
+                    sync = PatternSync::FullPattern;
+                }
+                return;
+            }
+            if ev_copy || consume_cmd(i, false, Key::C) {
+                self.copy_selection(pattern);
+                return;
+            }
+            if ev_cut || consume_cmd(i, false, Key::X) {
+                self.cut_selection(pattern, history);
+                sync = PatternSync::FullPattern;
+                return;
+            }
+            if ev_paste || consume_cmd(i, false, Key::V) {
+                if self.paste_selection(pattern, history) {
+                    sync = PatternSync::FullPattern;
+                }
+                return;
+            }
+            if consume_cmd(i, false, Key::A) {
+                let r = self.active_rect();
+                if r.min_row == 0 && r.max_row == ROWS_PER_PATTERN - 1 && r.min_lane == r.max_lane {
+                    self.anchor = Some((0, 0));
+                    self.lane = NUM_LANES - 1;
+                    self.row = ROWS_PER_PATTERN - 1;
+                    self.last_edit_msg = "Selected all 6 lanes".to_string();
+                } else {
+                    self.anchor = Some((self.lane, 0));
+                    self.row = ROWS_PER_PATTERN - 1;
+                    self.last_edit_msg = format!("Selected lane {}", self.lane);
+                }
+                self.moved_this_frame = true;
+                return;
+            }
+            if consume_cmd(i, true, Key::ArrowUp) {
+                self.transpose_selection(pattern, history, 12);
+                sync = PatternSync::FullPattern;
+                return;
+            }
+            if consume_cmd(i, true, Key::ArrowDown) {
+                self.transpose_selection(pattern, history, -12);
+                sync = PatternSync::FullPattern;
+                return;
+            }
+            if consume_cmd(i, false, Key::ArrowUp) {
+                self.transpose_selection(pattern, history, 1);
+                sync = PatternSync::FullPattern;
+                return;
+            }
+            if consume_cmd(i, false, Key::ArrowDown) {
+                self.transpose_selection(pattern, history, -1);
+                sync = PatternSync::FullPattern;
+                return;
+            }
+
+            // 2. Shift + Navigation -> Rectangular Block Selection
+            if i.consume_key(Modifiers::SHIFT, Key::ArrowUp) {
+                self.ensure_anchor();
+                self.row = self.row.saturating_sub(1);
+                self.vel_high_nibble = true;
+                self.moved_this_frame = true;
+                return;
+            }
+            if i.consume_key(Modifiers::SHIFT, Key::ArrowDown) {
+                self.ensure_anchor();
+                self.row = (self.row + 1).min(ROWS_PER_PATTERN - 1);
+                self.vel_high_nibble = true;
+                self.moved_this_frame = true;
+                return;
+            }
+            if i.consume_key(Modifiers::SHIFT, Key::ArrowLeft) {
+                self.ensure_anchor();
+                self.lane = self.lane.saturating_sub(1);
+                self.vel_high_nibble = true;
+                self.moved_this_frame = true;
+                return;
+            }
+            if i.consume_key(Modifiers::SHIFT, Key::ArrowRight) {
+                self.ensure_anchor();
+                self.lane = (self.lane + 1).min(NUM_LANES - 1);
+                self.vel_high_nibble = true;
+                self.moved_this_frame = true;
+                return;
+            }
+            if i.consume_key(Modifiers::SHIFT, Key::PageUp) {
+                self.ensure_anchor();
+                self.row = self.row.saturating_sub(16);
+                self.moved_this_frame = true;
+                return;
+            }
+            if i.consume_key(Modifiers::SHIFT, Key::PageDown) {
+                self.ensure_anchor();
+                self.row = (self.row + 16).min(ROWS_PER_PATTERN - 1);
+                self.moved_this_frame = true;
+                return;
+            }
+            if i.consume_key(Modifiers::SHIFT, Key::Home) {
+                self.ensure_anchor();
+                self.row = 0;
+                self.moved_this_frame = true;
+                return;
+            }
+            if i.consume_key(Modifiers::SHIFT, Key::End) {
+                self.ensure_anchor();
+                self.row = ROWS_PER_PATTERN - 1;
+                self.moved_this_frame = true;
+                return;
+            }
+
+            // 3. Octave & Edit-Step hotkeys
+            if i.consume_key(Modifiers::NONE, Key::Escape) {
+                self.anchor = None;
+                return;
+            }
             if i.consume_key(Modifiers::NONE, Key::F1)
                 || i.consume_key(Modifiers::NONE, Key::Minus)
             {
@@ -186,38 +448,45 @@ impl TrackerCursor {
                 self.edit_step = (self.edit_step + 1).min(16);
             }
 
-            // Cursor navigation (consume keys so egui widget focus never jumps)
+            // 4. Plain Cursor Navigation (clears block anchor)
             if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                self.anchor = None;
                 self.row = (self.row + ROWS_PER_PATTERN - 1) % ROWS_PER_PATTERN;
                 self.vel_high_nibble = true;
                 self.moved_this_frame = true;
             }
             if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                self.anchor = None;
                 self.row = (self.row + 1) % ROWS_PER_PATTERN;
                 self.vel_high_nibble = true;
                 self.moved_this_frame = true;
             }
             if i.consume_key(Modifiers::NONE, Key::PageUp) {
+                self.anchor = None;
                 self.row = self.row.saturating_sub(16);
                 self.vel_high_nibble = true;
                 self.moved_this_frame = true;
             }
             if i.consume_key(Modifiers::NONE, Key::PageDown) {
+                self.anchor = None;
                 self.row = (self.row + 16).min(ROWS_PER_PATTERN - 1);
                 self.vel_high_nibble = true;
                 self.moved_this_frame = true;
             }
             if i.consume_key(Modifiers::NONE, Key::Home) {
+                self.anchor = None;
                 self.row = 0;
                 self.vel_high_nibble = true;
                 self.moved_this_frame = true;
             }
             if i.consume_key(Modifiers::NONE, Key::End) {
+                self.anchor = None;
                 self.row = ROWS_PER_PATTERN - 1;
                 self.vel_high_nibble = true;
                 self.moved_this_frame = true;
             }
             if i.consume_key(Modifiers::NONE, Key::ArrowLeft) {
+                self.anchor = None;
                 match self.column {
                     SubColumn::Velocity => self.column = SubColumn::Note,
                     SubColumn::Note => {
@@ -229,6 +498,7 @@ impl TrackerCursor {
                 self.moved_this_frame = true;
             }
             if i.consume_key(Modifiers::NONE, Key::ArrowRight) {
+                self.anchor = None;
                 match self.column {
                     SubColumn::Note => self.column = SubColumn::Velocity,
                     SubColumn::Velocity => {
@@ -240,95 +510,119 @@ impl TrackerCursor {
                 self.moved_this_frame = true;
             }
             if i.consume_key(Modifiers::SHIFT, Key::Tab) {
+                self.anchor = None;
                 self.lane = (self.lane + NUM_LANES - 1) % NUM_LANES;
                 self.vel_high_nibble = true;
                 self.moved_this_frame = true;
             } else if i.consume_key(Modifiers::NONE, Key::Tab) {
+                self.anchor = None;
                 self.lane = (self.lane + 1) % NUM_LANES;
                 self.vel_high_nibble = true;
                 self.moved_this_frame = true;
             }
 
-            // Delete / Backspace / Enter / Air trigger
+            // 5. Delete / Backspace / Enter / Backtick
             if i.consume_key(Modifiers::SHIFT, Key::Delete) {
-                let r = self.row;
-                let l = self.lane;
-                let cleared = NoteCell {
-                    lock: SoundLock::default(),
-                    ..NoteCell::default()
-                };
-                pattern.lanes[l][r] = cleared;
-                updates.push(CellUpdate {
-                    lane: l,
-                    row: r,
-                    cell: cleared,
-                });
-                self.advance_row();
-            } else if i.consume_key(Modifiers::NONE, Key::Delete) {
-                let r = self.row;
-                let l = self.lane;
-                let cell = &mut pattern.lanes[l][r];
-                match self.column {
-                    SubColumn::Note => {
-                        cell.active = false;
-                        cell.air = false;
-                    }
-                    SubColumn::Velocity => {
-                        cell.velocity = 100;
-                    }
+                let rect = self.active_rect();
+                history.record_before_edit(pattern);
+                clear_rect(pattern, rect, true);
+                if rect.is_multi_cell() {
+                    self.last_edit_msg = "Cleared block + locks".to_string();
+                    sync = PatternSync::FullPattern;
+                } else {
+                    let cell = pattern.lanes[self.lane][self.row];
+                    sync = PatternSync::Single(CellUpdate {
+                        lane: self.lane,
+                        row: self.row,
+                        cell,
+                    });
+                    self.advance_row();
                 }
-                updates.push(CellUpdate {
-                    lane: l,
-                    row: r,
-                    cell: *cell,
-                });
-                self.advance_row();
-            } else if i.consume_key(Modifiers::NONE, Key::Backspace) {
+                return;
+            }
+            if i.consume_key(Modifiers::NONE, Key::Delete) {
+                let rect = self.active_rect();
+                history.record_before_edit(pattern);
+                if rect.is_multi_cell() {
+                    clear_rect(pattern, rect, false);
+                    self.last_edit_msg = "Cleared selected block".to_string();
+                    sync = PatternSync::FullPattern;
+                } else {
+                    let cell = &mut pattern.lanes[self.lane][self.row];
+                    match self.column {
+                        SubColumn::Note => {
+                            cell.active = false;
+                            cell.air = false;
+                        }
+                        SubColumn::Velocity => {
+                            cell.velocity = 100;
+                        }
+                    }
+                    sync = PatternSync::Single(CellUpdate {
+                        lane: self.lane,
+                        row: self.row,
+                        cell: *cell,
+                    });
+                    self.advance_row();
+                }
+                return;
+            }
+            if i.consume_key(Modifiers::NONE, Key::Backspace) {
+                history.record_before_edit(pattern);
+                self.anchor = None;
                 self.row = (self.row + ROWS_PER_PATTERN - 1) % ROWS_PER_PATTERN;
-                let r = self.row;
-                let l = self.lane;
-                let cell = &mut pattern.lanes[l][r];
+                let cell = &mut pattern.lanes[self.lane][self.row];
                 cell.active = false;
                 cell.air = false;
-                updates.push(CellUpdate {
-                    lane: l,
-                    row: r,
+                sync = PatternSync::Single(CellUpdate {
+                    lane: self.lane,
+                    row: self.row,
                     cell: *cell,
                 });
                 self.vel_high_nibble = true;
                 self.moved_this_frame = true;
-            } else if i.consume_key(Modifiers::NONE, Key::Enter) {
-                let r = self.row;
-                let l = self.lane;
-                let cell = &mut pattern.lanes[l][r];
+                return;
+            }
+            if i.consume_key(Modifiers::NONE, Key::Enter) {
+                history.record_before_edit(pattern);
+                let cell = &mut pattern.lanes[self.lane][self.row];
                 cell.active = !cell.active;
-                updates.push(CellUpdate {
-                    lane: l,
-                    row: r,
+                sync = PatternSync::Single(CellUpdate {
+                    lane: self.lane,
+                    row: self.row,
                     cell: *cell,
                 });
-            } else if i.consume_key(Modifiers::NONE, Key::Backtick) {
-                let r = self.row;
+                return;
+            }
+            if i.consume_key(Modifiers::NONE, Key::Backtick) {
+                history.record_before_edit(pattern);
                 let l = self.lane;
+                let r = self.row;
                 let cell = &mut pattern.lanes[l][r];
                 cell.active = true;
                 cell.air = true;
-                updates.push(CellUpdate {
+                sync = PatternSync::Single(CellUpdate {
                     lane: l,
                     row: r,
                     cell: *cell,
                 });
                 self.advance_row();
+                return;
             }
 
-            // Subcolumn-specific note or hex velocity entry
+            // 6. Piano Note Entry vs. Hex Velocity Entry (only when Ctrl/Cmd/Alt are NOT held)
+            if i.modifiers.command || i.modifiers.ctrl || i.modifiers.alt {
+                return;
+            }
+
             match self.column {
                 SubColumn::Note => {
                     for &(k, _) in PIANO_BINDINGS.iter().chain(UPPER_EXT_BINDINGS.iter()) {
                         if i.consume_key(Modifiers::NONE, k) {
                             if let Some(midi) = midi_for_piano_key(k, self.base_octave) {
-                                let r = self.row;
+                                history.record_before_edit(pattern);
                                 let l = self.lane;
+                                let r = self.row;
                                 let cell = &mut pattern.lanes[l][r];
                                 cell.active = true;
                                 cell.air = false;
@@ -336,7 +630,7 @@ impl TrackerCursor {
                                 if cell.velocity == 0 {
                                     cell.velocity = 100;
                                 }
-                                updates.push(CellUpdate {
+                                sync = PatternSync::Single(CellUpdate {
                                     lane: l,
                                     row: r,
                                     cell: *cell,
@@ -350,14 +644,17 @@ impl TrackerCursor {
                 SubColumn::Velocity => {
                     for &(k, nib) in &HEX_BINDINGS {
                         if i.consume_key(Modifiers::NONE, k) {
-                            let r = self.row;
+                            if self.vel_high_nibble {
+                                history.record_before_edit(pattern);
+                            }
                             let l = self.lane;
+                            let r = self.row;
                             let cell = &mut pattern.lanes[l][r];
                             let (vel, step_done) =
                                 apply_hex_nibble(cell.velocity, nib, &mut self.vel_high_nibble);
                             cell.velocity = vel;
                             cell.active = true;
-                            updates.push(CellUpdate {
+                            sync = PatternSync::Single(CellUpdate {
                                 lane: l,
                                 row: r,
                                 cell: *cell,
@@ -372,7 +669,7 @@ impl TrackerCursor {
             }
         });
 
-        updates
+        sync
     }
 }
 
