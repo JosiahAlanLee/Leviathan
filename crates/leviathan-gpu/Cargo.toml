@@ -1,0 +1,11 @@
+[package]
+name = "leviathan-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WGSL feedback shader pipeline IR, uniform layouts, and ping-pong visual buffer for Leviathan"
+
+[dependencies]
+bytemuck = { workspace = true }
+leviathan-core = { workspace = true, features = ["std"] }
