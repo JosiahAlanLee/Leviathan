@@ -51,12 +51,13 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
   - All `NoteCell` conditional fields and row `VisualAutomation` values are editable in UI and reflected in live `CvFrame` telemetry; 0 warnings.
 
 ### `T5` — `#![no_std]` Stereo Master Bus (Delay, Soft-Clip Limiter & Peak Telemetry)
-- **Status**: `OPEN`
+- **Status**: `IN REVIEW` (implementation `2bb4cb8`)
 - **Owned Files**: new `crates/leviathan-dsp/src/master.rs`, `crates/leviathan-dsp/src/lib.rs`, transport meter readout in `crates/leviathan-app/src/main.rs`
 - **Goal**: Add glue, spatial width, and overload protection to `SynthRack::render_stereo` without heap allocation.
 - **Scope & Constraints**:
   - Fixed-size `#![no_std]` stereo ping-pong / Haas delay buffer (e.g. `[f32; 16384]` inside `SynthRack`) with global or lockable send amount, followed by a clean-room soft-knee limiter and DC blocker.
   - Compute stereo peak levels so the UI transport bar can render a compact L/R level + clip indicator.
+- **Controls** `AudioCommand::SetMasterSend` adjusts the transport's **Delay send**. The send saves with the project and defaults to zero for older files. The meters display output peaks and hold pre-limiter overloads for one second.
 - **Acceptance Criteria**:
   - `no_std` check passes (`cargo check -p leviathan-dsp --no-default-features`), unit test verifies bounded `[-1.0, 1.0]` output under hot 6-lane chord input, and 0 warnings.
 

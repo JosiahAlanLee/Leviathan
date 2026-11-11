@@ -6,7 +6,7 @@ use leviathan_core::{
     AutomationRow, CvFrame, EngineConfig, LaunchTarget, NoteCell, Pattern, PatternChain,
     SongPlayer, SongStatus, NUM_LANES, ROWS_PER_PATTERN,
 };
-use leviathan_dsp::{sampler::SampleBank, SynthRack};
+use leviathan_dsp::{sampler::SampleBank, MasterPeaks, SynthRack};
 
 use crate::project::{Project, PATTERN_BANK_CAPACITY};
 
@@ -14,6 +14,7 @@ pub enum AudioCommand {
     SetPlaying(bool),
     SetFill(bool),
     SetBpm(f64),
+    SetMasterSend(f32),
     Reset,
     Launch(LaunchTarget),
     SetChain(PatternChain),
@@ -64,6 +65,7 @@ impl AudioCommand {
 pub struct AudioProject {
     generation: u64,
     bpm: f64,
+    master_send: f32,
     patterns: Vec<Pattern>,
     selected_pattern: usize,
     chain: PatternChain,
@@ -81,6 +83,7 @@ impl AudioProject {
         Self {
             generation,
             bpm: project.bpm,
+            master_send: project.master_send,
             patterns: project.patterns.clone(),
             selected_pattern: project.selected_pattern,
             chain: project.chain,
@@ -180,6 +183,7 @@ pub struct AudioTelemetry {
     pub generation: u64,
     pub cv: CvFrame,
     pub song: SongStatus,
+    pub master: MasterPeaks,
 }
 
 struct RtAudioWorker {
@@ -226,6 +230,7 @@ impl RtAudioWorker {
             };
             command.apply_transport(&mut self.player, self.pattern_count);
             match command {
+                AudioCommand::SetMasterSend(send) => self.synth.set_master_send(send),
                 AudioCommand::SetCell {
                     pattern,
                     lane,
@@ -258,6 +263,7 @@ impl RtAudioWorker {
                     self.pattern_count = project.patterns.len().min(self.patterns.len());
                     self.synth.sample_bank.clone_from(&project.sample_bank);
                     self.synth.reset_voices();
+                    self.synth.reset_master(project.master_send);
                     self.generation = project.generation;
                     self.tel_divider = 255;
                 }
@@ -289,11 +295,16 @@ impl RtAudioWorker {
         let pair = self.synth.render_stereo(&cv);
         self.tel_divider = self.tel_divider.wrapping_add(1);
         if retrigger || (self.tel_divider & 255) == 0 {
-            let _ = self.tel_tx.push(AudioTelemetry {
+            let telemetry = AudioTelemetry {
                 generation: self.generation,
                 cv,
                 song: self.player.status(),
-            });
+                master: self.synth.master_peaks(),
+            };
+            // Carry the interval's peaks forward if the UI hasn't drained its ring yet.
+            if self.tel_tx.push(telemetry).is_ok() {
+                self.synth.clear_master_peaks();
+            }
         }
         pair
     }
@@ -317,7 +328,7 @@ pub fn try_start_audio(
     let sample_rate = config.sample_rate as f64;
     let channels = (config.channels as usize).max(1);
 
-    let mut worker = RtAudioWorker::new(initial_pattern, sample_rate, cmd_rx, tel_tx);
+    let mut worker = Box::new(RtAudioWorker::new(initial_pattern, sample_rate, cmd_rx, tel_tx));
 
     let err_fn = |err| eprintln!("leviathan audio stream error: {err}");
 
@@ -466,6 +477,7 @@ mod tests {
         });
         let project = Project {
             bpm: 120.0,
+            master_send: 0.4,
             patterns: vec![first, second],
             selected_pattern: 1,
             chain,
@@ -513,6 +525,7 @@ mod tests {
 
         let oversized = Project {
             bpm: 120.0,
+            master_send: 0.0,
             patterns: vec![Pattern::default(); PATTERN_BANK_CAPACITY + 4],
             selected_pattern: PATTERN_BANK_CAPACITY + 2,
             chain: PatternChain::default(),
@@ -547,6 +560,41 @@ mod tests {
     }
 
     #[test]
+    fn master_peaks_survive_a_full_telemetry_ring() {
+        let (_tx, rx) = rtrb::RingBuffer::new(1);
+        let (tel_tx, mut tel_rx) = rtrb::RingBuffer::new(1);
+        let mut worker = RtAudioWorker::new(Pattern::default(), 48_000.0, rx, tel_tx);
+        assert!(worker.tel_tx.push(AudioTelemetry::default()).is_ok());
+
+        let lock = leviathan_core::SoundLock {
+            machine: leviathan_dsp::MachineKind::AcidLead as i16,
+            mask: 0b101,
+            values: [0.98, 0.0, 0.88, 0.0, 0.0, 0.0, 0.0, 0.0],
+        };
+        let cv = CvFrame {
+            pitch_v: [-12, -8, -5, 0, 4, 7].map(|semitones| semitones as f32 / 12.0),
+            gate_v: [10.0; NUM_LANES],
+            velocity_v: [10.0; NUM_LANES],
+            locks: [lock; NUM_LANES],
+            ..CvFrame::default()
+        };
+        for _ in 0..512 {
+            worker.synth.render_stereo(&cv);
+        }
+        let peaks = worker.synth.master_peaks();
+        assert_eq!(peaks.clipped, [true, true]);
+
+        worker.tel_divider = 255;
+        worker.next_stereo();
+        let _ = tel_rx.pop().unwrap();
+        worker.tel_divider = 255;
+        worker.next_stereo();
+        let reported = tel_rx.pop().unwrap().master;
+        assert_eq!(reported.clipped, peaks.clipped);
+        assert!(reported.output[0] >= peaks.output[0] && reported.output[1] >= peaks.output[1]);
+        assert_eq!(worker.synth.master_peaks(), MasterPeaks::default());
+    }
+    #[test] 
     fn set_automation_updates_live_cv_and_bytebus_telemetry() {
         let (tx, rx) = rtrb::RingBuffer::new(8);
         let (tel_tx, mut tel_rx) = rtrb::RingBuffer::new(16);

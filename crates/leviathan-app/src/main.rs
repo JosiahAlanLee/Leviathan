@@ -1,5 +1,6 @@
 mod audio;
 mod gpu_view;
+mod master_ui;
 mod inspector_ui;
 mod project;
 mod sampler_ui;
@@ -17,9 +18,10 @@ use leviathan_core::{
     CvFrame, EngineConfig, FillCondition, LaunchTarget, NoteCell, Pattern, PatternChain,
     SongPlayer, SongStatus, SoundLock, NUM_LANES, ROWS_PER_PATTERN,
 };
-use leviathan_dsp::MachineKind;
+use leviathan_dsp::{MachineKind, MasterPeaks};
 
 use audio::{try_start_audio, AudioCommand, AudioControl, AudioProject, AudioTelemetry};
+use master_ui::MasterMeters;
 use sampler_ui::{BankAction, SamplerBankUi};
 use session_ui::{ArrangementAction, ProjectAction, ProjectUi};
 use tracker_edit::EditHistory;
@@ -167,6 +169,8 @@ struct LeviathanApp {
     playing: bool,
     fill_active: bool,
     bpm: f64,
+    master_send: f32,
+    master_meters: MasterMeters,
     cursor: TrackerCursor,
     sampler_ui: SamplerBankUi,
     audio: AudioControl,
@@ -225,6 +229,8 @@ impl LeviathanApp {
             playing: false,
             fill_active: false,
             bpm: 132.0,
+            master_send: 0.0,
+            master_meters: MasterMeters::default(),
             cursor,
             sampler_ui: SamplerBankUi::default(),
             audio: AudioControl::new(cmd_tx),
@@ -374,6 +380,7 @@ impl LeviathanApp {
                 let result = project::save(
                     &path,
                     self.bpm,
+                    self.master_send,
                     &self.patterns,
                     self.selected_pattern,
                     &self.chain,
@@ -392,9 +399,9 @@ impl LeviathanApp {
         self.project_generation = self.project_generation.wrapping_add(1);
         let prepared = Arc::new(AudioProject::prepare(&project, self.project_generation));
         self.bpm = project.bpm;
-        self.histories = (0..project.patterns.len())
-            .map(|_| EditHistory::default())
-            .collect();
+        self.master_send = project.master_send;
+        self.master_meters = MasterMeters::default();
+        self.histories = (0..project.patterns.len()).map(|_| EditHistory::default()).collect();
         self.patterns = project.patterns;
         self.selected_pattern = project.selected_pattern;
         self.chain = project.chain;
@@ -415,13 +422,16 @@ impl LeviathanApp {
 impl eframe::App for LeviathanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.audio.flush();
+        let mut peaks = MasterPeaks::default();
         while let Ok(telemetry) = self.tel_rx.pop() {
             if telemetry.generation == self.project_generation {
                 self.latest_cv = telemetry.cv;
                 self.latest_song = telemetry.song;
+                peaks.merge(telemetry.master);
             }
         }
-
+        let now = ctx.input(|input| input.time);
+        self.master_meters.update(peaks, now);
         let (file, arrangement) = egui::TopBottomPanel::top("project_and_patterns")
             .show(ctx, |ui| {
                 let file = self.project_ui.toolbar(ui);
@@ -487,7 +497,7 @@ impl eframe::App for LeviathanApp {
         let tex_id = self.viewport.render_frame(ctx, &self.latest_cv);
 
         egui::TopBottomPanel::top("transport_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.heading("LEVIATHAN");
                 ui.separator();
                 let play_label = if self.playing {
@@ -514,6 +524,23 @@ impl eframe::App for LeviathanApp {
                 {
                     self.send_audio(AudioCommand::SetBpm(self.bpm));
                 }
+                ui.separator();
+                ui.label("Delay send");
+                let mut send_percent = self.master_send * 100.0;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut send_percent)
+                            .range(0.0..=100.0)
+                            .speed(0.5_f64)
+                            .suffix("%"),
+                    )
+                    .changed()
+                    && send_percent.is_finite()
+                {
+                    self.master_send = (send_percent / 100.0).clamp(0.0, 1.0);
+                    self.send_audio(AudioCommand::SetMasterSend(self.master_send));
+                }
+                self.master_meters.draw(ui, now);
                 ui.separator();
                 ui.monospace(format!(
                     "Oct:{} [-/=] | Step:{} [[/]] | Col:{} | Beat {:06.2} Row {:02X}",
@@ -781,7 +808,7 @@ impl eframe::App for LeviathanApp {
             });
         });
 
-        if self.playing || self.audio.has_pending() {
+        if self.playing || self.audio.has_pending() || self.master_meters.is_active(now) {
             ctx.request_repaint();
         }
     }
@@ -853,6 +880,7 @@ mod tests {
         app.apply_arrangement_action(ArrangementAction::AddPattern { clone: true });
         app.apply_arrangement_action(ArrangementAction::SetRate(PlaybackRate::Half));
         app.apply_arrangement_action(ArrangementAction::AppendToChain);
+        app.master_send = 0.35;
 
         frame(&ctx, &mut app, vec![key(Key::S, cmd)]);
         assert!(app.project_ui.dialog_open());
@@ -883,6 +911,7 @@ mod tests {
         assert_eq!(app.selected_pattern, 1);
         assert_eq!(app.patterns[1].rate, PlaybackRate::Half);
         assert_eq!(app.chain.as_slice(), &[0, 1]);
+        assert_eq!(app.master_send, 0.35);
         assert!(!app.playing);
     }
                                     }
