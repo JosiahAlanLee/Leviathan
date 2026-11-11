@@ -1,13 +1,58 @@
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait,use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use leviathan_core::{
-    CvFrame, EngineConfig, FillCondition, NoteCell, Pattern, TrackerEvaluator, NUM_LANES,
-    ROWS_PER_PATTERN,
+    CvFrame, EngineConfig, FillCondition, NoteCell, Pattern, SoundLock, TrackerEvaluator,
+    NUM_LANES, ROWS_PER_PATTERN,
 };
-use leviathan_dsp::SynthRack;
+use leviathan_dsp::{MachineKind, SynthRack};
 use leviathan_gpu::{FeedbackSurface, VisualUniforms, FEEDBACK_SHADER_WGSL};
 
-const LANE_NAMES: [&str; NUM_LANES] = ["0 KICK", "1 FM", "2 SUB", "3 AIR", "4 CHORD", "5 ACID"];
+const LANE_NAMES: [&str; NUM_LANES] = ["0 KICK", "1 FM4", "2 SUB", "3 AIR", "4 SMPL", "5 ACID"];
+
+const ALL_MACHINES: [MachineKind; 7] = [
+    MachineKind::KickDrum,
+    MachineKind::FourOpFm,
+    MachineKind::SubBass,
+    MachineKind::NoiseWash,
+    MachineKind::VarSampler,
+    MachineKind::AcidLead,
+    MachineKind::ChordStab,
+];
+
+fn param_labels(machine: MachineKind) -> [&'static str; 8] {
+    match machine {
+        MachineKind::VarSampler => [
+            "P0 Decay",
+            "P1 ChipClk",
+            "P2 Cutoff",
+            "P3 WaveBank",
+            "P4 LpStart",
+            "P5 LpWindow",
+            "P6 LpScan",
+            "P7 Mode/Bit",
+        ],
+        MachineKind::FourOpFm => [
+            "P0 Decay",
+            "P1 FmIndex",
+            "P2 Cutoff",
+            "P3 Alg(0-3)",
+            "P4 C:M Ratio",
+            "P5 ModDecay",
+            "P6 Op4 Fbk",
+            "P7 Detune",
+        ],
+        _ => [
+            "P0 Decay",
+            "P1 Drive",
+            "P2 Cutoff",
+            "P3Aux3",
+            "P4 Aux4",
+            "P5 Aux5",
+            "P6 Aux6",
+            "P7 Aux7",
+        ],
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 enum AudioCommand {
@@ -28,6 +73,7 @@ fn starter_electro_pattern() -> Pattern {
 
     for row in 0..ROWS_PER_PATTERN {
         let step16 = row % 16;
+        let bar = row / 16;
 
         if matches!(step16, 0 | 3 | 6 | 10 | 14) {
             pat.lanes[0][row] = NoteCell {
@@ -39,12 +85,31 @@ fn starter_electro_pattern() -> Pattern {
             };
         }
 
+        // Lane 1 (FourOpFm): DualPairs glass plucks on 4/12 + sound-locked Cascade bell clangs on 9/15
         if matches!(step16, 4 | 12) {
             pat.lanes[1][row] = NoteCell {
                 active: true,
                 midi: 66,
                 velocity: 108,
                 gate_fraction: 0.35,
+                lock: SoundLock {
+                    machine: MachineKind::FourOpFm as i16,
+                    mask: (1 << 1) | (1 << 3) | (1 << 4) | (1 << 5),
+                    values: [0.35, 0.46, 0.65, 0.30, 0.45, 0.22, 0.15, 0.10],
+                },
+                ..NoteCell::default()
+            };
+        } else if matches!(step16, 9 | 15) && bar % 2 == 1 {
+            pat.lanes[1][row] = NoteCell {
+                active: true,
+                midi: 73,
+                velocity: 96,
+                gate_fraction: 0.40,
+                lock: SoundLock {
+                    machine: MachineKind::FourOpFm as i16,
+                    mask: (1 << 1) | (1 << 3) | (1 << 4) | (1 << 6),
+                    values: [0.45, 0.82, 0.75, 0.05, 0.55, 0.35, 0.68, 0.20],
+                },
                 ..NoteCell::default()
             };
         }
@@ -75,12 +140,31 @@ fn starter_electro_pattern() -> Pattern {
             };
         }
 
-        if step16 == 0 && (row / 16) % 2 == 0 {
+        // Lane 4 (VarSampler): Ping-pong scanned m7 chord on even bars + down-clocked 9kHz anvil on odd bars
+        if step16 == 0 && bar % 2 == 0 {
             pat.lanes[4][row] = NoteCell {
                 active: true,
                 midi: 54,
-                velocity: 96,
-                gate_fraction: 0.80,
+                velocity: 108,
+                gate_fraction: 0.85,
+                lock: SoundLock {
+                    machine: MachineKind::VarSampler as i16,
+                    mask: (1 << 0) | (1 << 1) | (1 << 3) | (1 << 5) | (1 << 6) | (1 << 7),
+                    values: [0.75, 0.62, 0.72, 0.60, 0.05, 0.55, 0.45, 0.85],
+                },
+                ..NoteCell::default()
+            };
+        } else if step16 == 8 && bar % 2 == 1 {
+            pat.lanes[4][row] = NoteCell {
+                active: true,
+                midi: 49,
+                velocity: 116,
+                gate_fraction: 0.50,
+                lock: SoundLock {
+                    machine: MachineKind::VarSampler as i16,
+                    mask: (1 << 0) | (1 << 1) | (1 << 3) | (1 << 7),
+                    values: [0.50, 0.12, 0.58, 0.05, 0.0, 0.90, 0.0, 0.15],
+                },
                 ..NoteCell::default()
             };
         }
@@ -99,7 +183,8 @@ fn starter_electro_pattern() -> Pattern {
         let phase = row as f32 / ROWS_PER_PATTERN as f32;
         pat.automation[row].z = 0.25 + 0.35 * (phase * core::f32::consts::TAU).sin().abs();
         pat.automation[row].roll = 0.30 * (phase * core::f32::consts::TAU).cos();
-        pat.automation[row].feedback = 0.45 + 0.30 * (phase * core::f32::consts::PI * 4.0).sin().abs();
+        pat.automation[row].feedback =
+            0.45 + 0.30 * (phase * core::f32::consts::PI * 4.0).sin().abs();
     }
     pat
 }
@@ -256,6 +341,7 @@ struct LeviathanApp {
     playing: bool,
     fill_active: bool,
     bpm: f64,
+    selected_step: (usize, usize),
     cmd_tx: rtrb::Producer<AudioCommand>,
     tel_rx: rtrb::Consumer<CvFrame>,
     _audio_stream: Option<cpal::Stream>,
@@ -271,10 +357,12 @@ struct LeviathanApp {
 impl LeviathanApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let gpu_status = if let Some(rs) = cc.wgpu_render_state.as_ref() {
-            let _shader = rs.device.create_shader_module(eframe::wgpu::ShaderModuleDescriptor {
-                label: Some("leviathan_feedback_wgsl"),
-                source: eframe::wgpu::ShaderSource::Wgsl(FEEDBACK_SHADER_WGSL.into()),
-            });
+            let _shader = rs
+                .device
+                .create_shader_module(eframe::wgpu::ShaderModuleDescriptor {
+                    label: Some("leviathan_feedback_wgsl"),
+                    source: eframe::wgpu::ShaderSource::Wgsl(FEEDBACK_SHADER_WGSL.into()),
+                });
             "wgpu + WGSL compiled".to_string()
         } else {
             "Software rasterizer".to_string()
@@ -302,6 +390,7 @@ impl LeviathanApp {
             playing: false,
             fill_active: false,
             bpm: 132.0,
+            selected_step: (4, 0),
             cmd_tx,
             tel_rx,
             _audio_stream,
@@ -335,9 +424,9 @@ impl eframe::App for LeviathanApp {
             self.latest_cv = ev.step_sample(&self.pattern);
         }
 
-                let surf_w = self.surface.width;
-                let surf_h = self.surface.height;
-                let uniforms = VisualUniforms::from_cv(
+        let surf_w = self.surface.width;
+        let surf_h = self.surface.height;
+        let uniforms = VisualUniforms::from_cv(
             &self.latest_cv,
             self.frame_index,
             surf_w as u32,
@@ -345,18 +434,26 @@ impl eframe::App for LeviathanApp {
         );
         self.frame_index = self.frame_index.wrapping_add(1);
         let rgba = self.surface.step(&uniforms);
-                let color_img = egui::ColorImage::from_rgba_unmultiplied([surf_w, surf_h], rgba);
+        let color_img = egui::ColorImage::from_rgba_unmultiplied([surf_w, surf_h], rgba);
         let tex = self.preview_tex.get_or_insert_with(|| {
-            ctx.load_texture("feedback_surface", color_img.clone(), egui::TextureOptions::LINEAR)
+            ctx.load_texture(
+                "feedback_surface",
+                color_img.clone(),
+                egui::TextureOptions::LINEAR,
+            )
         });
-                tex.set(color_img, egui::TextureOptions::LINEAR);
+        tex.set(color_img, egui::TextureOptions::LINEAR);
         let tex_id = tex.id();
 
         egui::TopBottomPanel::top("transport_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("LEVIATHAN");
                 ui.separator();
-                let play_label = if self.playing { "Stop [Space]" } else { "Play [Space]" };
+                let play_label = if self.playing {
+                    "Stop [Space]"
+                } else {
+                    "Play [Space]"
+                };
                 if ui.button(play_label).clicked() {
                     self.playing = !self.playing;
                     let _ = self.cmd_tx.push(AudioCommand::SetPlaying(self.playing));
@@ -394,19 +491,20 @@ impl eframe::App for LeviathanApp {
             });
         });
 
+        let (sel_lane, sel_row) = self.selected_step;
+        let mut edit_cell = self.pattern.lanes[sel_lane][sel_row];
+        let mut cell_dirty = false;
+
         egui::SidePanel::right("visual_and_bus_panel")
-            .min_width(360.0)
+            .min_width(372.0)
             .show(ctx, |ui| {
                 ui.heading("Live Feedback Surface");
-                ui.image((tex_id, egui::vec2(344.0, 194.0)));
+                ui.image((tex_id, egui::vec2(352.0, 198.0)));
                 ui.separator();
-                ui.heading("CV & Automation");
                 ui.monospace(format!(
-                    "Z: {:4.2} V | Roll: {:+5.2} V | Feedback: {:4.2} V",
+                    "Z: {:4.2} V | Roll: {:+5.2} V | Fbk: {:4.2} V",
                     self.latest_cv.z_v, self.latest_cv.roll_v, self.latest_cv.feedback_v
                 ));
-                ui.separator();
-                ui.heading("9-Channel ByteBus (10V)");
                 ui.horizontal(|ui| {
                     for bit in 0..9 {
                         let high = self.latest_cv.bytebus_v[bit] > 5.0;
@@ -418,14 +516,101 @@ impl eframe::App for LeviathanApp {
                         let _ = ui.selectable_label(high, tag);
                     }
                 });
+
+                ui.separator();
+                let eff_machine = MachineKind::from_lane_and_lock(sel_lane, &edit_cell.lock);
+                ui.heading(format!(
+                    "Step Lock — {} Row {:02X} ({})",
+                    LANE_NAMES[sel_lane],
+                    sel_row,
+                    eff_machine.short_name()
+                ));
+                ui.small("Left-click grid toggles step; right-click inspects without toggling.");
+
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut edit_cell.active, "On").changed() {
+                        cell_dirty = true;
+                    }
+                    if ui.checkbox(&mut edit_cell.air, "Air").changed() {
+                        cell_dirty = true;
+                    }
+                    ui.label("MIDI");
+                    if ui
+                        .add(egui::DragValue::new(&mut edit_cell.midi).range(24..=96))
+                        .changed()
+                    {
+                        cell_dirty = true;
+                    }
+                    ui.label("Vel");
+                    if ui
+                        .add(egui::DragValue::new(&mut edit_cell.velocity).range(1..=127))
+                        .changed()
+                    {
+                        cell_dirty = true;
+                    }
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .selectable_label(edit_cell.lock.machine < 0, "Lane")
+                        .clicked()
+                    {
+                        edit_cell.lock.machine = -1;
+                        cell_dirty = true;
+                    }
+                    for m in ALL_MACHINES {
+                        let code = m as i16;
+                        if ui
+                            .selectable_label(edit_cell.lock.machine == code, m.short_name())
+                            .clicked()
+                        {
+                            edit_cell.lock.machine = code;
+                            cell_dirty = true;
+                        }
+                    }
+                });
+
+                let labels = param_labels(eff_machine);
+                for (slot, &name) in labels.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let mut locked = ((edit_cell.lock.mask >> slot) & 1) != 0;
+                        if ui.checkbox(&mut locked, "").changed() {
+                            if locked {
+                                edit_cell.lock.mask |= 1 << slot;
+                            } else {
+                                edit_cell.lock.mask &= !(1 << slot);
+                            }
+                            cell_dirty = true;
+                        }
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut edit_cell.lock.values[slot], 0.0..=1.0)
+                                    .text(name),
+                            )
+                            .changed()
+                        {
+                            edit_cell.lock.mask |= 1 << slot;
+                            cell_dirty = true;
+                        }
+                    });
+                }
             });
 
+        if cell_dirty {
+            self.pattern.lanes[sel_lane][sel_row] = edit_cell;
+            let _ = self.cmd_tx.push(AudioCommand::SetCell {
+                lane: sel_lane,
+                row: sel_row,
+                cell: edit_cell,
+            });
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Score v3 Pattern 00 (64 Rows x 6 Lanes)");
+            ui.heading("Score v3 Pattern 00 (64 Rows x 6 Lanes — * marks sound-locked steps)");
             egui::ScrollArea::vertical().show(ui, |ui| {
                 egui::Grid::new("score_v3_grid")
                     .striped(true)
-                    .min_col_width(72.0)
+                    .min_col_width(74.0)
                     .show(ui, |ui| {
                         ui.monospace("ROW");
                         for name in LANE_NAMES {
@@ -444,22 +629,33 @@ impl eframe::App for LeviathanApp {
 
                             for lane in 0..NUM_LANES {
                                 let cell = &mut self.pattern.lanes[lane][row];
+                                let has_lock = cell.lock.mask != 0 || cell.lock.machine >= 0;
+                                let sep = if has_lock { '*' } else { ' ' };
                                 let label = if cell.active {
                                     if cell.air {
-                                        "AIR --".to_string()
+                                        format!("AIR{sep}--")
                                     } else {
-                                        format!("{} {:02X}", midi_label(cell.midi), cell.velocity)
+                                        format!("{}{sep}{:02X}", midi_label(cell.midi), cell.velocity)
                                     }
+                                } else if has_lock {
+                                    "---*--".to_string()
                                 } else {
                                     "--- --".to_string()
                                 };
-                                if ui.selectable_label(cell.active, label).clicked() {
+                                let resp = ui.selectable_label(
+                                    cell.active || self.selected_step == (lane, row),
+                                    label,
+                                );
+                                if resp.clicked() {
+                                    self.selected_step = (lane, row);
                                     cell.active = !cell.active;
                                     let _ = self.cmd_tx.push(AudioCommand::SetCell {
                                         lane,
                                         row,
                                         cell: *cell,
                                     });
+                                } else if resp.secondary_clicked() {
+                                    self.selected_step = (lane, row);
                                 }
                             }
                             ui.end_row();
@@ -476,7 +672,7 @@ impl eframe::App for LeviathanApp {
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 740.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1240.0, 780.0]),
         ..eframe::NativeOptions::default()
     };
     eframe::run_native(
@@ -491,10 +687,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn starter_pattern_populates_electro_triggers() {
+    fn starter_pattern_populates_fm_and_sampler_sound_locks() {
         let pat = starter_electro_pattern();
         assert!(pat.lanes[0][0].active);
-        assert!(pat.lanes[0][10].active);
+        assert_eq!(pat.lanes[1][4].lock.machine, MachineKind::FourOpFm as i16);
+        assert_ne!(pat.lanes[1][4].lock.mask, 0);
+        assert_eq!(pat.lanes[4][0].lock.machine, MachineKind::VarSampler as i16);
+        assert_eq!(param_labels(MachineKind::VarSampler)[1], "P1 ChipClk");
         assert_eq!(midi_label(60), "C-4");
     }
-}
+} u
