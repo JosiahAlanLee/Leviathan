@@ -1,4 +1,4 @@
-use cpal::traits::{DeviceTrait,use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use leviathan_core::{
     CvFrame, EngineConfig, FillCondition, NoteCell, Pattern, SoundLock, TrackerEvaluator,
@@ -696,4 +696,4 @@ mod tests {
         assert_eq!(param_labels(MachineKind::VarSampler)[1], "P1 ChipClk");
         assert_eq!(midi_label(60), "C-4");
     }
-} u
+}
