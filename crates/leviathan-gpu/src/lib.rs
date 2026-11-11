@@ -1,6 +1,9 @@
 use bytemuck::{Pod, Zeroable};
 use leviathan_core::CvFrame;
 
+/// Maximum accepted custom `.wgsl` shader source size (`256 KiB`).
+pub const MAX_CUSTOM_WGSL_BYTES: usize = 256 * 1024;
+
 /// 16-byte aligned uniform block shared directly with WGSL shaders (`64` bytes total).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
@@ -59,7 +62,7 @@ impl VisualUniforms {
     }
 }
 
-/// WGSL fullscreen triangle + ping-pong reactive Möbius/PDE feedback fragment shader compiled via `wgpu`/`naga`.
+/// Built-in WGSL fullscreen triangle + ping-pong reactive Möbius/PDE feedback fragment shader.
 pub const FEEDBACK_SHADER_WGSL: &str = r#"
 struct VisualUniforms {
     beat: f32,
@@ -132,6 +135,192 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     return vec4<f32>(clamp(mixed, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 "#;
+
+/// Documented starter `.wgsl` shader template exported by `"Export Starter .wgsl"` for live-coding.
+pub const STARTER_SHADER_TEMPLATE_WGSL: &str = r#"// Leviathan Custom Ping-Pong Feedback Shader Starter (.wgsl)
+// BSD-3-Clause — Edit `fs_main` while Leviathan watches this file to live-reload!
+//
+// `@group(0)` ABI contract (64-byte VisualUniforms + ping-pong previous frame):
+//   - u.beat          : continuous musical beat phase
+//   - u.z_norm        : normalized Z automation [0.0 .. 1.0]
+//   - u.roll_rad      : roll automation angle in radians [-pi .. +pi]
+//   - u.feedback_norm : feedback mix amount [0.0 .. 0.98]
+//   - u.gate_energy   : per-bank gate envelopes (x=B0, y=B1, z=B2, w=B3) [0.0 .. 1.0]
+//   - u.pitch_norm    : per-bank 1V/oct pitch offsets (x=B0, y=B1, z=B2, w=B3)
+//   - u.byte_mask     : 8-bit ByteBus bitmask (0..255)
+//   - u.frame_index   : monotonic render frame counter
+//   - u.width, height : render target dimensions in pixels
+
+struct VisualUniforms {
+    beat: f32,
+    z_norm: f32,
+    roll_rad: f32,
+    feedback_norm: f32,
+    gate_energy: vec4<f32>,
+    pitch_norm: vec4<f32>,
+    byte_mask: u32,
+    frame_index: u32,
+    width: f32,
+    height: f32,
+};
+
+@group(0) @binding(0)
+var<uniform> u: VisualUniforms;
+@group(0) @binding(1)
+var prev_tex: texture_2d<f32>;
+@group(0) @binding(2)
+var prev_sampler: sampler;
+
+struct VertexOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOut {
+    var out: VertexOut;
+    let x = f32((idx << 1u) & 2u);
+    let y = f32(idx & 2u);
+    out.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+    out.uv = vec2<f32>(x, y);
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    let aspect = u.width / max(u.height, 1.0);
+    let uv_c = (in.uv - vec2<f32>(0.5, 0.5)) * vec2<f32>(aspect, 1.0);
+    let c = cos(u.roll_rad);
+    let s = sin(u.roll_rad);
+    let p = vec2<f32>(uv_c.x * c - uv_c.y * s, uv_c.x * s + uv_c.y * c) * (1.35 - 0.6 * u.z_norm);
+
+    let wave = 0.5 + 0.5 * sin(12.0 * length(p) - u.beat * 6.2831853);
+    let byte_glow = f32(u.byte_mask & 255u) / 255.0;
+    let fg = vec3<f32>(
+        0.12 + 0.65 * wave * (0.35 + 0.65 * u.gate_energy.x),
+        0.14 + 0.55 * abs(sin(p.x * 8.0)) * (0.3 + 0.7 * u.gate_energy.y) + 0.2 * byte_glow,
+        0.20 + 0.60 * abs(cos(p.y * 8.0)) * (0.3 + 0.7 * u.gate_energy.z)
+    );
+
+    let drift = (in.uv - vec2<f32>(0.5, 0.5)) * (0.988 - 0.03 * u.gate_energy.x) + vec2<f32>(0.5, 0.5);
+    let prev_rgb = textureSample(prev_tex, prev_sampler, drift).rgb;
+    let fb = clamp(u.feedback_norm, 0.0, 0.94);
+    let color = mix(fg, prev_rgb.gbr * 0.25 + prev_rgb * 0.75, fb);
+    return vec4<f32>(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+"#;
+
+/// Returns `true` when `name` ends with a case-insensitive `.wgsl` file extension.
+pub fn is_wgsl_filename(name: &str) -> bool {
+    let trimmed = name.trim();
+    match trimmed.rsplit_once('.') {
+        Some((_, ext)) => ext.eq_ignore_ascii_case("wgsl"),
+        None => false,
+    }
+}
+
+fn strip_wgsl_comments(src: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(src.len());
+    let bytes = src.as_bytes();
+    let mut i = 0;
+    let mut block_depth = 0usize;
+
+    while i < bytes.len() {
+        if block_depth > 0 {
+            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                block_depth += 1;
+                i += 2;
+            } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                block_depth -= 1;
+                out.push(' ');
+                i += 2;
+            } else {
+                if bytes[i] == b'\n' {
+                    out.push('\n');
+                }
+                i += 1;
+            }
+        } else if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            block_depth = 1;
+            i += 2;
+        } else {
+            let ch = src[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+
+    if block_depth != 0 {
+        return Err("Unterminated /* ... */ block comment in WGSL source".to_string());
+    }
+    Ok(out)
+}
+
+/// Fast pre-flight contract check for custom Leviathan WGSL shaders before GPU compilation.
+pub fn validate_wgsl_contract(source: &str) -> Result<(), String> {
+    if source.trim().is_empty() {
+        return Err("WGSL shader source is empty".to_string());
+    }
+    if source.len() > MAX_CUSTOM_WGSL_BYTES {
+        return Err(format!(
+            "WGSL shader exceeds max size ({} > {} bytes)",
+            source.len(),
+            MAX_CUSTOM_WGSL_BYTES
+        ));
+    }
+
+    let stripped = strip_wgsl_comments(source)?;
+
+    let mut brace_depth = 0i32;
+    let mut paren_depth = 0i32;
+    for ch in stripped.chars() {
+        match ch {
+            '{' => brace_depth += 1,
+            '}' => {
+                brace_depth -= 1;
+                if brace_depth < 0 {
+                    return Err("Unbalanced '}' in WGSL shader source".to_string());
+                }
+            }
+            '(' => paren_depth += 1,
+            ')' => {
+                paren_depth -= 1;
+                if paren_depth < 0 {
+                    return Err("Unbalanced ')' in WGSL shader source".to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    if brace_depth != 0 {
+        return Err("Unclosed '{' in WGSL shader source".to_string());
+    }
+    if paren_depth != 0 {
+        return Err("Unclosed '(' in WGSL shader source".to_string());
+    }
+
+    for marker in [
+        "@group(0)",
+        "@binding(0)",
+        "@vertex",
+        "fn vs_main",
+        "@fragment",
+        "fn fs_main",
+    ] {
+        if !stripped.contains(marker) {
+            return Err(format!(
+                "WGSL shader missing required Leviathan ABI marker `{marker}`"
+            ));
+        }
+    }
+
+    Ok(())
+}
 
 /// Ping-pong RGBA8 software feedback surface for headless fallback & deterministic verification.
 pub struct FeedbackSurface {
@@ -209,26 +398,22 @@ mod tests {
         cv.beat = 4.25;
         cv.z_v = 5.0;
         cv.feedback_v = 7.5;
-        cv.gate_v[0] = 10.0;
-        cv.bytebus_v[0] = 10.0;
-        cv.bytebus_v[3] = 10.0;
+        cv.gate_v = [10.0, 2.5, 0.0, 5.0];
+        cv.pitch_v = [0.25, -0.5, 1.0, 0.0];
+        cv.bytebus_v[0] = 6.0;
+        cv.bytebus_v[3] = 8.0;
 
-        let u = VisualUniforms::from_cv(&cv, 42, 640, 360);
-        assert_eq!(u.as_bytes().len(), 64);
+        let u = VisualUniforms::from_cv(&cv, 12, 640, 360);
+        assert_eq!(u.beat, 4.25);
+        assert_eq!(u.z_norm, 0.5);
+        assert_eq!(u.feedback_norm, 0.75);
+        assert_eq!(u.gate_energy, [1.0, 0.25, 0.0, 0.5]);
+        assert_eq!(u.pitch_norm, [0.25, -0.5, 1.0, 0.0]);
         assert_eq!(u.byte_mask, 0b0000_1001);
-        assert!((u.z_norm - 0.5).abs() < 1e-5);
-        assert!((u.gate_energy[0] - 1.0).abs() < 1e-5);
-        assert_eq!(u.frame_index, 42);
-    }
-
-    #[test]
-    fn feedback_shader_declares_ping_pong_bindings_and_entry_points() {
-        assert!(FEEDBACK_SHADER_WGSL.contains("@group(0) @binding(0)"));
-        assert!(FEEDBACK_SHADER_WGSL.contains("@group(0) @binding(1)"));
-        assert!(FEEDBACK_SHADER_WGSL.contains("@group(0) @binding(2)"));
-        assert!(FEEDBACK_SHADER_WGSL.contains("fn vs_main"));
-        assert!(FEEDBACK_SHADER_WGSL.contains("fn fs_main"));
-        assert!(FEEDBACK_SHADER_WGSL.contains("textureSample(prev_tex, prev_sampler"));
+        assert_eq!(u.frame_index, 12);
+        assert_eq!(u.width, 640.0);
+        assert_eq!(u.height, 360.0);
+        assert_eq!(u.as_bytes().len(), 64);
     }
 
     #[test]
@@ -246,5 +431,46 @@ mod tests {
         let u1 = VisualUniforms::from_cv(&cv, 1, 32, 18);
         let frame1 = surf.step(&u1);
         assert_ne!(frame0.as_slice(), frame1);
+    }
+
+    #[test]
+    fn starter_wgsl_template_matches_leviathan_abi_contract() {
+        validate_wgsl_contract(FEEDBACK_SHADER_WGSL)
+            .expect("built-in feedback shader must satisfy contract");
+        validate_wgsl_contract(STARTER_SHADER_TEMPLATE_WGSL)
+            .expect("starter template shader must satisfy contract");
+
+        for marker in [
+            "struct VisualUniforms",
+            "@group(0) @binding(0)",
+            "@group(0) @binding(1)",
+            "@group(0) @binding(2)",
+            "prev_tex",
+            "prev_sampler",
+            "fn vs_main",
+            "fn fs_main",
+        ] {
+            assert!(
+                STARTER_SHADER_TEMPLATE_WGSL.contains(marker),
+                "starter template missing marker {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn wgsl_contract_validator_rejects_malformed_or_incomplete_shaders() {
+        assert!(validate_wgsl_contract("   ").is_err());
+        assert!(validate_wgsl_contract("// @vertex fn vs_main @fragment fn fs_main").is_err());
+
+        let unclosed_brace = format!("{STARTER_SHADER_TEMPLATE_WGSL}\nfn broken() {{");
+        assert!(validate_wgsl_contract(&unclosed_brace).is_err());
+
+        let missing_fs = STARTER_SHADER_TEMPLATE_WGSL.replace("fn fs_main", "fn wrong_entry");
+        assert!(validate_wgsl_contract(&missing_fs).is_err());
+
+        assert!(is_wgsl_filename("custom_feedback.wgsl"));
+        assert!(is_wgsl_filename("PATCH.WGSL"));
+        assert!(!is_wgsl_filename("kick_01.wav"));
+        assert!(!is_wgsl_filename("project.leviathan.json"));
     }
 }
