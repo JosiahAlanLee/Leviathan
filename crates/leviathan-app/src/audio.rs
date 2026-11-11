@@ -47,6 +47,7 @@ impl AudioCommand {
             Self::Reset => player.reset_transport(pattern_count),
             Self::Launch(target) => player.launch(*target, pattern_count),
             Self::SetChain(chain) => player.set_chain(*chain),
+            Self::SetPattern { index, .. } => player.invalidate_pattern_timing(*index),
             Self::ReplaceProject(project) => {
                 *player = project.player(player.evaluator.config.sample_rate);
             }
@@ -83,16 +84,19 @@ impl AudioProject {
     }
 
     fn player(&self, sample_rate: f64) -> SongPlayer {
+        let count = self.patterns.len().min(PATTERN_BANK_CAPACITY);
         let mut player = SongPlayer::new(EngineConfig {
             bpm: self.bpm,
             sample_rate,
             ..EngineConfig::default()
         });
         player.set_chain(self.chain);
-        player.launch(
-            LaunchTarget::Pattern(self.selected_pattern),
-            self.patterns.len(),
-        );
+        if count > 0 {
+            player.launch(
+                LaunchTarget::Pattern(self.selected_pattern.min(count - 1)),
+                count,
+            );
+        }
         player
     }
 }
@@ -237,7 +241,7 @@ impl RtAudioWorker {
                     for (dest, source) in self.patterns.iter_mut().zip(&project.patterns) {
                         dest.clone_from(source);
                     }
-                    self.pattern_count = project.patterns.len();
+                    self.pattern_count = project.patterns.len().min(self.patterns.len());
                     self.synth.sample_bank.clone_from(&project.sample_bank);
                     self.synth.reset_voices();
                     self.generation = project.generation;
@@ -389,6 +393,7 @@ mod tests {
         control.send(AudioCommand::SetBpm(137.0));
         let pattern = Arc::new(Pattern::default());
         let weak = Arc::downgrade(&pattern);
+
         control.send(AudioCommand::SetPattern { index: 1, pattern });
         control.send(AudioCommand::Launch(LaunchTarget::Pattern(1)));
         assert!(control.has_pending());
@@ -483,5 +488,47 @@ mod tests {
             ),
             (0.25, 0, 10.0, 7.5)
         );
+    }
+
+    #[test]
+    fn set_pattern_refreshes_active_timing_and_replace_project_clamps_bank_count() {
+        let (tx, rx) = rtrb::RingBuffer::new(8);
+        let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(16);
+        let mut audio = AudioControl::new(tx);
+        let mut worker = RtAudioWorker::new(Pattern::default(), 100.0, rx, tel_tx);
+
+        let oversized = Project {
+            bpm: 120.0,
+            patterns: vec![Pattern::default(); PATTERN_BANK_CAPACITY + 4],
+            selected_pattern: PATTERN_BANK_CAPACITY + 2,
+            chain: PatternChain::default(),
+            samples: core::array::from_fn(|_| None),
+        };
+        audio.send(AudioCommand::ReplaceProject(Arc::new(
+            AudioProject::prepare(&oversized, 2),
+        )));
+        worker.drain_commands();
+        assert_eq!(worker.pattern_count, PATTERN_BANK_CAPACITY);
+        assert_eq!(worker.player.status().pattern, PATTERN_BANK_CAPACITY - 1);
+
+        audio.send(AudioCommand::Launch(LaunchTarget::Pattern(0)));
+        audio.send(AudioCommand::SetPlaying(true));
+        worker.drain_commands();
+        for _ in 0..50 {
+            worker.next_stereo();
+        }
+        audio.send(AudioCommand::SetPlaying(false));
+        audio.send(AudioCommand::SetPattern {
+            index: 0,
+            pattern: Arc::new(Pattern {
+                length: 4,
+                rate: PlaybackRate::FourX,
+                ..Pattern::default()
+            }),
+        });
+        audio.send(AudioCommand::SetPlaying(true));
+        worker.drain_commands();
+        worker.next_stereo();
+        assert_eq!(worker.player.status().pattern, 0);
     }
 }
