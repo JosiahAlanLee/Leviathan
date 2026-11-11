@@ -1,3 +1,8 @@
+mod sampler_ui;
+mod wav;
+
+use std::sync::Arc;
+
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use leviathan_core::{
@@ -6,6 +11,7 @@ use leviathan_core::{
 };
 use leviathan_dsp::{MachineKind, SynthRack};
 use leviathan_gpu::{FeedbackSurface, VisualUniforms, FEEDBACK_SHADER_WGSL};
+use sampler_ui::{BankAction, SamplerBankUi};
 
 const LANE_NAMES: [&str; NUM_LANES] = ["0 KICK", "1 FM4", "2 SUB", "3 AIR", "4 SMPL", "5 ACID"];
 
@@ -45,7 +51,7 @@ fn param_labels(machine: MachineKind) -> [&'static str; 8] {
             "P0 Decay",
             "P1 Drive",
             "P2 Cutoff",
-            "P3Aux3",
+            "P3 Aux3",
             "P4 Aux4",
             "P5 Aux5",
             "P6 Aux6",
@@ -54,7 +60,7 @@ fn param_labels(machine: MachineKind) -> [&'static str; 8] {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum AudioCommand {
     SetPlaying(bool),
     SetFill(bool),
@@ -64,6 +70,14 @@ enum AudioCommand {
         lane: usize,
         row: usize,
         cell: NoteCell,
+    },
+    LoadSampleBank {
+        bank: usize,
+        samples: Arc<[i16]>,
+        c4_rate_hz: f32,
+    },
+    ResetSampleBank {
+        bank: usize,
     },
 }
 
@@ -85,7 +99,6 @@ fn starter_electro_pattern() -> Pattern {
             };
         }
 
-        // Lane 1 (FourOpFm): DualPairs glass plucks on 4/12 + sound-locked Cascade bell clangs on 9/15
         if matches!(step16, 4 | 12) {
             pat.lanes[1][row] = NoteCell {
                 active: true,
@@ -140,7 +153,6 @@ fn starter_electro_pattern() -> Pattern {
             };
         }
 
-        // Lane 4 (VarSampler): Ping-pong scanned m7 chord on even bars + down-clocked 9kHz anvil on odd bars
         if step16 == 0 && bar % 2 == 0 {
             pat.lanes[4][row] = NoteCell {
                 active: true,
@@ -219,6 +231,18 @@ impl RtAudioWorker {
                     if lane < NUM_LANES && row < ROWS_PER_PATTERN {
                         self.pattern.lanes[lane][row] = cell;
                     }
+                }
+                AudioCommand::LoadSampleBank {
+                    bank,
+                    samples,
+                    c4_rate_hz,
+                } => {
+                    self.synth
+                        .sample_bank
+                        .load_pcm_with_rate(bank, &samples, c4_rate_hz);
+                }
+                AudioCommand::ResetSampleBank { bank } => {
+                    self.synth.sample_bank.reset_rom_bank(bank);
                 }
             }
         }
@@ -342,6 +366,7 @@ struct LeviathanApp {
     fill_active: bool,
     bpm: f64,
     selected_step: (usize, usize),
+    sampler_ui: SamplerBankUi,
     cmd_tx: rtrb::Producer<AudioCommand>,
     tel_rx: rtrb::Consumer<CvFrame>,
     _audio_stream: Option<cpal::Stream>,
@@ -391,6 +416,7 @@ impl LeviathanApp {
             fill_active: false,
             bpm: 132.0,
             selected_step: (4, 0),
+            sampler_ui: SamplerBankUi::default(),
             cmd_tx,
             tel_rx,
             _audio_stream,
@@ -414,6 +440,8 @@ impl eframe::App for LeviathanApp {
                 ev.playing = self.playing;
             }
         }
+
+        let (hovering_wav, mut bank_actions) = self.sampler_ui.poll_drag_and_drop(ctx);
 
         while let Ok(cv) = self.tel_rx.pop() {
             self.latest_cv = cv;
@@ -496,104 +524,107 @@ impl eframe::App for LeviathanApp {
         let mut cell_dirty = false;
 
         egui::SidePanel::right("visual_and_bus_panel")
-            .min_width(372.0)
+            .min_width(376.0)
             .show(ctx, |ui| {
-                ui.heading("Live Feedback Surface");
-                ui.image((tex_id, egui::vec2(352.0, 198.0)));
-                ui.separator();
-                ui.monospace(format!(
-                    "Z: {:4.2} V | Roll: {:+5.2} V | Fbk: {:4.2} V",
-                    self.latest_cv.z_v, self.latest_cv.roll_v, self.latest_cv.feedback_v
-                ));
-                ui.horizontal(|ui| {
-                    for bit in 0..9 {
-                        let high = self.latest_cv.bytebus_v[bit] > 5.0;
-                        let tag = if bit < 8 {
-                            format!("B{bit}")
-                        } else {
-                            "CLK".to_string()
-                        };
-                        let _ = ui.selectable_label(high, tag);
-                    }
-                });
-
-                ui.separator();
-                let eff_machine = MachineKind::from_lane_and_lock(sel_lane, &edit_cell.lock);
-                ui.heading(format!(
-                    "Step Lock — {} Row {:02X} ({})",
-                    LANE_NAMES[sel_lane],
-                    sel_row,
-                    eff_machine.short_name()
-                ));
-                ui.small("Left-click grid toggles step; right-click inspects without toggling.");
-
-                ui.horizontal(|ui| {
-                    if ui.checkbox(&mut edit_cell.active, "On").changed() {
-                        cell_dirty = true;
-                    }
-                    if ui.checkbox(&mut edit_cell.air, "Air").changed() {
-                        cell_dirty = true;
-                    }
-                    ui.label("MIDI");
-                    if ui
-                        .add(egui::DragValue::new(&mut edit_cell.midi).range(24..=96))
-                        .changed()
-                    {
-                        cell_dirty = true;
-                    }
-                    ui.label("Vel");
-                    if ui
-                        .add(egui::DragValue::new(&mut edit_cell.velocity).range(1..=127))
-                        .changed()
-                    {
-                        cell_dirty = true;
-                    }
-                });
-
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .selectable_label(edit_cell.lock.machine < 0, "Lane")
-                        .clicked()
-                    {
-                        edit_cell.lock.machine = -1;
-                        cell_dirty = true;
-                    }
-                    for m in ALL_MACHINES {
-                        let code = m as i16;
-                        if ui
-                            .selectable_label(edit_cell.lock.machine == code, m.short_name())
-                            .clicked()
-                        {
-                            edit_cell.lock.machine = code;
-                            cell_dirty = true;
-                        }
-                    }
-                });
-
-                let labels = param_labels(eff_machine);
-                for (slot, &name) in labels.iter().enumerate() {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("Live Feedback Surface");
+                    ui.image((tex_id, egui::vec2(348.0, 196.0)));
+                    ui.monospace(format!(
+                        "Z: {:4.2} V | Roll: {:+5.2} V | Fbk: {:4.2} V",
+                        self.latest_cv.z_v, self.latest_cv.roll_v, self.latest_cv.feedback_v
+                    ));
                     ui.horizontal(|ui| {
-                        let mut locked = ((edit_cell.lock.mask >> slot) & 1) != 0;
-                        if ui.checkbox(&mut locked, "").changed() {
-                            if locked {
-                                edit_cell.lock.mask |= 1 << slot;
+                        for bit in 0..9 {
+                            let high = self.latest_cv.bytebus_v[bit] > 5.0;
+                            let tag = if bit < 8 {
+                                format!("B{bit}")
                             } else {
-                                edit_cell.lock.mask &= !(1 << slot);
-                            }
+                                "CLK".to_string()
+                            };
+                            let _ = ui.selectable_label(high, tag);
+                        }
+                    });
+
+                    bank_actions.extend(self.sampler_ui.draw(ui, hovering_wav));
+
+                    ui.separator();
+                    let eff_machine = MachineKind::from_lane_and_lock(sel_lane, &edit_cell.lock);
+                    ui.heading(format!(
+                        "Step Lock — {} Row {:02X} ({})",
+                        LANE_NAMES[sel_lane],
+                        sel_row,
+                        eff_machine.short_name()
+                    ));
+                    ui.small("Left-click toggles step; right-click inspects.");
+
+                    ui.horizontal(|ui| {
+                        if ui.checkbox(&mut edit_cell.active, "On").changed() {
                             cell_dirty = true;
                         }
+                        if ui.checkbox(&mut edit_cell.air, "Air").changed() {
+                            cell_dirty = true;
+                        }
+                        ui.label("MIDI");
                         if ui
-                            .add(
-                                egui::Slider::new(&mut edit_cell.lock.values[slot], 0.0..=1.0)
-                                    .text(name),
-                            )
+                            .add(egui::DragValue::new(&mut edit_cell.midi).range(24..=96))
                             .changed()
                         {
-                            edit_cell.lock.mask |= 1 << slot;
+                            cell_dirty = true;
+                        }
+                        ui.label("Vel");
+                        if ui
+                            .add(egui::DragValue::new(&mut edit_cell.velocity).range(1..=127))
+                            .changed()
+                        {
                             cell_dirty = true;
                         }
                     });
-                }
+
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .selectable_label(edit_cell.lock.machine < 0, "Lane")
+                            .clicked()
+                        {
+                            edit_cell.lock.machine = -1;
+                            cell_dirty = true;
+                        }
+                        for m in ALL_MACHINES {
+                            let code = m as i16;
+                            if ui
+                                .selectable_label(edit_cell.lock.machine == code, m.short_name())
+                                .clicked()
+                            {
+                                edit_cell.lock.machine = code;
+                                cell_dirty = true;
+                            }
+                        }
+                    });
+
+                    let labels = param_labels(eff_machine);
+                    for (slot, &name) in labels.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let mut locked = ((edit_cell.lock.mask >> slot) & 1) != 0;
+                            if ui.checkbox(&mut locked, "").changed() {
+                                if locked {
+                                    edit_cell.lock.mask |= 1 << slot;
+                                } else {
+                                    edit_cell.lock.mask &= !(1 << slot);
+                                }
+                                cell_dirty = true;
+                            }
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut edit_cell.lock.values[slot], 0.0..=1.0)
+                                        .text(name),
+                                )
+                                .changed()
+                            {
+                                edit_cell.lock.mask |= 1 << slot;
+                                cell_dirty = true;
+                            }
+                        });
+                    }
+                });
             });
 
         if cell_dirty {
@@ -603,6 +634,22 @@ impl eframe::App for LeviathanApp {
                 row: sel_row,
                 cell: edit_cell,
             });
+        }
+
+        for action in bank_actions {
+            let cmd = match action {
+                BankAction::Load {
+                    bank,
+                    samples,
+                    c4_rate_hz,
+                } => AudioCommand::LoadSampleBank {
+                    bank,
+                    samples,
+                    c4_rate_hz,
+                },
+                BankAction::ResetRom { bank } => AudioCommand::ResetSampleBank { bank },
+            };
+            let _ = self.cmd_tx.push(cmd);
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -635,7 +682,11 @@ impl eframe::App for LeviathanApp {
                                     if cell.air {
                                         format!("AIR{sep}--")
                                     } else {
-                                        format!("{}{sep}{:02X}", midi_label(cell.midi), cell.velocity)
+                                        format!(
+                                            "{}{sep}{:02X}",
+                                            midi_label(cell.midi),
+                                            cell.velocity
+                                        )
                                     }
                                 } else if has_lock {
                                     "---*--".to_string()
@@ -672,7 +723,9 @@ impl eframe::App for LeviathanApp {
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1240.0, 780.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1260.0, 840.0])
+            .with_drag_and_drop(true),
         ..eframe::NativeOptions::default()
     };
     eframe::run_native(
@@ -696,4 +749,4 @@ mod tests {
         assert_eq!(param_labels(MachineKind::VarSampler)[1], "P1 ChipClk");
         assert_eq!(midi_label(60), "C-4");
     }
-}
+                        }
