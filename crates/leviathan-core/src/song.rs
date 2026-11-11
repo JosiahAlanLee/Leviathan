@@ -94,6 +94,12 @@ impl SongPlayer {
         }
     }
 
+    pub fn invalidate_pattern_timing(&mut self, pattern_index: usize) {
+        if pattern_index == self.evaluator.active_pattern {
+            self.timing = None;
+        }
+    }
+
     fn resolve(
         &self,
         target: LaunchTarget,
@@ -176,7 +182,8 @@ impl SongPlayer {
                     self.previous_plays.wrapping_add(1)
                 } else {
                     0
-                };
+                }
+                ;
                 self.evaluator.active_pattern = next;
                 self.chain_entry = entry;
                 // Advance by the musical duration, keeping sub-sample overshoot out of the anchor.
@@ -242,6 +249,32 @@ mod tests {
             (16.0, 0, 1.0, 10.0, 7.5)
         );
         assert_eq!((cv.clock_v, cv.reset_v), (10.0, 0.0));
+    }
+
+    #[test]
+    fn active_pattern_rate_edit_updates_cached_timing_without_resetting_clock() {
+        let mut patterns = [Pattern::default()];
+        let mut song = SongPlayer::new(EngineConfig {
+            bpm: 120.0,
+            sample_rate: 100.0,
+            ..EngineConfig::default()
+        });
+        song.evaluator.playing = true;
+        for _ in 0..100 {
+            song.step_sample(&patterns);
+        }
+        song.evaluator.playing = false;
+        patterns[0].rate = PlaybackRate::TwoX;
+        song.invalidate_pattern_timing(0);
+        song.evaluator.playing = true;
+
+        for _ in 100..400 {
+            let (_, retrigger) = song.step_sample(&patterns);
+            assert!(!retrigger);
+        }
+        let (cv, retrigger) = song.step_sample(&patterns);
+        assert!(retrigger);
+        assert_eq!((cv.beat, cv.row), (8.0, 0));
     }
 
     #[test]
