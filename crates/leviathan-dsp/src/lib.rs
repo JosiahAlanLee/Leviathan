@@ -1,12 +1,16 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 pub mod fm;
+mod master;
 pub mod sampler;
 
 use core::f32::consts::{FRAC_1_PI, FRAC_2_PI, PI, TAU};
 use fm::FourOpFmVoice;
 use leviathan_core::{CvFrame, SoundLock, NUM_LANES};
+use master::MasterBus;
 use sampler::{SampleBank, VarClockSamplerVoice};
+
+pub use master::MasterPeaks;
 
 pub const MACHINE_COUNT: usize = 7;
 
@@ -202,15 +206,18 @@ impl Default for VoiceState {
 pub struct SynthRack {
     sample_rate: f32,
     voices: [VoiceState; NUM_LANES],
+    master: MasterBus,
     pub sample_bank: SampleBank,
     pub counter: ByteBusCounter,
 }
 
 impl SynthRack {
     pub fn new(sample_rate: f32) -> Self {
+        let sample_rate = sample_rate.max(8_000.0);
         Self {
-            sample_rate: sample_rate.max(8_000.0),
+            sample_rate,
             voices: Self::fresh_voices(),
+            master: MasterBus::new(sample_rate),
             sample_bank: SampleBank::new(),
             counter: ByteBusCounter::default(),
         }
@@ -227,6 +234,22 @@ impl SynthRack {
     pub fn reset_voices(&mut self) {
         self.voices = Self::fresh_voices();
         self.counter = ByteBusCounter::default();
+    }
+
+    pub fn set_master_send(&mut self, send: f32) {
+        self.master.set_send(send);
+    }
+
+    pub fn reset_master(&mut self, send: f32) {
+        self.master.reset(send);
+    }
+
+    pub fn master_peaks(&self) -> MasterPeaks {
+        self.master.peaks
+    }
+
+    pub fn clear_master_peaks(&mut self) {
+        self.master.peaks = MasterPeaks::default();
     }
 
     pub fn retrigger_gates(&mut self) {
@@ -316,7 +339,8 @@ impl SynthRack {
             right += v2 * pan * 0.45;
         }
 
-        (fast_tanh(left), fast_tanh(right))
+        let [left, right] = self.master.process([left, right]);
+        (left, right)
     }
 }
 
@@ -363,6 +387,32 @@ mod tests {
             energy += l.abs() + r.abs();
         }
         assert!(energy > 0.25);
+    }
+
+    #[test]
+    fn master_bounds_hot_six_lane_chords_and_reports_the_overload() {
+        let lock = SoundLock {
+            machine: MachineKind::AcidLead as i16,
+            mask: 0b101,
+            values: [0.98, 0.0, 0.88, 0.0, 0.0, 0.0, 0.0, 0.0],
+        };
+        let cv = CvFrame {
+            pitch_v: [-12, -8, -5, 0, 4, 7].map(|semitones| semitones as f32 / 12.0),
+            gate_v: [10.0; NUM_LANES],
+            velocity_v: [10.0; NUM_LANES],
+            locks: [lock; NUM_LANES],
+            ..CvFrame::default()
+        };
+        let mut rack = SynthRack::new(48_000.0);
+        rack.reset_master(1.0);
+        for _ in 0..8192 {
+            let (left, right) = rack.render_stereo(&cv);
+            assert!((-1.0..=1.0).contains(&left));
+            assert!((-1.0..=1.0).contains(&right));
+        }
+        let peaks = rack.master_peaks();
+        assert_eq!(peaks.clipped, [true, true], "{peaks:?}");
+        assert!(peaks.output.iter().all(|peak| *peak > 0.9));
     }
 
     #[test]

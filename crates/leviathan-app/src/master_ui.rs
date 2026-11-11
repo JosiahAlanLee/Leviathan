@@ -1,0 +1,86 @@
+use eframe::egui;
+use leviathan_dsp::MasterPeaks;
+
+const LEVEL_FLOOR: f32 = 0.001;
+const CLIP_HOLD_SECONDS: f64 = 1.0;
+
+#[derive(Default)]
+pub struct MasterMeters {
+    levels: [f32; 2],
+    clip_until: [f64; 2],
+    last_update: f64,
+}
+
+impl MasterMeters {
+    pub fn update(&mut self, peaks: MasterPeaks, now: f64) {
+        let decay = (-7.0 * (now - self.last_update).max(0.0) as f32).exp();
+        self.last_update = now;
+        for channel in 0..2 {
+            let level = (self.levels[channel] * decay).max(peaks.output[channel]);
+            self.levels[channel] = if level >= LEVEL_FLOOR { level } else { 0.0 };
+            if peaks.clipped[channel] {
+                self.clip_until[channel] = now + CLIP_HOLD_SECONDS;
+            }
+        }
+    }
+
+    pub fn is_active(&self, now: f64) -> bool {
+        self.levels.iter().any(|&level| level > 0.0) || self.clip_until.iter().any(|&end| end > now)
+    }
+
+    pub fn draw(&self, ui: &mut egui::Ui, now: f64) {
+        ui.horizontal(|ui| {
+            for (channel, label) in ["L", "R"].into_iter().enumerate() {
+                let level = self.levels[channel];
+                let db = 20.0 * level.max(LEVEL_FLOOR).log10();
+                let fill = if self.clip_until[channel] > now {
+                    egui::Color32::LIGHT_RED
+                } else {
+                    egui::Color32::from_rgb(105, 193, 153)
+                };
+                ui.label(label);
+                ui.add(
+                    egui::ProgressBar::new((db + 60.0) / 60.0)
+                        .desired_width(42.0)
+                        .desired_height(9.0)
+                        .fill(fill),
+                )
+                .on_hover_text(format!("{label} output peak {db:.1} dBFS"));
+            }
+            let label = egui::RichText::new("CLIP").small();
+            let label = if self.clip_until.iter().any(|&end| end > now) {
+                label.color(egui::Color32::LIGHT_RED)
+            } else {
+                label.weak()
+            };
+            ui.label(label)
+                .on_hover_text("The mix exceeded 0 dBFS before the limiter");
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_peaks_across_packets_and_holds_clip_after_levels_decay() {
+        let mut peaks = MasterPeaks {
+            output: [0.98, 0.23],
+            clipped: [true, false],
+        };
+        peaks.merge(MasterPeaks {
+            output: [0.02, 0.6],
+            clipped: [false, false],
+        });
+        let mut meters = MasterMeters::default();
+        meters.update(peaks, 5.0);
+        assert_eq!(meters.levels, [0.98, 0.6]);
+        assert_eq!(meters.clip_until, [6.0, 0.0]);
+
+        meters.update(MasterPeaks::default(), 5.5);
+        assert!(meters.levels[0] < 0.1 && meters.is_active(5.5));
+        meters.update(MasterPeaks::default(), 7.0);
+        assert!(!meters.is_active(7.0));
+    }
+}

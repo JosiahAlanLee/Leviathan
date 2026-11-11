@@ -16,6 +16,7 @@ const MAX_PROJECT_BYTES: u64 = 8 * 1024 * 1024;
 
 pub struct Project {
     pub bpm: f64,
+    pub master_send: f32,
     pub patterns: Vec<Pattern>,
     pub selected_pattern: usize,
     pub chain: PatternChain,
@@ -26,6 +27,8 @@ pub struct Project {
 struct ProjectFile {
     version: u32,
     bpm: f64,
+    #[serde(default)]
+    master_send: f32,
     patterns: Vec<Pattern>,
     selected_pattern: usize,
     chain: Vec<u8>,
@@ -83,6 +86,9 @@ impl ProjectFile {
         if !(40.0..=240.0).contains(&self.bpm) {
             return Err("BPM must be between 40 and 240".to_string());
         }
+        if !(0.0..=1.0).contains(&self.master_send) {
+            return Err("Master delay send must be between 0 and 1".to_string());
+        }
         if !(1..=PATTERN_BANK_CAPACITY).contains(&self.patterns.len())
             || self.selected_pattern >= self.patterns.len()
         {
@@ -112,6 +118,7 @@ impl ProjectFile {
         }
         Ok(Project {
             bpm: self.bpm,
+            master_send: self.master_send,
             patterns: self.patterns,
             selected_pattern: self.selected_pattern,
             chain,
@@ -165,6 +172,7 @@ pub fn load(path: &Path) -> Result<Project, String> {
 pub fn save(
     path: &Path,
     bpm: f64,
+    master_send: f32,
     patterns: &[Pattern],
     selected_pattern: usize,
     chain: &PatternChain,
@@ -173,6 +181,7 @@ pub fn save(
     let project = ProjectFile {
         version: PROJECT_VERSION,
         bpm,
+        master_send,
         patterns: patterns.to_vec(),
         selected_pattern,
         chain: chain.as_slice().to_vec(),
@@ -254,12 +263,14 @@ mod tests {
             peaks: sample_peaks(&pcm),
             samples: Arc::clone(&pcm),
         });
-        save(&path, 120.0, &patterns, 0, &chain, &samples).unwrap();
+        save(&path, 120.0, 0.0, &patterns, 0, &chain, &samples).unwrap();
         let bpm = f64::from_bits(120.0_f64.to_bits() + 1);
-        save(&path, bpm, &patterns, 1, &chain, &samples).unwrap();
+        let send = 0.37_f32;
+        save(&path, bpm, send, &patterns, 1, &chain, &samples).unwrap();
         let project = load(&path).unwrap();
         fs::remove_file(path).unwrap();
         assert_eq!(project.bpm.to_bits(), bpm.to_bits());
+        assert_eq!(project.master_send.to_bits(), send.to_bits());
         assert_eq!(project.selected_pattern, 1);
         assert_eq!(project.chain, chain);
         for (original, loaded) in patterns.iter().zip(&project.patterns) {
@@ -285,6 +296,7 @@ mod tests {
         let mut project = ProjectFile {
             version: PROJECT_VERSION + 1,
             bpm: 120.0,
+            master_send: 0.0,
             patterns: vec![Pattern::default()],
             selected_pattern: 0,
             chain: vec![1],
@@ -309,6 +321,7 @@ mod tests {
         let project = ProjectFile {
             version: PROJECT_VERSION,
             bpm: 120.0,
+            master_send: 0.0,
             patterns: vec![pat],
             selected_pattern: 0,
             chain: vec![],
@@ -316,6 +329,25 @@ mod tests {
         };
         let json = serde_json::to_value(&project).unwrap();
         assert!(project_error(&json).contains("Invalid sound lock"));
+    }
+
+    #[test]
+    fn older_projects_default_to_dry_and_invalid_send_is_rejected() {
+        let project = ProjectFile {
+            version: PROJECT_VERSION,
+            bpm: 120.0,
+            master_send: 0.5,
+            patterns: vec![Pattern::default()],
+            selected_pattern: 0,
+            chain: vec![],
+            sample_banks: core::array::from_fn(|_| None),
+        };
+        let mut json = serde_json::to_value(project).unwrap();
+        json.as_object_mut().unwrap().remove("master_send");
+        let old: ProjectFile = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(old.into_project().unwrap().master_send, 0.0);
+        json["master_send"] = serde_json::json!(1.25);
+        assert!(project_error(&json).contains("Master delay send"));
     }
 
     fn project_error(json: &serde_json::Value) -> String {

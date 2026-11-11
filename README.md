@@ -37,6 +37,8 @@ Leviathan uses a strict hexagonal ("ports and adapters") layout so external GPU,
 - **New Pattern** and **Clone** build a bank of up to 16 patterns. Select a pattern to edit it, and set its rate in the pattern bar. While playing, **Queue Pattern** switches at the end of the active pattern. A rate edit to the active pattern takes effect on its next pass.
 - **Add Pattern** appends the selected pattern to the chain. Entries can repeat. **Cue Chain** starts the chain from its first entry when you press Play. **Queue Chain** launches it at the next pattern boundary during playback.
 
+The transport's **Delay send** feeds a short stereo ping-pong delay and saves with the project. The L/R meters show output peaks in dBFS. **CLIP** holds for one second when the mix exceeds full scale before limiting.
+
 ## Quick Start
 
 ```bash
