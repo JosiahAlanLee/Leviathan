@@ -119,6 +119,7 @@ pub fn midi_for_piano_key(key: Key, base_octave: i32) -> Option<u8> {
     None
 }
 
+#[cfg(test)]
 pub fn hex_key_to_nibble(key: Key) -> Option<u8> {
     for &(k, nib) in &HEX_BINDINGS {
         if k == key {
