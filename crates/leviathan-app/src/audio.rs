@@ -8,7 +8,7 @@ use leviathan_core::{
 };
 use leviathan_dsp::{
     sampler::{SampleBank, SampleRegion},
-    LaneChannel, MasterPeaks, SynthRack,
+    LaneChannel, LanePatch, MasterPeaks, SynthRack,
 };
 use leviathan_gpu::{AudioScopeSnapshot, AudioScopeTap};
 
@@ -25,7 +25,9 @@ pub enum AudioCommand {
     SetMasterSend(f32),
     SetLaneAudibleMask(u8),
     SetLaneChannels([LaneChannel; NUM_LANES]),
+    SetLanePatch { lane: usize, patch: LanePatch },
     Reset,
+    
     Launch(LaunchTarget),
     SetChain(PatternChain),
     SetCell {
@@ -83,6 +85,7 @@ pub struct AudioProject {
     master_send: f32,
     audible_mask: u8,
     lane_channels: [LaneChannel; NUM_LANES],
+lane_patches: [LanePatch; NUM_LANES],
     patterns: Vec<Pattern>,
     selected_pattern: usize,
     chain: PatternChain,
@@ -97,6 +100,7 @@ impl AudioProject {
             master_send: project.master_send,
             audible_mask: project.lane_mix.audible_mask(),
             lane_channels: project.lane_mix.dsp_channels(),
+lane_patches: project.lane_patches,
             patterns: project.patterns.clone(),
             selected_pattern: project.selected_pattern,
             chain: project.chain,
@@ -271,6 +275,7 @@ impl RtAudioWorker {
                 AudioCommand::SetMasterSend(send) => self.synth.set_master_send(send),
                 AudioCommand::SetLaneAudibleMask(mask) => self.synth.set_lane_audible_mask(mask),
                 AudioCommand::SetLaneChannels(channels) => self.synth.set_lane_channels(channels),
+AudioCommand::SetLanePatch { lane, patch } => self.synth.set_lane_patch(lane, patch),
                 AudioCommand::SetCell {
                     pattern,
                     lane,
@@ -304,6 +309,7 @@ impl RtAudioWorker {
                     self.synth.sample_bank.clone_from(&project.sample_bank);
                     self.synth.set_lane_audible_mask(project.audible_mask);
                     self.synth.set_lane_channels(project.lane_channels);
+            self.synth.set_lane_patches(project.lane_patches);
                     self.synth.reset_voices();
                     self.synth.reset_master(project.master_send);
                     self.generation = project.generation;
