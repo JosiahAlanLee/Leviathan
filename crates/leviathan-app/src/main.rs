@@ -193,7 +193,7 @@ struct LeviathanApp {
     offline_player: Option<SongPlayer>,
     audio_status: String,
     latest_cv: CvFrame
-        latest_scope: leviathan_gpu::AudioScopeSnapshot,,
+        latest_scope: leviathan_gpu::AudioScopeSnapshot,
     latest_song: SongStatus,
     viewport: FeedbackViewport,
 }
