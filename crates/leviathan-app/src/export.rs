@@ -346,6 +346,7 @@ mod tests {
             selected_pattern: 0,
             chain,
             samples: core::array::from_fn(|_| None),
+            custom_shader: None,
         }
     }
 
