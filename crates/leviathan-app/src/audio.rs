@@ -7,7 +7,7 @@ use leviathan_core::{
     SongPlayer, SongStatus, SoundLock, NUM_LANES, ROWS_PER_PATTERN,
 };
 use leviathan_dsp::{sampler::SampleBank, MasterPeaks, SynthRack};
-
+use leviathan_gpu::{AudioScopeSnapshot, AudioScopeTap};
 use crate::midi::{MidiEvent, MidiKey, MidiReceiver, MidiTarget};
 use crate::project::{Project, PATTERN_BANK_CAPACITY};
 
@@ -186,6 +186,7 @@ pub struct AudioTelemetry {
     pub cv: CvFrame,
     pub song: SongStatus,
     pub master: MasterPeaks,
+    pub scope: AudioScopeSnapshot,
     pub playing: bool,
     pub play_request: u64,
 }
@@ -204,6 +205,7 @@ struct RtAudioWorker {
     pattern_count: usize,
     player: SongPlayer,
     synth: SynthRack,
+    scope_tap: AudioScopeTap,
     cmd_rx: rtrb::Consumer<AudioCommand>,
     tel_tx: rtrb::Producer<AudioTelemetry>,
     tel_divider: u32,
@@ -234,6 +236,7 @@ impl RtAudioWorker {
                 ..EngineConfig::default()
             }),
             synth: SynthRack::new(sample_rate as f32),
+            scope_tap: AudioScopeTap::new(sample_rate as f32),
             cmd_rx,
             tel_tx,
             tel_divider: 0,
@@ -410,6 +413,7 @@ impl RtAudioWorker {
             }
             self.synth.render_stereo(&cv)
         };
+        self.scope_tap.push_stereo(pair.0, pair.1);
         self.tel_divider = self.tel_divider.wrapping_add(1);
         if retrigger || (self.tel_divider & 255) == 0 {
             let telemetry = AudioTelemetry {
@@ -417,6 +421,7 @@ impl RtAudioWorker {
                 cv,
                 song: self.player.status(),
                 master: self.synth.master_peaks(),
+                scope: self.scope_tap.snapshot(),
                 playing: self.player.evaluator.playing,
                 play_request: self.play_request,
             };
