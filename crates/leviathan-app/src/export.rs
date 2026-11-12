@@ -6,20 +6,15 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use leviathan_core::{EngineConfig, LaunchTarget, SongPlayer, NUM_LANES};
-use leviathan_dsp::{StereoDelay, SynthRack};
+use leviathan_dsp::{StereoDelay,default_lane_patches, LanePatch,  SynthRack};
 
 use crate::project::Project;
 use crate::wav::{StereoWav, WavEncoding};
 
 pub const SAMPLE_RATES: [u32; 3] = [44_100, 48_000, 96_000];
-const STEM_FILES: [&str; NUM_LANES] = [
-    "0-kick.wav",
-    "1-fm4.wav",
-    "2-sub.wav",
-    "3-air.wav",
-    "4-smpl.wav",
-    "5-acid.wav",
-];
+fn stem_filename(lane: usize, patch: &LanePatch) -> String {
+    format!("{lane}-{}.wav", patch.machine.slug())
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ExportSource {
@@ -147,7 +142,7 @@ impl ExportJob {
         let worker = thread::Builder::new()
             .name("leviathan-wav-export".into())
             .spawn(move || {
-                write_outputs(&project, fill, plan, &request.destination, &progress)?;
+                (&project, fill, plan, &request.destination, &progress)?;
                 Ok(request.destination)
             })?;
         Ok(Self {
@@ -193,6 +188,7 @@ fn render(
     rack.sample_bank = project.sample_bank();
     rack.set_lane_audible_mask(project.lane_mix.audible_mask());
     rack.set_lane_channels(project.lane_mix.dsp_channels());
+    rack.set_lane_patches(project.lane_patches);
     rack.reset_voices();
     rack.reset_master(project.master_send);
 
@@ -239,8 +235,11 @@ fn write_outputs(
         require_new_folder(destination)?;
     }
     let stage = StagingDirectory::new(destination)?;
+    let lane_patches = &project.lane_patches;
+    let stem_names: [String; NUM_LANES] = core::array::from_fn(|lane| stem_filename(lane, &lane_patches[lane]));
+    let stem_file_refs: Vec<&str> = stem_names.iter().map(String::as_str).collect();
     let names = if plan.settings.stems {
-        &STEM_FILES[..]
+        &stem_file_refs[..]
     } else {
         &[]
     };
@@ -326,6 +325,7 @@ mod tests {
     use crate::lane_mix::LaneMix;
     use crate::wav::decode_wav_bytes;
     use leviathan_core::{NoteCell, Pattern, PatternChain, PlaybackRate};
+    use leviathan_dsp::MachineKind;
 
     fn project() -> Project {
         let mut pattern = Pattern {
@@ -351,6 +351,7 @@ mod tests {
         Project {
             bpm: 120.0,
             master_send: 0.3,
+        lane_patches: default_lane_patches(),
             lane_mix: LaneMix::default(),
             patterns: vec![pattern, second],
             selected_pattern: 0,
@@ -427,7 +428,7 @@ mod tests {
             stems
         );
         assert_eq!(fs::read_dir(&stems).unwrap().count(), NUM_LANES + 1);
-        for (lane, name) in STEM_FILES.iter().enumerate() {
+    for (lane, name) in ["0-kick.wav", "1-fm4.wav", "2-sub.wav", "3-air.wav", "4-smpl.wav", "5-acid.wav"].iter().enumerate() {
             let bytes = fs::read(stems.join(name)).unwrap();
             let decoded = decode_wav_bytes(name, &bytes).unwrap();
             assert_eq!(decoded.original_frames, 4980);
@@ -465,5 +466,33 @@ mod tests {
             io::ErrorKind::AlreadyExists
         );
         assert_eq!(fs::read(stems.join("master.wav")).unwrap(), master);
+    }
+    #[test]
+    fn stem_export_respects_dynamic_lane_patches_and_slug_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let stems = temp.path().join("stems");
+        let mut snapshot = project();
+        snapshot.lane_patches[0].machine = MachineKind::FourOpFm;
+        snapshot.lane_patches[0].params[1] = 0.05;
+        snapshot.lane_patches[1].machine = MachineKind::FourOpFm;
+        snapshot.lane_patches[1].params[1] = 0.95;
+        snapshot.lane_patches[2].machine = MachineKind::ChordStab;
+
+        let request = ExportRequest {
+            settings: ExportSettings {
+                stems: true,
+                ..ExportSettings::default()
+            },
+            destination: stems.clone(),
+        };
+
+        ExportJob::start(snapshot, false, request)
+            .unwrap()
+            .finish()
+            .unwrap();
+
+        assert!(stems.join("0-fm4.wav").exists());
+        assert!(stems.join("1-fm4.wav").exists());
+        assert!(stems.join("2-chrd.wav").exists());
     }
 }
