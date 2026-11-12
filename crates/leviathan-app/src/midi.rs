@@ -39,6 +39,7 @@ impl MidiEvent {
     }
 }
 
+#[cfg(test)]
 fn parse_message(bytes: &[u8]) -> Option<MidiEvent> {
     match bytes {
         &[status @ 0x80..=0x9f, note @ 0..=127, velocity @ 0..=127] => {
@@ -56,6 +57,90 @@ fn parse_message(bytes: &[u8]) -> Option<MidiEvent> {
         [0xfb] => Some(MidiEvent::Continue),
         [0xfc] => Some(MidiEvent::Stop),
         _ => None,
+    }
+}
+
+fn parse_packet(bytes: &[u8], mut on_event: impl FnMut(MidiEvent)) {
+    let mut status: Option<u8> = None;
+    let mut data_0: Option<u8> = None;
+    let mut in_sysex = false;
+
+    for &byte in bytes {
+        match byte {
+            0xfa => on_event(MidiEvent::Start),
+            0xfb => on_event(MidiEvent::Continue),
+            0xfc => on_event(MidiEvent::Stop),
+            0xf8 | 0xf9 | 0xfd..=0xff => {}
+            0xf0 => {
+                in_sysex = true;
+                status = None;
+                data_0 = None;
+            }
+            0xf7 => {
+                in_sysex = false;
+                status = None;
+                data_0 = None;
+            }
+            0xf1..=0xf3 => {
+                in_sysex = false;
+                status = Some(byte);
+                data_0 = None;
+            }
+            0xf4..=0xf6 => {
+                in_sysex = false;
+                status = None;
+                data_0 = None;
+            }
+            0x80..=0xef => {
+                in_sysex = false;
+                status = Some(byte);
+                data_0 = None;
+            }
+            0x00..=0x7f => {
+                if in_sysex {
+                    continue;
+                }
+                let Some(st) = status else {
+                    continue;
+                };
+                match st {
+                    0xc0..=0xdf => {
+                        data_0 = None;
+                    }
+                    0xf1 | 0xf3 => {
+                        status = None;
+                        data_0 = None;
+                    }
+                    0xf2 => {
+                        if data_0.take().is_none() {
+                            data_0 = Some(byte);
+                        } else {
+                            status = None;
+                        }
+                    }
+                    _ => {
+                        if let Some(first) = data_0.take() {
+                            if (0x80..=0x9f).contains(&st) {
+                                let key = MidiKey {
+                                    channel: st & 0x0f,
+                                    note: first,
+                                };
+                                if st < 0x90 || byte == 0 {
+                                    on_event(MidiEvent::NoteOff(key));
+                                } else {
+                                    on_event(MidiEvent::NoteOn {
+                                        key,
+                                        velocity: byte,
+                                    });
+                                }
+                            }
+                        } else {
+                            data_0 = Some(byte);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -161,18 +246,17 @@ struct CallbackData {
 }
 
 fn receive_message(_timestamp: u64, bytes: &[u8], data: &mut CallbackData) {
-    let Some(event) = parse_message(bytes) else {
-        return;
-    };
-    if data.senders.is_none() {
-        data.senders = data.handoff.pop().ok();
-    }
-    if let Some(senders) = &mut data.senders {
-        senders.push(MidiPacket {
-            port_epoch: data.port_epoch,
-            event,
-        });
-    }
+    parse_packet(bytes, |event| {
+        if data.senders.is_none() {
+            data.senders = data.handoff.pop().ok();
+        }
+        if let Some(senders) = &mut data.senders {
+            senders.push(MidiPacket {
+                port_epoch: data.port_epoch,
+                event,
+            });
+        }
+    });
 }
 
 struct Port {
@@ -275,7 +359,7 @@ impl MidiControls {
         let senders = self
             .idle
             .take()
-            .ok_or_else(|| "MIDI input queue is unavailable".to_string())?;
+            .ok_or_else(|| "MIDI input queue is unavailable.".to_string())?;
         self.port_epoch.store(epoch, Ordering::Release);
         if let Err(PushError::Full(senders)) = handoff.push(senders) {
             self.idle = Some(senders);
@@ -386,6 +470,129 @@ mod tests {
     }
 
     #[test]
+    fn packet_framer_unpacks_chords_running_status_and_interleaved_realtime() {
+        let mut chord = Vec::new();
+        parse_packet(&[0x92, 60, 100, 0x92, 64, 96, 0x92, 67, 92], |ev| {
+            chord.push(ev)
+        });
+        assert_eq!(
+            chord,
+            vec![
+                MidiEvent::NoteOn {
+                    key: MidiKey {
+                        channel: 2,
+                        note: 60
+                    },
+                    velocity: 100,
+                },
+                MidiEvent::NoteOn {
+                    key: MidiKey {
+                        channel: 2,
+                        note: 64
+                    },
+                    velocity: 96,
+                },
+                MidiEvent::NoteOn {
+                    key: MidiKey {
+                        channel: 2,
+                        note: 67
+                    },
+                    velocity: 92,
+                },
+            ]
+        );
+
+        let mut mixed = Vec::new();
+        parse_packet(
+            &[
+                0xfa, 0xb1, 1, 64, 0x91, 48, 0xf8, 110, 52, 95, 48, 0, 0xf0, 0x7e, 0x7f, 0xf7,
+                60, 100, 0xfc,
+            ],
+            |ev| mixed.push(ev),
+        );
+        assert_eq!(
+            mixed,
+            vec![
+                MidiEvent::Start,
+                MidiEvent::NoteOn {
+                    key: MidiKey {
+                        channel: 1,
+                        note: 48
+                    },
+                    velocity: 110,
+                },
+                MidiEvent::NoteOn {
+                    key: MidiKey {
+                        channel: 1,
+                        note: 52
+                    },
+                    velocity: 95,
+                },
+                MidiEvent::NoteOff(MidiKey {
+                    channel: 1,
+                    note: 48
+                }),
+                MidiEvent::Stop,
+            ]
+        );
+
+        let epoch = Arc::new(AtomicU64::new(7));
+        let (audio_tx, mut audio_rx) = MidiReceiver::channel(&epoch);
+        let (ui_tx, mut ui_rx) = MidiReceiver::channel(&epoch);
+        let (mut handoff_tx, handoff_rx) = RingBuffer::new(1);
+        handoff_tx
+            .push(MidiSenders {
+                audio: audio_tx,
+                ui: ui_tx,
+            })
+            .unwrap();
+        let mut cb_data = CallbackData {
+            port_epoch: 7,
+            handoff: handoff_rx,
+            senders: None,
+        };
+
+        receive_message(
+            0,
+            &[0x90, 60, 100, 0x90, 64, 90, 0x80, 60, 0],
+            &mut cb_data,
+        );
+
+        let (_, audio_n) = audio_rx.begin_batch();
+        assert_eq!(audio_n, 3);
+        assert_eq!(
+            audio_rx.pop(),
+            Some(MidiEvent::NoteOn {
+                key: MidiKey {
+                    channel: 0,
+                    note: 60
+                },
+                velocity: 100,
+            })
+        );
+        assert_eq!(
+            audio_rx.pop(),
+            Some(MidiEvent::NoteOn {
+                key: MidiKey {
+                    channel: 0,
+                    note: 64
+                },
+                velocity: 90,
+            })
+        );
+        assert_eq!(
+            audio_rx.pop(),
+            Some(MidiEvent::NoteOff(MidiKey {
+                channel: 0,
+                note: 60
+            }))
+        );
+
+        let (_, ui_n) = ui_rx.begin_batch();
+        assert_eq!(ui_n, 2);
+    }
+
+    #[test]
     fn headless_enumeration_has_a_no_ports_fallback() {
         let (mut controls, _) = MidiControls::new();
         assert_eq!(controls.label(), "MIDI: No ports");
@@ -400,7 +607,7 @@ mod tests {
     #[test]
     fn audio_queue_resets_on_overflow_and_skips_old_ports() {
         let (mut controls, mut audio) = MidiControls::new();
-        for _ in 0..=MIDI_QUEUE_CAPACITY {
+        for _ in 0..MIDI_QUEUE_CAPACITY {
             controls.inject(MidiEvent::Start);
         }
         assert_eq!(audio.begin_batch(), (true, 0));
