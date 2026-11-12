@@ -253,8 +253,14 @@ impl SynthRack {
     }
 
     pub fn retrigger_gates(&mut self) {
-        for voice in &mut self.voices {
-            voice.prev_gate = false;
+        self.retrigger_lanes(u8::MAX);
+    }
+
+    pub fn retrigger_lanes(&mut self, lanes: u8) {
+        for (lane, voice) in self.voices.iter_mut().enumerate() {
+            if lanes & (1 << lane) != 0 {
+                voice.prev_gate = false;
+            }
         }
     }
 

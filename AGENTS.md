@@ -16,7 +16,7 @@ This guide defines architectural invariants, clean-room licensing rules, pinned 
 | `crates/leviathan-core` | **Yes** (mandatory) | Optional `serde` (`default-features = false`) | Deterministic Score v3 model, `TrackerEvaluator`, `CvFrame`, `ByteBus`, `SoundLinkPacket`. Zero heap allocations in `step_sample`. |
 | `crates/leviathan-dsp` | **Yes** (mandatory) | `leviathan-core` only | Zero-allocation synthesis (`SynthRack`, 4-bank `UQ16.16` `VarSampler`, 4-op `FourOpFm`, TPT SVF). No `std` and no `alloc` on the audio path. |
 | `crates/leviathan-gpu` | No | `bytemuck` (plus `wgpu` if headless-safe) | `VisualUniforms` (`#[repr(C)]`, `Pod`, `Zeroable`), `FEEDBACK_SHADER_WGSL`, and software `FeedbackSurface` fallback. Keep testable without a window. |
-| `crates/leviathan-app` | No | `leviathan-core`, `leviathan-dsp`, `leviathan-gpu`, `cpal`, `rtrb`, `eframe`, `serde`, `serde_json` | Native desktop shell: `cpal` RT callback (`RtAudioWorker`), `rtrb` lock-free rings, WAV loader, and `egui` tracker UI. |
+| `crates/leviathan-app` | No | `leviathan-core`, `leviathan-dsp`, `leviathan-gpu`, `cpal`, `midir`, `rtrb`, `eframe`, `serde`, `serde_json` | Native desktop shell: `cpal` RT callback (`RtAudioWorker`), `rtrb` lock-free rings, WAV loader, and `egui` tracker UI. |
 
 ## 3. Real-Time Audio & Pinned Crate Gotchas
 

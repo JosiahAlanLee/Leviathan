@@ -3,6 +3,7 @@ mod gpu_view;
 mod inspector_ui;
 mod link;
 mod master_ui;
+mod midi;
 mod project;
 mod sampler_ui;
 mod session_ui;
@@ -22,6 +23,7 @@ use leviathan_core::{
 use leviathan_dsp::{MachineKind, MasterPeaks};
 use link::SoundLinkBridge;
 use master_ui::MasterMeters;
+use midi::{MidiControls, MidiEvent, MidiReceiver, MidiTarget};
 
 use audio::{try_start_audio, AudioCommand, AudioControl, AudioProject, AudioTelemetry};
 use sampler_ui::{BankAction, SamplerBankUi};
@@ -174,6 +176,9 @@ struct LeviathanApp {
     master_send: f32,
     master_meters: MasterMeters,
     sound_link: SoundLinkBridge,
+    midi: MidiControls,
+    midi_target: MidiTarget,
+    play_request: u64,
     cursor: TrackerCursor,
     sampler_ui: SamplerBankUi,
     audio: AudioControl,
@@ -187,7 +192,9 @@ struct LeviathanApp {
 
 impl LeviathanApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        Self::with_audio(cc, try_start_audio)
+        let mut app = Self::with_audio(cc, try_start_audio);
+        app.midi.refresh();
+        app
     }
 
     fn with_audio(
@@ -196,6 +203,7 @@ impl LeviathanApp {
             Pattern,
             rtrb::Consumer<AudioCommand>,
             rtrb::Producer<AudioTelemetry>,
+            MidiReceiver,
         ) -> Result<(cpal::Stream, String), String>,
     ) -> Self {
         let viewport = FeedbackViewport::new(cc);
@@ -203,9 +211,10 @@ impl LeviathanApp {
         let initial_pattern = starter_electro_pattern();
         let (cmd_tx, cmd_rx) = rtrb::RingBuffer::<AudioCommand>::new(256);
         let (tel_tx, tel_rx) = rtrb::RingBuffer::<AudioTelemetry>::new(64);
+        let (midi, midi_events) = MidiControls::new();
 
         let (_audio_stream, offline_player, audio_status) =
-            match start_audio(initial_pattern.clone(), cmd_rx, tel_tx) {
+            match start_audio(initial_pattern.clone(), cmd_rx, tel_tx, midi_events) {
                 Ok((stream, label)) => (Some(stream), None, label),
                 Err(label) => (
                     None,
@@ -220,7 +229,7 @@ impl LeviathanApp {
         let mut cursor = TrackerCursor::default();
         cursor.select(4, 0, SubColumn::Note, false);
 
-        Self {
+        let mut app = Self {
             _audio_stream,
             patterns: vec![initial_pattern],
             histories: vec![EditHistory::default()],
@@ -235,6 +244,9 @@ impl LeviathanApp {
             master_send: 0.0,
             master_meters: MasterMeters::default(),
             sound_link: SoundLinkBridge::default(),
+            midi,
+            midi_target: MidiTarget::default(),
+            play_request: 0,
             cursor,
             sampler_ui: SamplerBankUi::default(),
             audio: AudioControl::new(cmd_tx),
@@ -244,7 +256,9 @@ impl LeviathanApp {
             latest_cv: CvFrame::default(),
             latest_song: SongStatus::default(),
             viewport,
-        }
+        };
+        app.sync_midi_target();
+        app
     }
 
     fn send_audio(&mut self, command: AudioCommand) {
@@ -253,6 +267,62 @@ impl LeviathanApp {
             self.latest_song = player.status();
         } else {
             self.audio.send(command);
+        }
+    }
+
+    fn toggle_playing(&mut self) {
+        self.playing = !self.playing;
+        self.play_request = self.play_request.wrapping_add(1);
+        self.send_audio(AudioCommand::SetPlaying {
+            playing: self.playing,
+            request: self.play_request,
+        });
+    }
+
+    fn sync_midi_target(&mut self) {
+        let target = MidiTarget {
+            pattern: self.selected_pattern,
+            lane: self.cursor.lane,
+            row: self.cursor.row,
+        };
+        if self.midi_target != target {
+            self.midi_target = target;
+            self.send_audio(AudioCommand::SetMidiTarget(target));
+        }
+    }
+
+    fn read_midi(&mut self, ctx: &egui::Context) {
+        let (_, count) = self.midi.events.begin_batch();
+        let record = self.midi.record_armed
+            && !self.project_ui.dialog_open()
+            && ctx.memory(|memory| memory.top_modal_layer().is_none());
+        for _ in 0..count {
+            match self.midi.events.pop() {
+                Some(MidiEvent::NoteOn { key, velocity }) if record => {
+                    let pattern = self.selected_pattern;
+                    let update = self.cursor.enter_note(
+                        &mut self.patterns[pattern],
+                        &mut self.histories[pattern],
+                        key.note,
+                        Some(velocity),
+                    );
+                    self.cursor.last_edit_msg = format!("MIDI {}", midi_label(key.note));
+                    self.send_audio(AudioCommand::SetCell {
+                        pattern,
+                        lane: update.lane,
+                        row: update.row,
+                        cell: update.cell,
+                    });
+                }
+                Some(event) => {
+                    if let Some(player) = &mut self.offline_player {
+                        if event.apply_transport(player, self.patterns.len()) {
+                            self.playing = player.evaluator.playing;
+                        }
+                    }
+                }
+                None => {}
+            }
         }
     }
 
@@ -415,6 +485,8 @@ impl LeviathanApp {
         self.sampler_ui.restore(project.samples);
         self.viewport.restore_custom_shader(project.custom_shader);
         self.playing = false;
+        self.midi.record_armed = false;
+        self.midi.events.discard_pending();
         self.fill_active = false;
         self.inspector_drag_recorded = false;
         self.cursor = TrackerCursor::default();
@@ -433,6 +505,9 @@ impl eframe::App for LeviathanApp {
         let mut peaks = MasterPeaks::default();
         while let Ok(telemetry) = self.tel_rx.pop() {
             if telemetry.generation == self.project_generation {
+                if telemetry.play_request == self.play_request {
+                    self.playing = telemetry.playing;
+                }
                 self.latest_cv = telemetry.cv;
                 self.latest_song = telemetry.song;
                 peaks.merge(telemetry.master);
@@ -473,8 +548,7 @@ impl eframe::App for LeviathanApp {
             && !ctx.wants_keyboard_input()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space))
         {
-            self.playing = !self.playing;
-            self.send_audio(AudioCommand::SetPlaying(self.playing));
+            self.toggle_playing();
         }
 
         if !self.project_ui.dialog_open() {
@@ -496,6 +570,8 @@ impl eframe::App for LeviathanApp {
             }
         }
 
+        self.read_midi(ctx);
+        self.sync_midi_target();
         let (hovering_wav, mut bank_actions) = self.sampler_ui.poll_drag_and_drop(ctx);
         let hovering_wgsl = self.viewport.poll_shader_drop(ctx);
         let now_secs = ctx.input(|i| i.time);
@@ -518,8 +594,7 @@ impl eframe::App for LeviathanApp {
                     "Play [Space]"
                 };
                 if ui.button(play_label).clicked() {
-                    self.playing = !self.playing;
-                    self.send_audio(AudioCommand::SetPlaying(self.playing));
+                    self.toggle_playing();
                 }
                 if ui.button("Reset").clicked() {
                     self.send_audio(AudioCommand::Reset);
@@ -568,6 +643,8 @@ impl eframe::App for LeviathanApp {
                 ui.small(&self.audio_status);
                 ui.separator();
                 ui.small(self.viewport.status_label());
+                ui.separator();
+                self.midi.draw(ui);
             });
         });
 
@@ -824,6 +901,7 @@ impl eframe::App for LeviathanApp {
             });
         });
 
+        self.sync_midi_target();
         if self.playing || self.audio.has_pending() || self.master_meters.is_active(now) {
             ctx.request_repaint();
         }
@@ -876,7 +954,63 @@ mod tests {
 
     fn offline_app(ctx: &egui::Context) -> LeviathanApp {
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-        LeviathanApp::with_audio(&cc, |_, _, _| Err("Offline test clock".to_string()))
+        LeviathanApp::with_audio(&cc, |_, _, _, _| Err("Offline test clock".to_string()))
+    }
+
+    #[test]
+    fn midi_step_record_preserves_locks_and_uses_the_tracker_edit_step() {
+        use midi::MidiKey;
+
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        app.cursor.select(4, 0, SubColumn::Note, false);
+        app.cursor.edit_step = 2;
+        let before = app.patterns[0].lanes[4][0];
+        let first = MidiEvent::NoteOn {
+            key: MidiKey { channel: 1, note: 1 },
+            velocity: 19,
+        };
+        app.midi.inject(first);
+        frame(&ctx, &mut app, Vec::new());
+        assert_eq!(app.patterns[0].lanes[4][0], before);
+
+        app.midi.record_armed = true;
+        app.midi.inject(first);
+        app.midi.inject(MidiEvent::NoteOn {
+            key: MidiKey {
+                channel: 1,
+                note: 127,
+            },
+            velocity: 126,
+        });
+        frame(&ctx, &mut app, Vec::new());
+        let notes = &app.patterns[0].lanes[4];
+        assert_eq!(
+            (notes[0].midi, notes[0].velocity, notes[0].lock),
+            (1, 19, before.lock)
+        );
+        assert!(notes[0].active && !notes[0].air);
+        assert_eq!(
+            (notes[2].midi, notes[2].velocity, app.cursor.row),
+            (127, 126, 4)
+        );
+        let command = Modifiers {
+            ctrl: true,
+            command: true,
+            ..Modifiers::NONE
+        };
+        frame(&ctx, &mut app, vec![key(Key::Z, command)]);
+        assert!(!app.patterns[0].lanes[4][2].active);
+
+        app.midi.inject(MidiEvent::Start);
+        frame(&ctx, &mut app, Vec::new());
+        assert!(app.playing);
+        app.midi.inject(MidiEvent::Stop);
+        frame(&ctx, &mut app, Vec::new());
+        assert!(!app.playing);
+        app.midi.inject(MidiEvent::Continue);
+        frame(&ctx, &mut app, Vec::new());
+        assert!(app.playing);
     }
 
     #[test]
