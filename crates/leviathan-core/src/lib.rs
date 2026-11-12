@@ -32,7 +32,7 @@ impl Default for SoundLock {
             values: [0.0; SOUND_PARAMS],
         }
     }
-
+}
 impl SoundLock {
     #[inline]
     pub const fn has_param(&self, slot: usize) -> bool {
@@ -65,7 +65,6 @@ impl SoundLock {
     }
 }
 }
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SoundLane {
