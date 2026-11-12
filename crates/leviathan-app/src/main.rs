@@ -192,7 +192,7 @@ struct LeviathanApp {
     tel_rx: rtrb::Consumer<AudioTelemetry>,
     offline_player: Option<SongPlayer>,
     audio_status: String,
-    latest_cv: CvFrame
+    latest_cv: CvFrame,
         latest_scope: leviathan_gpu::AudioScopeSnapshot,
     latest_song: SongStatus,
     viewport: FeedbackViewport,
@@ -506,8 +506,8 @@ custom_shader: self.viewport.custom_shader().cloned(),
         self.fill_active = false;
         self.inspector_drag_recorded = false;
         self.cursor = TrackerCursor::default();
-        self.latest_cv = CvFrame::default()
-        self.latest_scope = leviathan_gpu::AudioScopeSnapshot::default();;
+        self.latest_cv = CvFrame::default();
+        self.latest_scope = leviathan_gpu::AudioScopeSnapshot::default();        
         self.latest_song = SongStatus {
             pattern: self.selected_pattern,
             ..SongStatus::default()
@@ -614,7 +614,7 @@ impl eframe::App for LeviathanApp {
         }
 
         self.sound_link.emit_frame(&self.latest_cv, self.playing);
-        let tex_id = self.viewport.render_frame(ctx, &self.latest_cv), &self.latest_scope;
+        let tex_id = self.viewport.render_frame(ctx, &self.latest_cv, &self.latest_scope);
 
         egui::TopBottomPanel::top("transport_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
