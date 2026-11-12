@@ -1,16 +1,6 @@
 use eframe::egui;
-use leviathan_core::{NoteCell, Pattern, SoundLock};
-use leviathan_dsp::MachineKind;
-
-const ALL_MACHINES: [MachineKind; 7] = [
-    MachineKind::KickDrum,
-    MachineKind::FourOpFm,
-    MachineKind::SubBass,
-    MachineKind::NoiseWash,
-    MachineKind::VarSampler,
-    MachineKind::AcidLead,
-    MachineKind::ChordStab,
-];
+use leviathan_core::{NoteCell, Pattern, SoundLock, SOUND_PARAMS};
+use leviathan_dsp::{LanePatch, MachineKind, MACHINE_SPECS};
 
 pub fn apply_starter_sound_locks(pat: &mut Pattern) {
     for row in 0..64 {
@@ -61,78 +51,103 @@ pub fn apply_starter_sound_locks(pat: &mut Pattern) {
     }
 }
 
-pub fn param_labels(machine: MachineKind) -> [&'static str; 8] {
-    match machine {
-        MachineKind::VarSampler => [
-            "P0 Decay",
-            "P1 ChipClk",
-            "P2 Cutoff",
-            "P3 WaveBank",
-            "P4 LpStart",
-            "P5 LpWindow",
-            "P6 LpScan",
-            "P7 Mode/Bit",
-        ],
-        MachineKind::FourOpFm => [
-            "P0 Decay",
-            "P1 FmIndex",
-            "P2 Cutoff",
-            "P3 Alg(0-3)",
-            "P4 C:M Ratio",
-            "P5 ModDecay",
-            "P6 Op4 Fbk",
-            "P7 Detune",
-        ],
-        _ => [
-            "P0 Decay",
-            "P1 Drive",
-            "P2 Cutoff",
-            "P3 Aux3",
-            "P4 Aux4",
-            "P5 Aux5",
-            "P6 Aux6",
-            "P7 Aux7",
-        ],
-    }
+pub fn draw_lane_patch_inspector(ui: &mut egui::Ui, lane: usize, patch: &mut LanePatch) -> bool {
+    let mut dirty = false;
+    egui::CollapsingHeader::new(format!("Lane {} Patch ({})", lane + 1, patch.machine.display_name()))
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for spec in &MACHINE_SPECS {
+                    if ui
+                        .selectable_label(patch.machine == spec.kind, spec.badge)
+                        .on_hover_text(spec.name)
+                        .clicked()
+                        && patch.machine != spec.kind
+                    {
+                        *patch = LanePatch::for_machine(spec.kind);
+                        dirty = true;
+                    }
+                }
+                if ui
+                    .small_button("Reset")
+                    .on_hover_text("Restore default macro knobs for this machine")
+                    .clicked()
+                {
+                    *patch = LanePatch::for_machine(patch.machine);
+                    dirty = true;
+                }
+            });
+            let spec = patch.machine.spec();
+            for slot in 0..SOUND_PARAMS {
+                if ui
+                    .add(egui::Slider::new(&mut patch.params[slot], 0.0..=1.0).text(format!(
+                        "P{slot} {}",
+                        spec.params[slot].name
+                    )))
+                    .changed()
+                {
+                    dirty = true;
+                }
+            }
+        });
+    dirty
 }
 
 pub fn draw_step_lock_inspector(
     ui: &mut egui::Ui,
     lane: usize,
     row: usize,
-    lane_name: &str,
+    lane_patch: &LanePatch,
     cell: &mut NoteCell,
 ) -> bool {
     let mut dirty = false;
-    let eff = MachineKind::from_lane_and_lock(lane, &cell.lock);
+    let eff = MachineKind::from_patch_and_lock(lane_patch, &cell.lock);
     ui.separator();
-    ui.heading(format!("Step Lock — {lane_name} Row {row:02X} ({})", eff.short_name()));
+    ui.heading(format!(
+        "Step Lock - L{} {} Row {row:02X} ({})",
+        lane + 1,
+        lane_patch.machine.short_name(),
+        eff.short_name()
+    ));
     ui.horizontal_wrapped(|ui| {
-        if ui.selectable_label(cell.lock.machine < 0, "Lane").clicked() {
+        let lane_label = format!("Lane ({})", lane_patch.machine.short_name());
+        if ui
+            .selectable_label(cell.lock.machine < 0, lane_label)
+            .clicked()
+        {
             cell.lock.machine = -1;
             dirty = true;
         }
-        for m in ALL_MACHINES {
+        for &m in &MachineKind::ALL {
             let code = m as i16;
-            if ui.selectable_label(cell.lock.machine == code, m.short_name()).clicked() {
+            if ui
+                .selectable_label(cell.lock.machine == code, m.short_name())
+                .clicked()
+            {
                 cell.lock.machine = code;
                 dirty = true;
             }
         }
     });
-    for (slot, &name) in param_labels(eff).iter().enumerate() {
+
+    let spec = eff.spec();
+    for slot in 0..SOUND_PARAMS {
         ui.horizontal(|ui| {
-            let mut locked = ((cell.lock.mask >> slot) & 1) != 0;
+            let mut locked = (cell.lock.mask & (1 << slot)) != 0;
             if ui.checkbox(&mut locked, "").changed() {
                 if locked {
+                    if (cell.lock.mask & (1 << slot)) == 0 {
+                        cell.lock.values[slot] = lane_patch.params[slot];
+                    }
                     cell.lock.mask |= 1 << slot;
                 } else {
                     cell.lock.mask &= !(1 << slot);
                 }
                 dirty = true;
             }
+            let param_name = format!("P{slot} {}", spec.params[slot].name);
             if ui
-                .add(egui::Slider::new(&mut cell.lock.values[slot], 0.0..=1.0).text(name))
+                .add(egui::Slider::new(&mut cell.lock.values[slot], 0.0..=1.0).text(param_name))
                 .changed()
             {
                 cell.lock.mask |= 1 << slot;
@@ -140,5 +155,6 @@ pub fn draw_step_lock_inspector(
             }
         });
     }
+
     dirty
 }
