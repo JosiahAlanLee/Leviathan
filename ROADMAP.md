@@ -99,7 +99,7 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
   - Unit tests verifying deterministic `256×2` waveform/band texel packing from synthetic stereo frames, `validate_wgsl_contract` acceptance of both `@group(0)`-only (`T10`) and `@group(0)` + `@group(1)` shaders, and headless `FeedbackViewport` rendering; `0` workspace compiler warnings.
 
 ### `T14` — Generative Tracker Tools (Euclidean Fill, Ramp Interpolation, Scale Lock) & Clean-Room `.mid` SMF Import / Export
-- **Status**: `OPEN`
+- **Status**: `IMPLEMENTED` (`9c1e840`). `Ctrl/Cmd+I` ramps the selected velocity or automation field and syncs through `AudioCommand::SetPattern`.
 - **Owned Files**: `crates/leviathan-app/src/tracker_edit.rs`, `crates/leviathan-app/src/tracker_keys.rs`, new `crates/leviathan-app/src/smf.rs`, new `crates/leviathan-app/src/gen_ui.rs`, `crates/leviathan-app/src/main.rs`
 - **Goal**: Add fast tracker composition power-tools (**Euclidean step generator** `E(pulses, steps, rotation)`, **Linear Ramp Interpolation** `Ctrl/Cmd+I` across selected `VEL` or visual automation `Z`/`Roll`/`Fbk` ranges, and **Scale-Lock pitch quantizer**) alongside clean-room Standard MIDI File (`.mid`, SMF Type-0 / Type-1) pattern & chain import/export for DAW interoperability.
 - **Scope & Constraints**:
