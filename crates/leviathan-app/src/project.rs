@@ -435,43 +435,9 @@ mod tests {
                 chain,
                 samples,
                 custom_shader: Some(shader.clone()),
-            ,(
-            &pathsave(
-            &path,
-            Project {
-                bpm: 120.0,
-                master_send: 0.25,
-                lane_mix: LaneMix::default(),
-                patterns: patterns.to_vec(),
-                selected_pattern: 0,
-                chain,
-                samples,
-                custom_shader: Some(shader.clone()),
-            },
-        )
-        .unwrap();(
-            &path,
-            Project {
-                bpm: 120.0,
-                master_send: 0.25,
-                lane_mix: LaneMix::default(),
-                patterns: patterns.to_vec(),
-                selected_pattern: 0,
-                chain,
-                samples,
-                custom_shader: Some(shader.clone()),
-            },
-        ),
-            120.0,
-            0.25,
-        )
-            &patterns,
-            0,
-            &chain,
-            &samples,
-            Some(&shader),
-        )
-        .unwrap();
+                   },
+    )
+    .unwrap(); );
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.custom_shader, Some(shader));
 
