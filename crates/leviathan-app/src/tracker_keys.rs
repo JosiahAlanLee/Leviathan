@@ -2,7 +2,10 @@ use eframe::egui::{self, Key, Modifiers};
 use leviathan_core::{NoteCell, Pattern, NUM_LANES, ROWS_PER_PATTERN};
 
 use crate::lane_mix::{LaneMix, LaneMixAction};
-use crate::tracker_edit::{clear_rect, transpose_rect, BlockClipboard, BlockRect, EditHistory};
+use crate::tracker_edit::{
+    clear_rect, transpose_rect, BlockClipboard, BlockRect, EditHistory, EuclideanFill, RampTarget,
+    ScaleLock,
+};
 
 const CMD_ONLY: Modifiers = Modifiers {
     alt: false,
@@ -103,6 +106,15 @@ pub enum PatternSync {
     None,
     Single(CellUpdate),
     FullPattern,
+    Undo,
+    Redo,
+}
+
+#[derive(Clone, Copy)]
+pub enum GeneratorAction {
+    Euclidean(EuclideanFill),
+    Ramp,
+    Quantize,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +128,8 @@ pub struct TrackerCursor {
     pub moved_this_frame: bool,
     pub anchor: Option<(usize, usize)>,
     pub clipboard: Option<BlockClipboard>,
+    pub ramp_target: RampTarget,
+    pub scale_lock: ScaleLock,
     pub last_edit_msg: String,
 }
 
@@ -131,6 +145,8 @@ impl Default for TrackerCursor {
             moved_this_frame: false,
             anchor: None,
             clipboard: None,
+            ramp_target: RampTarget::default(),
+            scale_lock: ScaleLock::default(),
             last_edit_msg: "Ready".to_string(),
         }
     }
@@ -297,6 +313,32 @@ impl TrackerCursor {
         n > 0
     }
 
+    pub fn generate(
+        &mut self,
+        pattern: &mut Pattern,
+        history: &mut EditHistory,
+        action: GeneratorAction,
+    ) -> bool {
+        let rect = self.active_rect();
+        let changed = history.edit(pattern, |edited| match action {
+            GeneratorAction::Euclidean(fill) => fill.apply(edited, rect),
+            GeneratorAction::Ramp => self.ramp_target.apply(edited, rect),
+            GeneratorAction::Quantize => self.scale_lock.apply(edited, rect),
+        });
+        self.last_edit_msg = if changed {
+            match action {
+                GeneratorAction::Euclidean(_) => "Filled Euclidean rhythm".to_string(),
+                GeneratorAction::Ramp => format!("Interpolated {}", self.ramp_target.label()),
+                GeneratorAction::Quantize => "Quantized pitches".to_string(),
+            }
+        } else if matches!(action, GeneratorAction::Ramp) && rect.max_row - rect.min_row < 2 {
+            "Select at least three rows to interpolate".to_string()
+        } else {
+            "Selection already matches".to_string()
+        };
+        changed
+    }
+
     fn ensure_anchor(&mut self) {
         if self.anchor.is_none() {
             self.anchor = Some((self.lane, self.row));
@@ -322,7 +364,7 @@ impl TrackerCursor {
         let cell = &mut pattern.lanes[lane][row];
         cell.active = true;
         cell.air = false;
-        cell.midi = midi;
+        cell.midi = self.scale_lock.quantize(midi);
         cell.velocity = velocity.unwrap_or(if cell.velocity == 0 { 100 } else { cell.velocity });
         let update = CellUpdate {
             lane,
@@ -368,15 +410,15 @@ impl TrackerCursor {
 
             // 1. Undo / Redo / Select-All / Clipboard / Transpose shortcuts (most-specific first)
             if consume_cmd(i, true, Key::Z) || consume_cmd(i, false, Key::Y) {
-                if history.redo(pattern) {
-                    self.last_edit_msg = "Redo".to_string();
-                    sync = PatternSync::FullPattern;
-                }
+                sync = PatternSync::Redo;
                 return;
             }
             if consume_cmd(i, false, Key::Z) {
-                if history.undo(pattern) {
-                    self.last_edit_msg = "Undo".to_string();
+                sync = PatternSync::Undo;
+                return;
+            }
+            if consume_cmd(i, false, Key::I) {
+                if self.generate(pattern, history, GeneratorAction::Ramp) {
                     sync = PatternSync::FullPattern;
                 }
                 return;

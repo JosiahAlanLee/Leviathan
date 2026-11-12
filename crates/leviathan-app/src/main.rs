@@ -1,6 +1,7 @@
 mod audio;
 mod export;
 mod export_ui;
+mod gen_ui;
 mod gpu_view;
 mod inspector_ui;
 mod lane_mix;
@@ -11,6 +12,7 @@ mod mixer_ui;
 mod project;
 mod sampler_ui;
 mod session_ui;
+mod smf;
 mod tracker_edit;
 mod tracker_keys;
 mod wav;
@@ -19,6 +21,7 @@ use std::sync::Arc;
 
 use eframe::egui;
 use export_ui::ExportUi;
+use gen_ui::{GenUi, MidiDestination, MidiFileAction};
 use gpu_view::FeedbackViewport;
 use inspector_ui::{InspectorEdits, LANE_NAMES};
 use lane_mix::LaneMix;
@@ -175,6 +178,7 @@ struct LeviathanApp {
     chain: PatternChain,
     project_ui: ProjectUi,
     export_ui: ExportUi,
+    gen_ui: GenUi,
     project_generation: u64,
     inspector_drag_recorded: bool,
     playing: bool,
@@ -246,6 +250,7 @@ impl LeviathanApp {
             chain: PatternChain::default(),
             project_ui: ProjectUi::default(),
             export_ui: ExportUi::default(),
+            gen_ui: GenUi::default(),
             project_generation: 0,
             inspector_drag_recorded: false,
             playing: false,
@@ -318,7 +323,7 @@ impl LeviathanApp {
                         key.note,
                         Some(velocity),
                     );
-                    self.cursor.last_edit_msg = format!("MIDI {}", midi_label(key.note));
+                    self.cursor.last_edit_msg = format!("MIDI {}", midi_label(update.cell.midi));
                     self.send_audio(AudioCommand::SetCell {
                         pattern,
                         lane: update.lane,
@@ -343,6 +348,140 @@ impl LeviathanApp {
             index,
             pattern: Arc::new(self.patterns[index].clone()),
         });
+    }
+
+    fn step_history(&mut self, index: usize, redo: bool) {
+        let previous_bpm = self.bpm;
+        let history = &mut self.histories[index];
+        let pattern = &mut self.patterns[index];
+        let changed = if redo {
+            history.redo(pattern, &mut self.bpm)
+        } else {
+            history.undo(pattern, &mut self.bpm)
+        };
+        if changed {
+            self.cursor.last_edit_msg = if redo { "Redo" } else { "Undo" }.to_string();
+            self.push_full_pattern(index);
+            if self.bpm != previous_bpm {
+                self.send_audio(AudioCommand::SetBpm(self.bpm));
+            }
+        }
+    }
+
+    fn import_midi(
+        &mut self,
+        mut import: smf::Import,
+        destination: MidiDestination,
+        use_tempo: bool,
+    ) -> Result<String, String> {
+        let bpm = import.bpm.clamp(40.0, 240.0);
+        let tempo_changes = use_tempo && self.bpm != bpm;
+        let mut message = match destination {
+            MidiDestination::Pattern => {
+                let selected = self.selected_pattern;
+                let pattern = import.patterns.pop().ok_or("MIDI file has no pattern")?;
+                self.histories[selected].record_before_import(
+                    &self.patterns[selected],
+                    tempo_changes.then_some(self.bpm),
+                );
+                self.patterns[selected] = pattern;
+                self.cursor.anchor = None;
+                self.cursor.row = self.cursor.row.min(self.patterns[selected].length - 1);
+                self.push_full_pattern(selected);
+                format!("Imported pattern {selected:02X}")
+            }
+            MidiDestination::AppendChain => {
+                let start = self.patterns.len();
+                let count = import.patterns.len();
+                let entries = import.chain.as_slice();
+                if start + count > project::PATTERN_BANK_CAPACITY {
+                    return Err(format!("MIDI chain needs {count} free pattern slots"));
+                }
+                if self.chain.as_slice().len() + entries.len() > leviathan_core::MAX_CHAIN_ENTRIES {
+                    return Err(format!(
+                        "MIDI chain needs {} free chain entries",
+                        entries.len()
+                    ));
+                }
+                for pattern in import.patterns {
+                    let index = self.patterns.len();
+                    self.patterns.push(pattern);
+                    self.histories.push(EditHistory::default());
+                    self.push_full_pattern(index);
+                }
+                for &index in entries {
+                    self.chain.push((start + usize::from(index)) as u8);
+                }
+                self.send_audio(AudioCommand::SetChain(self.chain));
+                format!(
+                    "Appended {} chain entries in {count} patterns",
+                    entries.len()
+                )
+            }
+            MidiDestination::OpenChain => {
+                let count = import.patterns.len();
+                let mut project = self.project_snapshot();
+                if use_tempo {
+                    project.bpm = bpm;
+                }
+                project.patterns = import.patterns;
+                project.selected_pattern = usize::from(import.chain.as_slice()[0]);
+                project.chain = import.chain;
+                self.install_project(project);
+                self.project_ui = ProjectUi::default();
+                format!("Opened MIDI project with {count} patterns")
+            }
+        };
+        self.inspector_drag_recorded = false;
+        if use_tempo && self.bpm != bpm {
+            self.bpm = bpm;
+            self.send_audio(AudioCommand::SetBpm(bpm));
+        }
+        if use_tempo {
+            if bpm != import.bpm {
+                message.push_str(&format!(" · file tempo limited to {bpm} BPM"));
+            }
+            if import.tempo_changes {
+                message.push_str(" · used the initial tempo");
+            }
+        }
+        if import.dropped_notes > 0 {
+            message.push_str(&format!(
+                " · {} notes exceeded six lanes",
+                import.dropped_notes
+            ));
+        }
+        Ok(message)
+    }
+
+    fn apply_midi_file(&mut self, action: MidiFileAction) {
+        let result = match action {
+            MidiFileAction::Import {
+                path,
+                destination,
+                rate,
+                use_tempo,
+            } => smf::load(&path, rate, destination.scope())
+                .and_then(|import| self.import_midi(import, destination, use_tempo)),
+            MidiFileAction::Export {
+                path,
+                scope,
+                format,
+            } => {
+                let patterns = match scope {
+                    smf::Scope::Pattern => vec![&self.patterns[self.selected_pattern]],
+                    smf::Scope::Chain => self
+                        .chain
+                        .as_slice()
+                        .iter()
+                        .map(|&index| &self.patterns[usize::from(index)])
+                        .collect(),
+                };
+                smf::save(&path, &patterns, self.bpm, format)
+                    .map(|()| format!("Exported {}", path.display()))
+            }
+        };
+        self.gen_ui.finish(result);
     }
 
     fn select_pattern(&mut self, index: usize) {
@@ -613,6 +752,8 @@ impl eframe::App for LeviathanApp {
                     });
                 }
                 PatternSync::FullPattern => self.push_full_pattern(selected),
+                PatternSync::Undo => self.step_history(selected, false),
+                PatternSync::Redo => self.step_history(selected, true),
             }
         }
 
@@ -765,7 +906,27 @@ impl eframe::App for LeviathanApp {
             self.send_audio(cmd);
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let tracker = egui::CentralPanel::default().show(ctx, |ui| {
+            let pattern_length = self.patterns[selected].length;
+            let has_chain = !self.chain.as_slice().is_empty();
+            let (generate, midi_file) = ui
+                .add_enabled_ui(!modal_open, |ui| {
+                    (
+                        self.gen_ui
+                            .pattern_tools(ui, &mut self.cursor, pattern_length),
+                        self.gen_ui.midi_files(ui, has_chain),
+                    )
+                })
+                .inner;
+            if let Some(action) = generate {
+                if self.cursor.generate(
+                    &mut self.patterns[selected],
+                    &mut self.histories[selected],
+                    action,
+                ) {
+                    self.push_full_pattern(selected);
+                }
+            }
             ui.horizontal_wrapped(|ui| {
                 let undo_n = self.histories[selected].undo_len();
                 let redo_n = self.histories[selected].redo_len();
@@ -773,19 +934,15 @@ impl eframe::App for LeviathanApp {
                     .add_enabled(undo_n > 0, egui::Button::new(format!("Undo ({undo_n})")))
                     .on_hover_text("Ctrl+Z / Cmd+Z")
                     .clicked()
-                    && self.histories[selected].undo(&mut self.patterns[selected])
                 {
-                    self.cursor.last_edit_msg = "Undo".to_string();
-                    self.push_full_pattern(selected);
+                    self.step_history(selected, false);
                 }
                 if ui
                     .add_enabled(redo_n > 0, egui::Button::new(format!("Redo ({redo_n})")))
                     .on_hover_text("Ctrl+Y / Ctrl+Shift+Z")
                     .clicked()
-                    && self.histories[selected].redo(&mut self.patterns[selected])
                 {
-                    self.cursor.last_edit_msg = "Redo".to_string();
-                    self.push_full_pattern(selected);
+                    self.step_history(selected, true);
                 }
                 ui.separator();
                 if ui.button("Copy").on_hover_text("Ctrl+C").clicked() {
@@ -958,7 +1115,12 @@ impl eframe::App for LeviathanApp {
                         }
                     });
             });
+            midi_file
         });
+        if let Some(action) = tracker.inner {
+            self.apply_midi_file(action);
+            ctx.request_repaint();
+        }
 
         let audible = self.lane_mix.audible_mask();
         if audible != previous_audible {
@@ -1077,6 +1239,200 @@ mod tests {
         app.midi.inject(MidiEvent::Continue);
         frame(&ctx, &mut app, Vec::new());
         assert!(app.playing);
+    }
+
+    #[test]
+    fn ramp_shortcut_is_one_bulk_update_and_one_undo_step() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        let (tx, mut rx) = rtrb::RingBuffer::new(16);
+        app.audio = AudioControl::new(tx);
+        app.offline_player = None;
+        app.cursor.select(1, 0, SubColumn::Velocity, false);
+        app.cursor.select(1, 4, SubColumn::Velocity, true);
+        app.patterns[0].lanes[1][0].velocity = 20;
+        app.patterns[0].lanes[1][4].velocity = 100;
+        let before = app.patterns[0].lanes[1];
+        frame(&ctx, &mut app, vec![key(Key::I, Modifiers::CTRL)]);
+        assert_eq!(app.histories[0].undo_len(), 1);
+        assert_eq!(app.patterns[0].lanes[1][2].velocity, 60);
+        let mut updates = 0;
+        while let Ok(command) = rx.pop() {
+            if let AudioCommand::SetPattern { index, pattern } = command {
+                updates += 1;
+                assert_eq!(index, 0);
+                assert_eq!(pattern.lanes[1][2].velocity, 60);
+            }
+        }
+        assert_eq!(updates, 1);
+        frame(&ctx, &mut app, vec![key(Key::Z, Modifiers::COMMAND)]);
+        assert_eq!(app.patterns[0].lanes[1], before);
+        frame(&ctx, &mut app, vec![key(Key::Y, Modifiers::COMMAND)]);
+        assert_eq!(app.patterns[0].lanes[1][2].velocity, 60);
+    }
+
+    #[test]
+    fn scale_lock_applies_to_keyboard_entry_and_midi_step_recording() {
+        use midi::MidiKey;
+        use tracker_edit::Scale;
+
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        app.cursor.select(4, 0, SubColumn::Note, false);
+        app.cursor.scale_lock.scale = Scale::Major;
+        frame(&ctx, &mut app, vec![key(Key::S, Modifiers::NONE)]);
+        assert_eq!(app.patterns[0].lanes[4][0].midi, 60);
+        app.midi.record_armed = true;
+        app.midi.inject(MidiEvent::NoteOn {
+            key: MidiKey {
+                channel: 0,
+                note: 63,
+            },
+            velocity: 95,
+        });
+        frame(&ctx, &mut app, Vec::new());
+        let recorded = app.patterns[0].lanes[4][1];
+        assert_eq!((recorded.midi, recorded.velocity), (62, 95));
+    }
+
+    #[test]
+    fn midi_file_pattern_import_undo_redo_includes_tempo_and_grid() {
+        let path = std::env::temp_dir().join(format!("leviathan-t14-{}.mid", std::process::id()));
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        let original = app.patterns[0].clone();
+        let original_bpm = app.bpm;
+        let mut exported = Pattern {
+            length: 8,
+            rate: PlaybackRate::Half,
+            ..Pattern::default()
+        };
+        exported.lanes[4][6] = NoteCell {
+            active: true,
+            midi: 73,
+            velocity: 95,
+            ..NoteCell::default()
+        };
+        let file_bpm = 123.456_789;
+        smf::save(&path, &[&exported], file_bpm, smf::Format::MultiTrack).unwrap();
+        app.apply_midi_file(MidiFileAction::Import {
+            path: path.clone(),
+            destination: MidiDestination::Pattern,
+            rate: PlaybackRate::OneX,
+            use_tempo: true,
+        });
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(app.histories[0].undo_len(), 1);
+        assert_eq!(app.patterns[0].lanes[4][6], exported.lanes[4][6]);
+        assert_eq!(app.patterns[0].rate, PlaybackRate::Half);
+        assert_eq!(app.bpm, file_bpm);
+        assert_eq!(
+            app.offline_player.as_ref().unwrap().evaluator.config.bpm,
+            file_bpm
+        );
+
+        frame(&ctx, &mut app, vec![key(Key::Z, Modifiers::COMMAND)]);
+        assert_eq!(app.patterns[0].lanes, original.lanes);
+        assert_eq!(app.patterns[0].length, original.length);
+        assert_eq!(app.bpm, original_bpm);
+        assert_eq!(
+            app.offline_player.as_ref().unwrap().evaluator.config.bpm,
+            original_bpm
+        );
+
+        frame(&ctx, &mut app, vec![key(Key::Y, Modifiers::COMMAND)]);
+        assert_eq!(app.patterns[0].lanes, exported.lanes);
+        assert_eq!(app.patterns[0].length, exported.length);
+        assert_eq!(app.bpm, file_bpm);
+    }
+
+    #[test]
+    fn midi_chain_append_preserves_existing_patterns_and_checks_capacity() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        let original = app.patterns[0].lanes;
+        let bpm = app.bpm;
+        app.apply_arrangement_action(&ctx, ArrangementAction::AppendToChain);
+        let make_import = || {
+            let mut chain = PatternChain::default();
+            for index in [0, 1, 0] {
+                chain.push(index);
+            }
+            smf::Import {
+                patterns: vec![Pattern::default(), Pattern::default()],
+                chain,
+                bpm: 104.0,
+                dropped_notes: 0,
+                tempo_changes: false,
+            }
+        };
+        app.import_midi(make_import(), MidiDestination::AppendChain, false)
+            .unwrap();
+        assert_eq!(app.chain.as_slice(), &[0, 1, 2, 1]);
+        assert_eq!(app.patterns[0].lanes, original);
+        assert_eq!(app.bpm, bpm);
+        app.patterns
+            .resize_with(project::PATTERN_BANK_CAPACITY - 1, Pattern::default);
+        let count = app.patterns.len();
+        app.histories.resize_with(count, EditHistory::default);
+        assert!(app
+            .import_midi(make_import(), MidiDestination::AppendChain, true)
+            .is_err());
+        assert_eq!(app.chain.as_slice(), &[0, 1, 2, 1]);
+        assert_eq!(app.patterns.len(), count);
+        assert_eq!(app.bpm, bpm);
+    }
+
+    #[test]
+    fn midi_chain_can_open_with_a_full_bank_of_patterns() {
+        let path =
+            std::env::temp_dir().join(format!("leviathan-t14-chain-{}.mid", std::process::id()));
+        let ctx = egui::Context::default();
+        let mut source = offline_app(&ctx);
+        source.patterns = (0..project::PATTERN_BANK_CAPACITY)
+            .map(|index| {
+                let mut pattern = Pattern {
+                    length: 4,
+                    ..Pattern::default()
+                };
+                pattern.lanes[0][0] = NoteCell {
+                    active: true,
+                    midi: 60 + index as u8,
+                    ..NoteCell::default()
+                };
+                pattern
+            })
+            .collect();
+        for index in 0..source.patterns.len() {
+            source.chain.push(index as u8);
+        }
+        source.apply_midi_file(MidiFileAction::Export {
+            path: path.clone(),
+            scope: smf::Scope::Chain,
+            format: smf::Format::SingleTrack,
+        });
+
+        let mut app = offline_app(&ctx);
+        app.master_send = 0.35;
+        app.apply_midi_file(MidiFileAction::Import {
+            path: path.clone(),
+            destination: MidiDestination::OpenChain,
+            rate: PlaybackRate::EightX,
+            use_tempo: true,
+        });
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(app.patterns.len(), project::PATTERN_BANK_CAPACITY);
+        assert_eq!(app.histories.len(), app.patterns.len());
+        assert_eq!(app.chain, source.chain);
+        assert_eq!(app.bpm, source.bpm);
+        assert_eq!(app.master_send, 0.35);
+        for (actual, expected) in app.patterns.iter().zip(source.patterns) {
+            assert_eq!(
+                (actual.length, actual.rate),
+                (expected.length, expected.rate)
+            );
+            assert_eq!(actual.lanes, expected.lanes);
+        }
     }
 
     #[test]
