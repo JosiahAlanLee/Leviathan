@@ -62,7 +62,7 @@ impl AudioCommand {
     }
 }
 
-pub struct Audio
+pub struct AudioProject {
     generation: u64,
     bpm: f64,
     master_send: f32,
@@ -72,7 +72,7 @@ pub struct Audio
     sample_bank: SampleBank,
 }
 
-impl Audio
+impl AudioProject {
     pub fn prepare(project: &Project, generation: u64) -> Self {
         let mut sample_bank = SampleBank::new();
         for (bank, sample) in project.samples.iter().enumerate() {

@@ -398,8 +398,8 @@ mod tests {
         cv.beat = 4.25;
         cv.z_v = 5.0;
         cv.feedback_v = 7.5;
-        cv.gate_v = [10.0, 2.5, 0.0, 5.0];
-        cv.pitch_v = [0.25, -0.5, 1.0, 0.0];
+        cv.gate_v = [10.0, 2.5, 0.0, 5.0, 0.0, 0.0];
+        cv.pitch_v = [0.25, -0.5, 1.0, 0.0, 0.0, 0.0];
         cv.bytebus_v[0] = 6.0;
         cv.bytebus_v[3] = 8.0;
 

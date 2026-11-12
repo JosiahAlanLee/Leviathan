@@ -282,7 +282,7 @@ mod tests {
         save(&path, 120.0, 0.0, &patterns, 0, &chain, &samples, None).unwrap();
         let bpm = f64::from_bits(120.0_f64.to_bits() + 1);
         let send = 0.37_f32;
-        save(&path, bpm, send, &patterns, 1, &chain, &samples), None.unwrap();
+        save(&path, bpm, send, &patterns, 1, &chain, &samples, None).unwrap();
         let project = load(&path).unwrap();
         fs::remove_file(path).unwrap();
         assert_eq!(project.bpm.to_bits(), bpm.to_bits());
