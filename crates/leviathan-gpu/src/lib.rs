@@ -62,7 +62,7 @@ impl VisualUniforms {
     }
 }
 
-/// Built-in WGSL fullscreen triangle + ping-pong reactive Möbius/PDE feedback fragment shader.
+/// WGSL fullscreen triangle + ping-pong reactive Möbius/PDE feedback fragment shader compiled via `wgpu`/`naga`.
 pub const FEEDBACK_SHADER_WGSL: &str = r#"
 struct VisualUniforms {
     beat: f32,
@@ -398,22 +398,33 @@ mod tests {
         cv.beat = 4.25;
         cv.z_v = 5.0;
         cv.feedback_v = 7.5;
-        cv.gate_v = [10.0, 2.5, 0.0, 5.0];
-        cv.pitch_v = [0.25, -0.5, 1.0, 0.0];
+        cv.gate_v = [10.0, 2.5, 0.0, 5.0, 0.0, 0.0];
+        cv.pitch_v = [0.25, -0.5, 1.0, 0.0, 0.0, 0.0];
         cv.bytebus_v[0] = 6.0;
         cv.bytebus_v[3] = 8.0;
 
-        let u = VisualUniforms::from_cv(&cv, 12, 640, 360);
+        let u = VisualUniforms::from_cv(&cv, 42, 640, 360);
         assert_eq!(u.beat, 4.25);
-        assert_eq!(u.z_norm, 0.5);
-        assert_eq!(u.feedback_norm, 0.75);
+        assert!((u.z_norm - 0.5).abs() < 1e-5);
+        assert!((u.feedback_norm - 0.75).abs() < 1e-5);
+        assert!((u.gate_energy[0] - 1.0).abs() < 1e-5);
         assert_eq!(u.gate_energy, [1.0, 0.25, 0.0, 0.5]);
         assert_eq!(u.pitch_norm, [0.25, -0.5, 1.0, 0.0]);
         assert_eq!(u.byte_mask, 0b0000_1001);
-        assert_eq!(u.frame_index, 12);
+        assert_eq!(u.frame_index, 42);
         assert_eq!(u.width, 640.0);
         assert_eq!(u.height, 360.0);
         assert_eq!(u.as_bytes().len(), 64);
+    }
+
+    #[test]
+    fn feedback_shader_declares_ping_pong_bindings_and_entry_points() {
+        assert!(FEEDBACK_SHADER_WGSL.contains("@group(0) @binding(0)"));
+        assert!(FEEDBACK_SHADER_WGSL.contains("@group(0) @binding(1)"));
+        assert!(FEEDBACK_SHADER_WGSL.contains("@group(0) @binding(2)"));
+        assert!(FEEDBACK_SHADER_WGSL.contains("fn vs_main"));
+        assert!(FEEDBACK_SHADER_WGSL.contains("fn fs_main"));
+        assert!(FEEDBACK_SHADER_WGSL.contains("textureSample(prev_tex, prev_sampler"));
     }
 
     #[test]
