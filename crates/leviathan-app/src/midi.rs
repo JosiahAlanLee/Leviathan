@@ -607,7 +607,7 @@ mod tests {
     #[test]
     fn audio_queue_resets_on_overflow_and_skips_old_ports() {
         let (mut controls, mut audio) = MidiControls::new();
-        for _ in 0..MIDI_QUEUE_CAPACITY {
+        for _ in 0..=MIDI_QUEUE_CAPACITY {
             controls.inject(MidiEvent::Start);
         }
         assert_eq!(audio.begin_batch(), (true, 0));
