@@ -424,7 +424,7 @@ mod tests {
             wgsl: leviathan_gpu::STARTER_SHADER_TEMPLATE_WGSL.to_string(),
         };
 
-        save
+        save(
             &path,
             Project {
                 bpm: 120.0,
