@@ -162,6 +162,7 @@ pub enum ArrangementAction {
     Select(usize),
     AddPattern { clone: bool },
     SetRate(PlaybackRate),
+    SetSwing(f32),
     Launch(LaunchTarget),
     AppendToChain,
     PopChain,
@@ -244,6 +245,19 @@ pub fn draw_arrangement(
                     }
                 }
             });
+        let mut swing = patterns[selected].swing * 100.0;
+        if ui
+            .add(
+                egui::Slider::new(&mut swing, 50.0..=leviathan_core::MAX_SWING * 100.0)
+                    .step_by(0.5)
+                    .suffix("%")
+                    .text("Swing"),
+            )
+            .on_hover_text("Delay odd rows while keeping the pattern length fixed")
+            .changed()
+        {
+            action = Some(ArrangementAction::SetSwing(swing / 100.0));
+        }
         let launch = if playing {
             "Queue Pattern"
         } else {

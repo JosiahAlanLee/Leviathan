@@ -1,6 +1,7 @@
 use eframe::egui;
 use leviathan_core::{
-    AutomationRow, FillCondition, NoteCell, PlaybackRate, SoundLock, NUM_LANES, ROWS_PER_PATTERN,
+    AutomationRow, FillCondition, NoteCell, PlaybackRate, SoundLock, MAX_NUDGE, MAX_RETRIG,
+    NUM_LANES, ROWS_PER_PATTERN,
 };
 use leviathan_dsp::MachineKind;
 
@@ -184,11 +185,26 @@ pub fn draw(
     ui.horizontal(|ui| {
         if ui
             .add(egui::Slider::new(&mut edit_cell.gate_fraction, 0.0..=1.0).text("Gate"))
-            .on_hover_text("Step gate duty cycle fraction (0.0..=1.0)")
+            .on_hover_text("Gate length within each trigger interval")
             .changed()
         {
             cell_dirty = true;
         }
+    });
+
+    ui.horizontal_wrapped(|ui| {
+        cell_dirty |= ui
+            .add(
+                egui::Slider::new(&mut edit_cell.micro_offset, -MAX_NUDGE..=MAX_NUDGE)
+                    .suffix(" ticks")
+                    .text("Nudge"),
+            )
+            .on_hover_text("Move this hit earlier or later. One row is 48 ticks.")
+            .changed();
+        cell_dirty |= ui
+            .add(egui::Slider::new(&mut edit_cell.retrig, 1..=MAX_RETRIG).text("Retrig"))
+            .on_hover_text("Number of evenly spaced hits in this step")
+            .changed();
     });
 
     ui.horizontal_wrapped(|ui| {

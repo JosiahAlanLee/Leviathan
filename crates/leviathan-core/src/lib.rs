@@ -110,6 +110,18 @@ pub enum FillCondition {
     WhenNoFill,
 }
 
+pub const MAX_NUDGE: i8 = 24;
+pub const MAX_RETRIG: u8 = 4;
+pub const MAX_SWING: f32 = 0.75;
+
+const fn straight_swing() -> f32 {
+    0.5
+}
+
+const fn single_trigger() -> u8 {
+    1
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NoteCell {
@@ -121,6 +133,10 @@ pub struct NoteCell {
     pub probability: u8, // 0..=100
     pub fill: FillCondition,
     pub lock: SoundLock,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub micro_offset: i8,
+    #[cfg_attr(feature = "serde", serde(default = "single_trigger"))]
+    pub retrig: u8,
 }
 
 impl Default for NoteCell {
@@ -134,6 +150,8 @@ impl Default for NoteCell {
             probability: 100,
             fill: FillCondition::Always,
             lock: SoundLock::default(),
+            micro_offset: 0,
+            retrig: single_trigger(),
         }
     }
 }
@@ -163,6 +181,8 @@ impl Default for AutomationRow {
 pub struct Pattern {
     pub length: usize,
     pub rate: PlaybackRate,
+    #[cfg_attr(feature = "serde", serde(default = "straight_swing"))]
+    pub swing: f32,
     #[cfg_attr(feature = "serde", serde(with = "pattern_serde::lanes"))]
     pub lanes: [[NoteCell; ROWS_PER_PATTERN]; NUM_LANES],
     #[cfg_attr(feature = "serde", serde(with = "pattern_serde::automation"))]
@@ -174,6 +194,7 @@ impl Default for Pattern {
         Self {
             length: ROWS_PER_PATTERN,
             rate: PlaybackRate::OneX,
+            swing: straight_swing(),
             lanes: [[NoteCell::default(); ROWS_PER_PATTERN]; NUM_LANES],
             automation: [AutomationRow::default(); ROWS_PER_PATTERN],
         }
@@ -186,9 +207,15 @@ impl Pattern {
     }
 
     fn timing(&self) -> PatternTiming {
+        let swing = if self.swing.is_finite() {
+            self.swing.clamp(straight_swing(), MAX_SWING)
+        } else {
+            straight_swing()
+        };
         PatternTiming {
             rows: self.length.clamp(1, ROWS_PER_PATTERN),
             rate: self.rate,
+            odd_delay: f64::from(swing) * 2.0 - 1.0,
         }
     }
 }
@@ -197,11 +224,21 @@ impl Pattern {
 struct PatternTiming {
     rows: usize,
     rate: PlaybackRate,
+    odd_delay: f64,
 }
 
 impl PatternTiming {
     fn duration_beats(&self) -> f64 {
         self.rows as f64 / self.rate.rows_per_beat()
+    }
+
+    fn row_start(self, row: usize) -> f64 {
+        row as f64
+            + if row & 1 != 0 && row < self.rows {
+                self.odd_delay
+            } else {
+                0.0
+            }
     }
 }
 
@@ -241,6 +278,8 @@ pub struct CvFrame {
     pub run_v: f32,
     pub pitch_v: [f32; NUM_LANES],
     pub gate_v: [f32; NUM_LANES],
+    /// Lanes with a new nudged or ratcheted attack on this sample.
+    pub retrigger_mask: u8,
     pub velocity_v: [f32; NUM_LANES],
     pub locks: [SoundLock; NUM_LANES],
     pub z_v: f32,
@@ -311,6 +350,7 @@ pub struct TrackerEvaluator {
     held_pitch_v: [f32; NUM_LANES],
     held_vel_v: [f32; NUM_LANES],
     held_locks: [SoundLock; NUM_LANES],
+    last_pulse: [Option<(u32, usize, u8)>; NUM_LANES],
     sequence: u64,
 }
 
@@ -367,6 +407,7 @@ impl TrackerEvaluator {
             held_pitch_v: [0.0; NUM_LANES],
             held_vel_v: [0.0; NUM_LANES],
             held_locks: [SoundLock::default(); NUM_LANES],
+            last_pulse: [None; NUM_LANES],
             sequence: 0,
         }
     }
@@ -374,6 +415,7 @@ impl TrackerEvaluator {
     pub fn reset_transport(&mut self) {
         self.clock = SampleClock::new(&self.config);
         self.cycle_start_beat = 0.0;
+        self.last_pulse = [None; NUM_LANES];
     }
 
     pub fn step_sample(&mut self, pattern: &Pattern) -> CvFrame {
@@ -399,6 +441,7 @@ impl TrackerEvaluator {
     ) -> CvFrame {
         let v_high = self.config.v_high;
         if !self.playing {
+            self.last_pulse = [None; NUM_LANES];
             return CvFrame {
                 pitch_v: self.held_pitch_v,
                 velocity_v: self.held_vel_v,
@@ -418,44 +461,106 @@ impl TrackerEvaluator {
             0.0
         };
 
-        let pat_len = timing.rows;
         let total_rows = (beat - pattern_start_beat).max(0.0) * timing.rate.rows_per_beat();
-        let row_index_abs = total_rows as u64;
-        let row = (row_index_abs as usize) % pat_len;
-        let bar_count = previous_plays.wrapping_add((row_index_abs / pat_len as u64) as u32);
-        let row_phase = fract_positive(total_rows) as f32;
+        let cycle = total_rows as u64 / timing.rows as u64;
+        let position = total_rows - (cycle * timing.rows as u64) as f64;
+        let grid_row = (position as usize).min(timing.rows - 1);
+        let row = if position < timing.row_start(grid_row) {
+            grid_row.saturating_sub(1)
+        } else {
+            grid_row
+        };
+        let bar_count = previous_plays.wrapping_add(cycle as u32);
+        let sample_rows =
+            self.config.bpm * timing.rate.rows_per_beat() / (60.0 * self.config.sample_rate);
+        let sample_rows = if sample_rows.is_finite() {
+            sample_rows.max(0.0)
+        } else {
+            0.0
+        };
+        // Leave a full sample on either side of each ratchet edge, with
+        // room for rounding when the gate width lands on a sample boundary.
+        let edge_width = sample_rows * 1.000_001;
 
         let mut gate_v = [0.0_f32; NUM_LANES];
         let mut hit_mask: u8 = 0;
+        let mut retrigger_mask: u8 = 0;
 
-        for lane in 0..NUM_LANES {
-            let cell = &pattern.lanes[lane][row];
-            let fill_ok = match cell.fill {
-                FillCondition::Always => true,
-                FillCondition::WhenFill => self.fill_active,
-                FillCondition::WhenNoFill => !self.fill_active,
-            };
-
-            if cell.active
-                && fill_ok
-                && passes_probability(
-                    cell.probability,
-                    self.config.seed,
-                    self.active_pattern as u32,
-                    lane as u32,
-                    row as u32,
-                    bar_count,
-                )
-            {
-                if !cell.air {
-                    let semis = cell.midi as i32 + self.config.key_offset - self.config.pitch_zero;
-                    self.held_pitch_v[lane] = semis as f32 / 12.0;
+        for (lane, gate) in gate_v.iter_mut().enumerate() {
+            let mut latest: Option<(usize, f64, f64)> = None;
+            // A nudge can bring the next row forward or extend the previous
+            // row. Keep one more row for notes whose onsets have traded order.
+            for candidate in grid_row.saturating_sub(2)..=(grid_row + 1).min(timing.rows - 1) {
+                let cell = &pattern.lanes[lane][candidate];
+                if !cell.active {
+                    continue;
                 }
-                self.held_vel_v[lane] = (cell.velocity.min(127) as f32 / 127.0) * v_high;
-                self.held_locks[lane] = cell.lock;
-                if row_phase < cell.gate_fraction.clamp(0.01, 1.0) {
-                    gate_v[lane] = v_high;
-                    hit_mask |= 1 << lane;
+                let nominal = timing.row_start(candidate);
+                let span = timing.row_start(candidate + 1) - nominal;
+                let nudge = f64::from(cell.micro_offset.clamp(-MAX_NUDGE, MAX_NUDGE)) / 48.0;
+                // Keep even the latest hit inside the pattern and leave
+                // enough time for each pulse and its gap at the loop edge.
+                let minimum_span =
+                    (edge_width * 2.0 * f64::from(cell.retrig.clamp(1, MAX_RETRIG))).min(span);
+                let start = (nominal + nudge).clamp(0.0, timing.rows as f64 - minimum_span);
+                let fill_ok = match cell.fill {
+                    FillCondition::Always => true,
+                    FillCondition::WhenFill => self.fill_active,
+                    FillCondition::WhenNoFill => !self.fill_active,
+                };
+                if start <= position
+                    && latest.is_none_or(|(_, previous, _)| start >= previous)
+                    && fill_ok
+                    && passes_probability(
+                        cell.probability,
+                        self.config.seed,
+                        self.active_pattern as u32,
+                        lane as u32,
+                        candidate as u32,
+                        bar_count,
+                    )
+                {
+                    latest = Some((candidate, start, span.min(timing.rows as f64 - start)));
+                }
+            }
+            let previous_pulse = self.last_pulse[lane].take();
+            let Some((note_row, start, span)) = latest else {
+                continue;
+            };
+            let cell = &pattern.lanes[lane][note_row];
+            let elapsed = position - start;
+            if elapsed >= span {
+                continue;
+            }
+            if !cell.air {
+                let semis = cell.midi as i32 + self.config.key_offset - self.config.pitch_zero;
+                self.held_pitch_v[lane] = semis as f32 / 12.0;
+            }
+            self.held_vel_v[lane] = (cell.velocity.min(127) as f32 / 127.0) * v_high;
+            self.held_locks[lane] = cell.lock;
+
+            let count = cell.retrig.clamp(1, MAX_RETRIG);
+            let interval = span / f64::from(count);
+            let pulse = ((elapsed / interval) as u8).min(count - 1);
+            let phase = elapsed - f64::from(pulse) * interval;
+            let width = interval * f64::from(cell.gate_fraction.clamp(0.01, 1.0));
+            let width = if count > 1 {
+                let gap = edge_width.min(interval * 0.5);
+                width.clamp(gap, interval - gap)
+            } else if cell.micro_offset != 0 {
+                width.max(edge_width.min(interval))
+            } else {
+                width
+            };
+            if phase < width {
+                *gate = v_high;
+                hit_mask |= 1 << lane;
+                if count > 1 || cell.micro_offset != 0 {
+                    let pulse = Some((bar_count, note_row, pulse));
+                    if pulse != previous_pulse {
+                        retrigger_mask |= 1 << lane;
+                    }
+                    self.last_pulse[lane] = pulse;
                 }
             }
         }
@@ -471,6 +576,7 @@ impl TrackerEvaluator {
             run_v: v_high,
             pitch_v: self.held_pitch_v,
             gate_v,
+            retrigger_mask,
             velocity_v: self.held_vel_v,
             locks: self.held_locks,
             z_v: auto.z.clamp(0.0, 1.0) * v_high,

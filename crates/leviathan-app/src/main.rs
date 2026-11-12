@@ -7,6 +7,7 @@ mod lane_mix;
 mod link;
 mod master_ui;
 mod midi;
+mod mixer_ui;
 mod project;
 mod sampler_ui;
 mod session_ui;
@@ -218,7 +219,7 @@ impl LeviathanApp {
 
         let initial_pattern = starter_electro_pattern();
         let (cmd_tx, cmd_rx) = rtrb::RingBuffer::<AudioCommand>::new(256);
-        let (tel_tx, tel_rx) = rtrb::RingBuffer::<AudioTelemetry>::new(64);
+        let (tel_tx, tel_rx) = rtrb::RingBuffer::<AudioTelemetry>::new(256);
         let (midi, midi_events) = MidiControls::new();
 
         let (_audio_stream, offline_player, audio_status) =
@@ -421,7 +422,7 @@ impl LeviathanApp {
         }
     }
 
-    fn apply_arrangement_action(&mut self, action: ArrangementAction) {
+    fn apply_arrangement_action(&mut self, ctx: &egui::Context, action: ArrangementAction) {
         let index = self.selected_pattern;
         match action {
             ArrangementAction::Select(index) => self.select_pattern(index),
@@ -441,6 +442,11 @@ impl LeviathanApp {
                 let pattern = &mut self.patterns[index];
                 self.histories[index].record_before_edit(pattern);
                 pattern.rate = rate;
+                self.push_full_pattern(index);
+            }
+            ArrangementAction::SetSwing(swing) => {
+                self.record_inspector_undo_once(ctx, index);
+                self.patterns[index].swing = swing;
                 self.push_full_pattern(index);
             }
             ArrangementAction::Launch(target) => self.send_audio(AudioCommand::Launch(target)),
@@ -468,7 +474,8 @@ impl LeviathanApp {
             selected_pattern: self.selected_pattern,
             chain: self.chain,
             samples: self.sampler_ui.samples.clone(),
-custom_shader: self.viewport.custom_shader().cloned(),
+            sample_regions: self.sampler_ui.regions,
+            custom_shader: self.viewport.custom_shader().cloned(),
         }
     }
 
@@ -498,7 +505,8 @@ custom_shader: self.viewport.custom_shader().cloned(),
         self.patterns = project.patterns;
         self.selected_pattern = project.selected_pattern;
         self.chain = project.chain;
-        self.sampler_ui.restore(project.samples);
+        self.sampler_ui
+            .restore(project.samples, project.sample_regions);
         self.viewport.restore_custom_shader(project.custom_shader);
         self.playing = false;
         self.midi.record_armed = false;
@@ -521,10 +529,19 @@ impl eframe::App for LeviathanApp {
         self.audio.flush();
         self.export_ui.poll(ctx);
         let mut peaks = MasterPeaks::default();
+        let mut visual_gates = [0.0_f32; NUM_LANES];
+        let telemetry_generation = self.project_generation;
         while let Ok(telemetry) = self.tel_rx.pop() {
             if telemetry.generation == self.project_generation {
                 if telemetry.play_request == self.play_request {
                     self.playing = telemetry.playing;
+                }
+                if telemetry.cv.gate_v != self.latest_cv.gate_v || telemetry.cv.retrigger_mask != 0
+                {
+                    self.sound_link.emit_frame(&telemetry.cv, telemetry.playing);
+                }
+                for (peak, gate) in visual_gates.iter_mut().zip(telemetry.cv.gate_v) {
+                    *peak = peak.max(gate);
                 }
                 self.latest_cv = telemetry.cv;
                 self.latest_scope = telemetry.scope;
@@ -554,7 +571,7 @@ impl eframe::App for LeviathanApp {
             self.apply_project_action(action);
         } else if !modal_open {
             if let Some(action) = arrangement {
-                self.apply_arrangement_action(action);
+                self.apply_arrangement_action(ctx, action);
             }
         }
         if let Some(request) = self.export_ui.show_dialog(
@@ -568,12 +585,9 @@ impl eframe::App for LeviathanApp {
 
         let selected = self.selected_pattern;
         let previous_audible = self.lane_mix.audible_mask();
+        let previous_channels = self.lane_mix.channels;
         if !modal_open && !ctx.wants_keyboard_input() {
             tracker_keys::apply_lane_mix_shortcuts(ctx, &mut self.lane_mix);
-        }
-
-        if !ctx.input(|i| i.pointer.any_down()) {
-            self.inspector_drag_recorded = false;
         }
 
         if !modal_open
@@ -614,7 +628,13 @@ impl eframe::App for LeviathanApp {
         }
 
         self.sound_link.emit_frame(&self.latest_cv, self.playing);
-        let tex_id = self.viewport.render_frame(ctx, &self.latest_cv, &self.latest_scope);
+        let mut visual_cv = self.latest_cv;
+        if telemetry_generation == self.project_generation {
+            for (gate, peak) in visual_cv.gate_v.iter_mut().zip(visual_gates) {
+                *gate = gate.max(peak);
+            }
+        }
+                let tex_id = self.viewport.render_frame(ctx, &visual_cv, &self.latest_scope);
 
         egui::TopBottomPanel::top("transport_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -711,6 +731,7 @@ impl eframe::App for LeviathanApp {
 
                     ui.separator();
                     self.viewport.draw_shader_controls(ui, hovering_wgsl);
+                    mixer_ui::draw(ui, &mut self.lane_mix);
                     bank_actions.extend(self.sampler_ui.draw(ui, hovering_wav));
 
                     ui.separator();
@@ -721,6 +742,9 @@ impl eframe::App for LeviathanApp {
             });
 
         self.apply_inspector_edits(ctx, selected, sel_lane, sel_row, inspector_edits);
+        if !ctx.input(|i| i.pointer.any_down()) {
+            self.inspector_drag_recorded = false;
+        }
 
         for action in bank_actions {
             let cmd = match action {
@@ -734,6 +758,9 @@ impl eframe::App for LeviathanApp {
                     c4_rate_hz,
                 },
                 BankAction::ResetRom { bank } => AudioCommand::ResetSampleBank { bank },
+                BankAction::SetRegion { bank, region } => {
+                    AudioCommand::SetSampleRegion { bank, region }
+                }
             };
             self.send_audio(cmd);
         }
@@ -937,6 +964,9 @@ impl eframe::App for LeviathanApp {
         if audible != previous_audible {
             self.send_audio(AudioCommand::SetLaneAudibleMask(audible));
         }
+        if self.lane_mix.channels != previous_channels {
+            self.send_audio(AudioCommand::SetLaneChannels(self.lane_mix.dsp_channels()));
+        }
         self.sync_midi_target();
         if self.playing || self.audio.has_pending() || self.master_meters.is_active(now) {
             ctx.request_repaint();
@@ -1071,11 +1101,12 @@ mod tests {
                 key(Key::Num4, Modifiers::ALT | Modifiers::SHIFT),
             ],
         );
-        assert_eq!(app.lane_mix, LaneMix { mute_mask: 0b10, solo_mask: 0b1000 });
-        app.apply_arrangement_action(ArrangementAction::AppendToChain);
-        app.apply_arrangement_action(ArrangementAction::AddPattern { clone: true });
-        app.apply_arrangement_action(ArrangementAction::SetRate(PlaybackRate::Half));
-        app.apply_arrangement_action(ArrangementAction::AppendToChain);
+        assert_eq!(app.lane_mix.mute_mask, 0b10);
+        assert_eq!(app.lane_mix.solo_mask, 0b1000);
+        app.apply_arrangement_action(&ctx, ArrangementAction::AppendToChain);
+        app.apply_arrangement_action(&ctx, ArrangementAction::AddPattern { clone: true });
+        app.apply_arrangement_action(&ctx, ArrangementAction::SetRate(PlaybackRate::Half));
+        app.apply_arrangement_action(&ctx, ArrangementAction::AppendToChain);
 
         frame(&ctx, &mut app, vec![key(Key::S, cmd)]);
         assert!(app.project_ui.dialog_open());
@@ -1104,7 +1135,8 @@ mod tests {
         frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
         std::fs::remove_file(path).unwrap();
         assert_eq!(app.master_send, 0.35);
-        assert_eq!(app.lane_mix, LaneMix { mute_mask: 0b10, solo_mask: 0b1000 });
+        assert_eq!(app.lane_mix.mute_mask, 0b10);
+        assert_eq!(app.lane_mix.solo_mask, 0b1000);
         frame(&ctx, &mut app, Vec::new());
         frame(&ctx, &mut app, vec![key(Key::Num0, Modifiers::ALT)]);
         assert_eq!(app.lane_mix, LaneMix::default());

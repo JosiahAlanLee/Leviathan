@@ -194,6 +194,10 @@ impl SongPlayer {
             }
             self.timing = Some(timing);
         }
+        let retrigger = self.evaluator.playing && core::mem::take(&mut self.needs_retrigger);
+        if retrigger {
+            self.evaluator.last_pulse = [None; crate::NUM_LANES];
+        }
         let cv = self.evaluator.evaluate_sample(
             pattern,
             timing,
@@ -201,7 +205,6 @@ impl SongPlayer {
             self.pattern_start_beat,
             self.previous_plays,
         );
-        let retrigger = self.evaluator.playing && core::mem::take(&mut self.needs_retrigger);
         (cv, retrigger)
     }
 }
@@ -210,6 +213,143 @@ impl SongPlayer {
 mod tests {
     use super::*;
     use crate::{AutomationRow, NoteCell, PlaybackRate};
+
+    fn groove_player() -> SongPlayer {
+        let mut player = SongPlayer::new(EngineConfig {
+            bpm: 60.0,
+            sample_rate: 192.0,
+            ..EngineConfig::default()
+        });
+        player.evaluator.playing = true;
+        player
+    }
+
+    #[test]
+    fn swing_delays_odd_rows_and_keeps_an_odd_length_pattern_in_time() {
+        let mut pattern = Pattern {
+            length: 5,
+            swing: 0.75,
+            ..Pattern::default()
+        };
+        pattern.lanes[0][..5].fill(NoteCell {
+            active: true,
+            ..NoteCell::default()
+        });
+        pattern.automation[1].byte_word = 0x80;
+        assert_eq!(pattern.duration_beats(), 1.25);
+        let mut player = groove_player();
+        let mut was_high = false;
+        let mut hits = [usize::MAX; 6];
+        let mut hit = 0;
+        for sample in 0..=240 {
+            let (cv, _) = player.step_sample(core::slice::from_ref(&pattern));
+            let high = cv.gate_v[0] > 0.0;
+            if high && !was_high {
+                hits[hit] = sample;
+                hit += 1;
+            }
+            if sample == 48 {
+                assert_eq!(cv.row, 0);
+                assert_eq!(cv.bytebus_v[7], 0.0);
+            }
+            if sample == 72 {
+                assert_eq!(cv.row, 1);
+                assert_eq!(cv.bytebus_v[7], 10.0);
+            }
+            was_high = high;
+        }
+        assert_eq!(hits, [0, 72, 96, 168, 192, 240]);
+    }
+
+    #[test]
+    fn full_gate_ratchets_have_separate_edges_and_even_onsets() {
+        let mut pattern = Pattern {
+            length: 1,
+            ..Pattern::default()
+        };
+        for count in 1..=4 {
+            pattern.lanes[0][0] = NoteCell {
+                active: true,
+                gate_fraction: 1.0,
+                retrig: count,
+                ..NoteCell::default()
+            };
+            let mut player = groove_player();
+            let mut was_high = false;
+            let mut hits = 0;
+            for sample in 0..48 {
+                let (cv, _) = player.step_sample(core::slice::from_ref(&pattern));
+                let high = cv.gate_v[0] > 0.0;
+                if high && !was_high {
+                    assert_eq!(sample, hits * 48 / usize::from(count));
+                    assert_eq!(cv.retrigger_mask, u8::from(count > 1));
+                    hits += 1;
+                } else {
+                    assert_eq!(cv.retrigger_mask, 0);
+                }
+                was_high = high;
+            }
+            assert_eq!(hits, usize::from(count));
+        }
+    }
+
+    #[test]
+    fn nudged_hits_cross_rows_but_stay_inside_the_pattern() {
+        let mut pattern = Pattern {
+            length: 4,
+            swing: 0.75,
+            ..Pattern::default()
+        };
+        for (lane, row, offset) in [(0, 0, -24), (1, 2, -24), (2, 1, 24), (3, 3, 24)] {
+            pattern.lanes[lane][row] = NoteCell {
+                active: true,
+                micro_offset: offset,
+                gate_fraction: 1.0,
+                ..NoteCell::default()
+            };
+        }
+        pattern.lanes[3][3].retrig = 4;
+        // These two hits trade order. The first one must stay released
+        // once the later onset has taken over the lane.
+        pattern.lanes[4][1] = NoteCell {
+            active: true,
+            midi: 72,
+            micro_offset: 24,
+            gate_fraction: 1.0,
+            ..NoteCell::default()
+        };
+        pattern.lanes[4][2] = NoteCell {
+            active: true,
+            midi: 48,
+            micro_offset: -6,
+            gate_fraction: 1.0,
+            ..NoteCell::default()
+        };
+        let mut player = groove_player();
+        let mut first = [None; 4];
+        let mut last_lane_hits = 0;
+        for sample in 0..192 {
+            let (cv, _) = player.step_sample(core::slice::from_ref(&pattern));
+            for (lane, onset) in first.iter_mut().enumerate() {
+                if cv.retrigger_mask & (1 << lane) != 0 {
+                    onset.get_or_insert((sample, cv.row));
+                }
+            }
+            last_lane_hits += usize::from(cv.retrigger_mask & 8 != 0);
+            match sample {
+                90 => assert_eq!((cv.pitch_v[4], cv.gate_v[4]), (-1.0, 10.0)),
+                96 => assert_eq!((cv.pitch_v[4], cv.gate_v[4]), (1.0, 10.0)),
+                120.. => assert_eq!((cv.pitch_v[4], cv.gate_v[4]), (1.0, 0.0)),
+                _ => {}
+            }
+        }
+        assert_eq!(first[..3], [Some((0, 0)), Some((72, 1)), Some((96, 2))]);
+        assert!(matches!(first[3], Some((184..=185, 3))));
+        assert_eq!(last_lane_hits, 4);
+        let (cv, _) = player.step_sample(&[pattern]);
+        assert_eq!(cv.row, 0);
+        assert_eq!(cv.gate_v[3], 0.0);
+    }
 
     #[test]
     fn queued_launch_changes_audio_and_automation_on_first_sample_of_incoming_row_zero() {
