@@ -98,7 +98,8 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
   - Round-trip unit test rendering a multi-lane pattern to both `16-bit PCM` and `32-bit float` WAV bytes and decoding them back via `wav::decode_wav_bytes` with verified frame counts, sample rates, and non-silent peaks; 0 compiler warnings.
 
 ### `T9` — External MIDI Input (Live Audition, Step Record & MIDI Transport)
-- **Status**: `OPEN`
+- **Status**: `IN REVIEW` (implementation `beac0d8`)
+- **Controls**: MIDI port selector, **Refresh MIDI**, and **MIDI REC**. `AudioCommand::SetMidiTarget` follows the cursor, and `SetPlaying { playing, request }` acknowledges local play/stop changes.
 - **Owned Files**: `Cargo.toml`, `crates/leviathan-app/Cargo.toml`, new `crates/leviathan-app/src/midi.rs`, `crates/leviathan-app/src/audio.rs`, `crates/leviathan-app/src/main.rs`
 - **Goal**: Support hardware/virtual MIDI input ports (`midir`) for live voice audition on the active lane, step-record note/velocity entry into the tracker grid, and MIDI `Start` (`0xFA`) / `Continue` (`0xFB`) / `Stop` (`0xFC`) transport sync.
 - **Scope & Constraints**:
