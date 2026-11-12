@@ -32,6 +32,38 @@ impl Default for SoundLock {
             values: [0.0; SOUND_PARAMS],
         }
     }
+
+impl SoundLock {
+    #[inline]
+    pub const fn has_param(&self, slot: usize) -> bool {
+        slot < SOUND_PARAMS && ((self.mask >> slot) & 1) != 0
+    }
+
+    #[inline]
+    pub const fn resolved_with_base(
+        &self,
+        default_machine: i16,
+        base_values: &[f32; SOUND_PARAMS],
+    ) -> Self {
+        let mut values = *base_values;
+        let mut slot = 0;
+        while slot < SOUND_PARAMS {
+            if ((self.mask >> slot) & 1) != 0 {
+                values[slot] = self.values[slot];
+            }
+            slot += 1;
+        }
+        Self {
+            machine: if self.machine >= 0 {
+                self.machine
+            } else {
+                default_machine
+            },
+            mask: 0x00ff,
+            values,
+        }
+    }
+}
 }
 
 #[repr(C)]
@@ -665,5 +697,24 @@ mod tests {
 
         let f1 = eval.step_sample(&pat);
         assert!((f1.pitch_v[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sound_lock_resolves_masked_overrides_over_lane_base() {
+        let base = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+        let mut lock = SoundLock::default();
+        lock.mask = (1 << 1) | (1 << 6);
+        lock.values[1] = 0.95;
+        lock.values[6] = 0.05;
+
+        let resolved = lock.resolved_with_base(4, &base);
+        assert_eq!(resolved.machine, 4);
+        assert_eq!(resolved.mask, 0x00ff);
+        assert_eq!(resolved.values, [0.1, 0.95, 0.3, 0.4, 0.5, 0.6, 0.05, 0.8]);
+
+        lock.machine = 6;
+        assert_eq!(lock.resolved_with_base(4, &base).machine, 6);
+        assert!(lock.has_param(1));
+        assert!(!lock.has_param(0));
     }
 }
