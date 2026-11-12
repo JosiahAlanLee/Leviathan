@@ -231,7 +231,37 @@ fn default_path(stems: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::midi::{MidiEvent, MidiKey};
+    use crate::LeviathanApp;
     use eframe::egui::{Event, Key, Modifiers, RawInput};
+
+    #[test]
+    fn opening_export_dialog_blocks_midi_step_recording_but_keeps_transport() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = LeviathanApp::with_audio(&cc, |_, _, _, _| Err("Offline test clock".into()));
+        app.export_ui.dialog = true;
+        app.midi.record_armed = true;
+        let (lane, row) = (app.cursor.lane, app.cursor.row);
+        let before = app.patterns[0].lanes[lane][row];
+        app.midi.inject(MidiEvent::NoteOn {
+            key: MidiKey {
+                channel: 0,
+                note: 67,
+            },
+            velocity: 91,
+        });
+        app.midi.inject(MidiEvent::Start);
+
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut eframe::Frame::_new_kittest());
+        });
+
+        assert_eq!(app.patterns[0].lanes[lane][row], before);
+        assert_eq!(app.cursor.row, row);
+        assert!(app.export_ui.dialog_open());
+        assert!(app.playing);
+    }
 
     #[test]
     fn export_dialog_submits_the_path_and_selected_options() {

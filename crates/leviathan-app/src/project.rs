@@ -510,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_shader_round_trips_and_legacy_projects_default_to_none() {
+    fn custom_shader_and_lane_mix_round_trip_in_the_same_project() {
         let path = std::env::temp_dir()
             .join(format!("leviathan-shader-rt-{}.json", std::process::id()));
         let patterns = [Pattern::default()];
@@ -520,30 +520,37 @@ mod tests {
             name: "starter_custom.wgsl".to_string(),
             wgsl: leviathan_gpu::STARTER_SHADER_TEMPLATE_WGSL.to_string(),
         };
+        let lane_mix = LaneMix {
+            mute_mask: 0b10,
+            solo_mask: 0b11,
+        };
 
         save(
             &path,
             Project {
                 bpm: 120.0,
                 master_send: 0.25,
-                lane_mix: LaneMix::default(),
+                lane_mix,
                 patterns: patterns.to_vec(),
                 selected_pattern: 0,
                 chain,
                 samples,
                 sample_regions: Default::default(),
                 custom_shader: Some(shader.clone()),
-                   },
-    )
-    .unwrap();
+            },
+        )
+        .unwrap();
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.custom_shader, Some(shader));
+        assert_eq!(loaded.lane_mix, lane_mix);
 
         let raw_bytes = fs::read(&path).unwrap();
         let mut json: serde_json::Value = serde_json::from_slice(&raw_bytes).unwrap();
         json.as_object_mut().unwrap().remove("custom_shader");
         let legacy: ProjectFile = serde_json::from_value(json.clone()).unwrap();
-        assert_eq!(legacy.into_project().unwrap().custom_shader, None);
+        let legacy = legacy.into_project().unwrap();
+        assert_eq!(legacy.custom_shader, None);
+        assert_eq!(legacy.lane_mix, lane_mix);
 
         json["custom_shader"] = serde_json::json!({
             "name": "broken.wgsl",

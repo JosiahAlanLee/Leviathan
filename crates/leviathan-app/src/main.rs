@@ -194,6 +194,7 @@ struct LeviathanApp {
     offline_player: Option<SongPlayer>,
     audio_status: String,
     latest_cv: CvFrame,
+        latest_scope: leviathan_gpu::AudioScopeSnapshot,
     latest_song: SongStatus,
     viewport: FeedbackViewport,
 }
@@ -264,6 +265,7 @@ impl LeviathanApp {
             offline_player,
             audio_status,
             latest_cv: CvFrame::default(),
+            latest_scope: leviathan_gpu::AudioScopeSnapshot::default(),
             latest_song: SongStatus::default(),
             viewport,
         };
@@ -301,10 +303,10 @@ impl LeviathanApp {
         }
     }
 
-    fn read_midi(&mut self, ctx: &egui::Context) {
+    fn read_midi(&mut self, ctx: &egui::Context, modal_open: bool) {
         let (_, count) = self.midi.events.begin_batch();
         let record = self.midi.record_armed
-            && !self.project_ui.dialog_open()
+            && !modal_open
             && ctx.memory(|memory| memory.top_modal_layer().is_none());
         for _ in 0..count {
             match self.midi.events.pop() {
@@ -513,6 +515,7 @@ impl LeviathanApp {
         self.inspector_drag_recorded = false;
         self.cursor = TrackerCursor::default();
         self.latest_cv = CvFrame::default();
+        self.latest_scope = leviathan_gpu::AudioScopeSnapshot::default();        
         self.latest_song = SongStatus {
             pattern: self.selected_pattern,
             ..SongStatus::default()
@@ -541,6 +544,7 @@ impl eframe::App for LeviathanApp {
                     *peak = peak.max(gate);
                 }
                 self.latest_cv = telemetry.cv;
+                self.latest_scope = telemetry.scope;
                 self.latest_song = telemetry.song;
                 peaks.merge(telemetry.master);
             }
@@ -612,7 +616,7 @@ impl eframe::App for LeviathanApp {
             }
         }
 
-        self.read_midi(ctx);
+        self.read_midi(ctx, modal_open);
         self.sync_midi_target();
         let (hovering_wav, mut bank_actions) = self.sampler_ui.poll_drag_and_drop(ctx);
         let hovering_wgsl = self.viewport.poll_shader_drop(ctx);
@@ -630,7 +634,7 @@ impl eframe::App for LeviathanApp {
                 *gate = gate.max(peak);
             }
         }
-        let tex_id = self.viewport.render_frame(ctx, &visual_cv);
+                let tex_id = self.viewport.render_frame(ctx, &visual_cv, &self.latest_scope);
 
         egui::TopBottomPanel::top("transport_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {

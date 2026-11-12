@@ -8,8 +8,9 @@ use std::time::SystemTime;
 use eframe::{egui, egui_wgpu, wgpu};
 use leviathan_core::CvFrame;
 use leviathan_gpu::{
-    is_wgsl_filename, validate_wgsl_contract, FeedbackSurface, VisualUniforms,
-    FEEDBACK_SHADER_WGSL, MAX_CUSTOM_WGSL_BYTES, STARTER_SHADER_TEMPLATE_WGSL,
+    is_wgsl_filename, validate_wgsl_contract, AudioScopeSnapshot, FeedbackSurface, VisualUniforms,
+    AUDIO_TEX_BYTES, AUDIO_TEX_HEIGHT, AUDIO_TEX_WIDTH, FEEDBACK_SHADER_WGSL,
+    MAX_CUSTOM_WGSL_BYTES, STARTER_SHADER_TEMPLATE_WGSL,
 };
 
 use crate::project::CustomShader;
@@ -60,6 +61,9 @@ struct GpuPingPong {
     _textures: [wgpu::Texture; 2],
     views: [wgpu::TextureView; 2],
     bind_groups: [wgpu::BindGroup; 2],
+    audio_tex: wgpu::Texture,
+    audio_bind_group: wgpu::BindGroup,
+    audio_rgba: Box<[u8; AUDIO_TEX_BYTES]>,
     texture_id: egui::TextureId,
     front_idx: usize,
     width: u32,
@@ -253,11 +257,69 @@ impl GpuPingPong {
             ],
         });
 
+        let audio_tex = rs.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("leviathan_audio_scope_tex"),
+            size: wgpu::Extent3d {
+                width: AUDIO_TEX_WIDTH,
+                height: AUDIO_TEX_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let audio_tex_view = audio_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut audio_rgba = Box::new([0u8; AUDIO_TEX_BYTES]);
+        AudioScopeSnapshot::default().pack_rgba8(&mut audio_rgba);
+        rs.queue.write_texture(
+            audio_tex.as_image_copy(),
+            &*audio_rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * AUDIO_TEX_WIDTH),
+                rows_per_image: Some(AUDIO_TEX_HEIGHT),
+            },
+            wgpu::Extent3d {
+                width: AUDIO_TEX_WIDTH,
+                height: AUDIO_TEX_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let audio_bind_group_layout =
+            rs.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("leviathan_audio_tex_bgl"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    }],
+                });
+
+        let audio_bind_group = rs.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("leviathan_audio_tex_bg"),
+            layout: &audio_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&audio_tex_view),
+            }],
+        });
+
         let pipeline_layout = rs
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("leviathan_feedback_pl"),
-                bind_group_layouts: &[&bind_group_layout],
+                bind_group_layouts: &[&bind_group_layout, &audio_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
@@ -280,6 +342,9 @@ impl GpuPingPong {
             _textures: [tex_a, tex_b],
             views: [view_a, view_b],
             bind_groups: [bg_a, bg_b],
+            audio_tex,
+            audio_bind_group,
+            audio_rgba,
             texture_id,
             front_idx: 0,
             width,
@@ -298,10 +363,26 @@ impl GpuPingPong {
         Ok(())
     }
 
-    fn step(&mut self, uniforms: &VisualUniforms) -> egui::TextureId {
+    fn step(&mut self, uniforms: &VisualUniforms, scope: &AudioScopeSnapshot) -> egui::TextureId {
         self.render_state
             .queue
             .write_buffer(&self.uniform_buf, 0, uniforms.as_bytes());
+
+        scope.pack_rgba8(&mut self.audio_rgba);
+        self.render_state.queue.write_texture(
+            self.audio_tex.as_image_copy(),
+            &*self.audio_rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * AUDIO_TEX_WIDTH),
+                rows_per_image: Some(AUDIO_TEX_HEIGHT),
+            },
+            wgpu::Extent3d {
+                width: AUDIO_TEX_WIDTH,
+                height: AUDIO_TEX_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+        );
 
         let src = self.front_idx;
         let dst = 1 - src;
@@ -327,6 +408,7 @@ impl GpuPingPong {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_groups[src], &[]);
+            pass.set_bind_group(1, &self.audio_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
         self.render_state
@@ -367,6 +449,8 @@ pub struct FeedbackViewport {
     shader_path_input: String,
     shader_status: String,
     shader_error: Option<String>,
+    latest_scope: AudioScopeSnapshot,
+    show_audio_scope: bool,
 }
 
 impl FeedbackViewport {
@@ -380,8 +464,10 @@ impl FeedbackViewport {
             watched_mtime: None,
             last_watch_poll_secs: 0.0,
             shader_path_input: DEFAULT_STARTER_PATH.to_string(),
-            shader_status: "Shader: Built-in Möbius/PDE feedback".to_string(),
+            shader_status: "Shader: Built-in Möbius/PDE + audio_tex".to_string(),
             shader_error: None,
+            latest_scope: AudioScopeSnapshot::default(),
+            show_audio_scope: true,
         }
     }
 
@@ -508,7 +594,7 @@ impl FeedbackViewport {
         self.watched_path = None;
         self.watched_mtime = None;
         self.shader_error = None;
-        self.shader_status = "Shader: Built-in Möbius/PDE feedback".to_string();
+        self.shader_status = "Shader: Built-in Möbius/PDE + audio_tex".to_string();
     }
 
     fn export_starter_template(path: &Path) -> Result<(), String> {
@@ -587,8 +673,67 @@ impl FeedbackViewport {
         }
     }
 
+    fn draw_audio_scope_canvas(&self, ui: &mut egui::Ui) {
+        egui::Frame::canvas(ui.style()).show(ui, |ui| {
+            let (resp, painter) =
+                ui.allocate_painter(egui::vec2(340.0, 42.0), egui::Sense::hover());
+            let rect = resp.rect;
+            let band_w = rect.width() * 0.25;
+            for (b_idx, &lvl) in self.latest_scope.bands.iter().enumerate() {
+                let clamped = if lvl.is_finite() {
+                    lvl.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let bar_h = clamped * (rect.height() - 4.0);
+                if bar_h > 0.5 {
+                    let x0 = rect.left() + b_idx as f32 * band_w + 2.0;
+                    let x1 = x0 + band_w - 4.0;
+                    let bar_rect = egui::Rect::from_min_max(
+                        egui::pos2(x0, rect.bottom() - 2.0 - bar_h),
+                        egui::pos2(x1, rect.bottom() - 2.0),
+                    );
+                    painter.rect_filled(
+                        bar_rect,
+                        2.0,
+                        egui::Color32::from_rgba_unmultiplied(45, 115, 135, 90),
+                    );
+                }
+            }
+
+            let mid_y = rect.center().y;
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left(), mid_y),
+                    egui::pos2(rect.right(), mid_y),
+                ],
+                egui::Stroke::new(0.75_f32, egui::Color32::from_gray(55)),
+            );
+
+            let half_h = rect.height() * 0.44;
+            let stroke_l = egui::Stroke::new(1.25_f32, egui::Color32::from_rgb(95, 225, 250));
+            let stroke_r = egui::Stroke::new(1.10_f32, egui::Color32::from_rgb(235, 130, 215));
+            let step = 2usize;
+            let count = 256 / step;
+            for i in 0..(count - 1) {
+                let s0 = i * step;
+                let s1 = (i + 1) * step;
+                let x0 = rect.left() + (s0 as f32 / 255.0) * rect.width();
+                let x1 = rect.left() + (s1 as f32 / 255.0) * rect.width();
+
+                let yl0 = mid_y - ((self.latest_scope.wave_l[s0] as f32 / 255.0) * 2.0 - 1.0) * half_h;
+                let yl1 = mid_y - ((self.latest_scope.wave_l[s1] as f32 / 255.0) * 2.0 - 1.0) * half_h;
+                painter.line_segment([egui::pos2(x0, yl0), egui::pos2(x1, yl1)], stroke_l);
+
+                let yr0 = mid_y - ((self.latest_scope.wave_r[s0] as f32 / 255.0) * 2.0 - 1.0) * half_h;
+                let yr1 = mid_y - ((self.latest_scope.wave_r[s1] as f32 / 255.0) * 2.0 - 1.0) * half_h;
+                painter.line_segment([egui::pos2(x0, yr0), egui::pos2(x1, yr1)], stroke_r);
+            }
+        });
+    }
+
     pub fn draw_shader_controls(&mut self, ui: &mut egui::Ui, hovering_wgsl: bool) {
-        ui.label(egui::RichText::new("Custom WGSL Shader (Live Hot-Reload)").strong());
+        ui.label(egui::RichText::new("Custom WGSL Shader & Audio Scope").strong());
         if hovering_wgsl {
             ui.colored_label(
                 egui::Color32::from_rgb(130, 235, 175),
@@ -632,9 +777,15 @@ impl FeedbackViewport {
             {
                 self.reset_builtin_shader();
             }
+
+            ui.toggle_value(&mut self.show_audio_scope, "Audio Scope")
+                .on_hover_text("Toggle live 256x2 @group(1) audio_tex waveform & 4-band scope");
         });
 
         ui.small(&self.shader_status);
+        if self.show_audio_scope {
+            self.draw_audio_scope_canvas(ui);
+        }
         if let Some(err) = &self.shader_error {
             ui.colored_label(
                 egui::Color32::from_rgb(255, 115, 115),
@@ -643,14 +794,20 @@ impl FeedbackViewport {
         }
     }
 
-    pub fn render_frame(&mut self, ctx: &egui::Context, cv: &CvFrame) -> egui::TextureId {
+    pub fn render_frame(
+        &mut self,
+        ctx: &egui::Context,
+        cv: &CvFrame,
+        scope: &AudioScopeSnapshot,
+    ) -> egui::TextureId {
+        self.latest_scope = *scope;
         let frame = self.frame_index;
         self.frame_index = self.frame_index.wrapping_add(1);
 
         match &mut self.backend {
             Backend::Hardware(gpu) => {
                 let uniforms = VisualUniforms::from_cv(cv, frame, gpu.width, gpu.height);
-                gpu.step(&uniforms)
+                gpu.step(&uniforms, scope)
             }
             Backend::Software {
                 surface,
@@ -680,18 +837,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn software_viewport_steps_headlessly_and_reports_dimensions() {
+    fn software_viewport_steps_headlessly_and_updates_audio_scope() {
         let mut vp = FeedbackViewport::new_software();
         assert!(vp.status_label().contains("CPU fallback"));
+        assert!(vp.show_audio_scope);
 
         let ctx = egui::Context::default();
         let mut cv = CvFrame::default();
         cv.gate_v[0] = 10.0;
         cv.feedback_v = 5.0;
 
-        let id0 = vp.render_frame(&ctx, &cv);
-        let id1 = vp.render_frame(&ctx, &cv);
+        let mut scope = AudioScopeSnapshot::default();
+        scope.wave_l[0] = 240;
+        scope.bands = [0.85, 0.4, 0.2, 0.1];
+
+        let id0 = vp.render_frame(&ctx, &cv, &scope);
+        let id1 = vp.render_frame(&ctx, &cv, &scope);
         assert_eq!(id0, id1);
+        assert_eq!(vp.latest_scope, scope);
+
+        // Verify both T10 @group(0)-only shaders and T13 @group(1) shaders load cleanly.
+        let t10_only = r#"
+            struct VisualUniforms { beat: f32, z_norm: f32, roll_rad: f32, feedback_norm: f32,
+                gate_energy: vec4<f32>, pitch_norm: vec4<f32>, byte_mask: u32, frame_index: u32,
+                width: f32, height: f32 };
+            @group(0) @binding(0) var<uniform> u: VisualUniforms;
+            @vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+                return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+            }
+            @fragment fn fs_main() -> @location(0) vec4<f32> {
+                return vec4<f32>(u.beat, 0.0, 0.0, 1.0);
+            }
+        "#;
+        vp.apply_custom_shader_source("t10_compat.wgsl".to_string(), t10_only.to_string(), None)
+            .expect("T10 @group(0)-only shader must remain compatible");
+        vp.apply_custom_shader_source(
+            "t13_audio.wgsl".to_string(),
+            STARTER_SHADER_TEMPLATE_WGSL.to_string(),
+            None,
+        )
+        .expect("T13 @group(0)+@group(1) shader must load");
     }
 
     #[test]
@@ -756,7 +941,6 @@ mod tests {
 
         let base_mtime = fs::metadata(&path).unwrap().modified().unwrap();
 
-        // Write broken WGSL and advance mtime: hot-reload must surface error and retain valid shader.
         fs::write(&path, "// broken live edit\nfn fs_main() {").unwrap();
         fs::OpenOptions::new()
             .write(true)
@@ -772,7 +956,6 @@ mod tests {
             "previous valid shader must remain active when hot-reload fails"
         );
 
-        // Fix WGSL on disk and advance mtime again: hot-reload must swap shader and clear error.
         let updated_wgsl = STARTER_SHADER_TEMPLATE_WGSL.replace("12.0 * length", "20.0 * length");
         fs::write(&path, &updated_wgsl).unwrap();
         fs::OpenOptions::new()
@@ -794,4 +977,4 @@ mod tests {
 
         let _ = fs::remove_file(&path);
     }
-            }
+                             }

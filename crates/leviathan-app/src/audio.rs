@@ -10,6 +10,7 @@ use leviathan_dsp::{
     sampler::{SampleBank, SampleRegion},
     LaneChannel, MasterPeaks, SynthRack,
 };
+use leviathan_gpu::{AudioScopeSnapshot, AudioScopeTap};
 
 use crate::midi::{MidiEvent, MidiKey, MidiReceiver, MidiTarget};
 use crate::project::{Project, PATTERN_BANK_CAPACITY};
@@ -196,6 +197,7 @@ pub struct AudioTelemetry {
     pub cv: CvFrame,
     pub song: SongStatus,
     pub master: MasterPeaks,
+    pub scope: AudioScopeSnapshot,
     pub playing: bool,
     pub play_request: u64,
 }
@@ -214,6 +216,7 @@ struct RtAudioWorker {
     pattern_count: usize,
     player: SongPlayer,
     synth: SynthRack,
+    scope_tap: AudioScopeTap,
     cmd_rx: rtrb::Consumer<AudioCommand>,
     tel_tx: rtrb::Producer<AudioTelemetry>,
     tel_divider: u32,
@@ -245,6 +248,7 @@ impl RtAudioWorker {
                 ..EngineConfig::default()
             }),
             synth: SynthRack::new(sample_rate as f32),
+            scope_tap: AudioScopeTap::new(sample_rate as f32),
             cmd_rx,
             tel_tx,
             tel_divider: 0,
@@ -304,6 +308,11 @@ impl RtAudioWorker {
                     self.synth.reset_master(project.master_send);
                     self.generation = project.generation;
                     self.tel_divider = 255;
+                    // Match the project-open cursor before the next MIDI batch.
+                    self.midi_target = MidiTarget {
+                        pattern: self.player.status().pattern,
+                        ..MidiTarget::default()
+                    };
                     self.midi_preview = [None; NUM_LANES];
                     if let Some(events) = &mut self.midi_events {
                         events.discard_pending();
@@ -428,6 +437,7 @@ impl RtAudioWorker {
             }
             self.synth.render_stereo(&cv)
         };
+        self.scope_tap.push_stereo(pair.0, pair.1);
         self.tel_divider = self.tel_divider.wrapping_add(1);
         if retrigger
             || cv.retrigger_mask != 0
@@ -439,6 +449,7 @@ impl RtAudioWorker {
                 cv,
                 song: self.player.status(),
                 master: self.synth.master_peaks(),
+                scope: self.scope_tap.snapshot(),
                 playing: self.player.evaluator.playing,
                 play_request: self.play_request,
             };
@@ -558,6 +569,7 @@ pub fn try_start_audio(
 mod tests {
     use super::*;
     use crate::export::{ExportJob, ExportRequest, ExportSettings};
+    use crate::lane_mix::LaneMix;
     use crate::midi::MidiControls;
     use crate::wav::{sample_peaks, DecodedWav, WavEncoding};
     use leviathan_core::PlaybackRate;
@@ -954,6 +966,127 @@ mod tests {
         worker.drain_commands();
         worker.next_stereo();
         assert!(worker.midi_preview[5].is_none());
+    }
+
+    #[test]
+    fn held_midi_preview_follows_lane_mute_and_solo() {
+        let (mut midi, receiver) = MidiControls::new();
+        let (tx, rx) = rtrb::RingBuffer::new(8);
+        let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(16);
+        let mut audio = AudioControl::new(tx);
+        let mut worker = RtAudioWorker::new(Pattern::default(), 8_000.0, rx, tel_tx, Some(receiver));
+        let lane = 5;
+        let key = MidiKey {
+            channel: 0,
+            note: 72,
+        };
+        audio.send(AudioCommand::SetMidiTarget(MidiTarget {
+            lane,
+            ..MidiTarget::default()
+        }));
+        midi.inject(MidiEvent::NoteOn { key, velocity: 100 });
+        worker.drain_commands();
+
+        let peak = |worker: &mut RtAudioWorker, frames| {
+            (0..frames)
+                .map(|_| {
+                    let (left, right) = worker.next_stereo();
+                    left.abs().max(right.abs())
+                })
+                .fold(0.0, f32::max)
+        };
+        assert!(peak(&mut worker, 64) > 0.01);
+
+        let mut mix = LaneMix {
+            solo_mask: 1,
+            ..LaneMix::default()
+        };
+        audio.send(AudioCommand::SetLaneAudibleMask(mix.audible_mask()));
+        worker.drain_commands();
+        peak(&mut worker, 1024);
+        assert!(peak(&mut worker, 64) < 1e-5);
+
+        mix.solo_mask |= 1 << lane;
+        mix.mute_mask = 1 << lane;
+        audio.send(AudioCommand::SetLaneAudibleMask(mix.audible_mask()));
+        worker.drain_commands();
+        assert!(peak(&mut worker, 64) < 1e-5);
+        assert_eq!(worker.midi_preview[lane].unwrap().key, Some(key));
+
+        mix.mute_mask = 0;
+        audio.send(AudioCommand::SetLaneAudibleMask(mix.audible_mask()));
+        worker.drain_commands();
+        assert!(peak(&mut worker, 128) > 0.01);
+
+        mix.mute_mask = 1 << lane;
+        audio.send(AudioCommand::SetLaneAudibleMask(mix.audible_mask()));
+        midi.inject(MidiEvent::NoteOff(key));
+        worker.drain_commands();
+        assert_eq!(worker.midi_preview[lane].unwrap().key, None);
+    }
+
+    #[test]
+    fn project_replacement_switches_midi_target_and_mix_together() {
+        let (mut midi, receiver) = MidiControls::new();
+        let (tx, rx) = rtrb::RingBuffer::new(8);
+        let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(16);
+        let mut audio = AudioControl::new(tx);
+        let mut worker = RtAudioWorker::new(Pattern::default(), 8_000.0, rx, tel_tx, Some(receiver));
+        let key = MidiKey {
+            channel: 0,
+            note: 72,
+        };
+        audio.send(AudioCommand::SetMidiTarget(MidiTarget {
+            lane: 5,
+            row: 2,
+            ..MidiTarget::default()
+        }));
+        midi.inject(MidiEvent::NoteOn { key, velocity: 100 });
+        worker.drain_commands();
+        assert_eq!(worker.midi_preview[5].unwrap().key, Some(key));
+        worker.next_stereo();
+
+        let mut selected = Pattern::default();
+        let lock = SoundLock {
+            mask: 1,
+            values: [0.7; 8],
+            ..SoundLock::default()
+        };
+        selected.lanes[0][0].lock = lock;
+        let project = Project {
+            bpm: 120.0,
+            master_send: 0.0,
+            lane_mix: LaneMix {
+                mute_mask: 1,
+                solo_mask: 0b11,
+            },
+            patterns: vec![Pattern::default(), selected],
+            selected_pattern: 1,
+            chain: PatternChain::default(),
+            samples: core::array::from_fn(|
+              _| None),
+            sample_regions: Default::default(),
+          custom_shader: None,
+        };
+        let snapshot = Arc::new(AudioProject::prepare(&project, 1));
+        let retained = Arc::downgrade(&snapshot);
+        midi.inject(MidiEvent::Start);
+        audio.send(AudioCommand::ReplaceProject(snapshot));
+        worker.drain_commands();
+        assert!(worker.midi_preview.iter().all(Option::is_none));
+        assert!(!worker.player.evaluator.playing);
+        assert!(retained.upgrade().is_some());
+        audio.flush();
+        assert!(retained.upgrade().is_none());
+
+        // A note can arrive before the next UI command reaches the worker.
+        midi.inject(MidiEvent::NoteOn { key, velocity: 100 });
+        worker.drain_commands();
+        let preview = worker.midi_preview[0].expect("preview should use the restored cursor lane");
+        assert_eq!(preview.lock, lock);
+        for _ in 0..64 {
+            assert_eq!(worker.next_stereo(), (0.0, 0.0));
+        }
     }
 
     #[test]
