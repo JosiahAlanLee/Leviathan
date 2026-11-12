@@ -523,6 +523,7 @@ mod tests {
         let lane_mix = LaneMix {
             mute_mask: 0b10,
             solo_mask: 0b11,
+        ..LaneMix::default()
         };
 
         save(
