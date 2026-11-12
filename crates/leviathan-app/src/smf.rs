@@ -268,6 +268,9 @@ fn read_track(bytes: &[u8], track: u16, timeline: &mut Timeline) -> Result<()> {
                 let length = reader.vlq()? as usize;
                 reader.take(length)?;
             }
+            0xf8..=0xfe => {
+                flags = cell_flags;
+            }
             0x00..=0xef => {
                 let (message, pitch) = if byte >= 0x80 {
                     status = Some(byte);
@@ -808,4 +811,27 @@ mod tests {
             assert!(decode(&invalid, PlaybackRate::OneX, Scope::Pattern).is_err());
         }
     }
+#[test]
+fn realtime_status_bytes_are_ignored_without_clearing_running_status() {
+    let track = [
+        0, 0x90, 60, 100,
+        12, 0xf8,
+        12, 60, 0,
+        0, 0xfe,
+        0, 64, 90,
+        12, 0xfc,
+        12, 64, 0,
+        0, 0xff, 0x2f, 0,
+        ];
+    let bytes = fixture(0, 96, &[&track]);
+    let import = decode(&bytes, PlaybackRate::OneX, Scope::Pattern)
+    .expect("realtime bytes should be skipped");
+    let pattern = &import.patterns[0];
+    assert!(pattern.lanes[0][0].active);
+    assert_eq!(pattern.lanes[0][0].midi, 60);
+    assert_eq!(pattern.lanes[0][0].velocity, 100);
+    assert!(pattern.lanes[0][1].active);
+    assert_eq!(pattern.lanes[0][1].midi, 64);
+    assert_eq!(pattern.lanes[0][1].velocity, 90);
+}
 }
