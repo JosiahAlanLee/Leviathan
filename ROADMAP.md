@@ -62,7 +62,8 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
 - **Core vs. DSP Pair (`T11` + `T12`)**: `T11` (`leviathan-core` / `inspector_ui.rs` swing, microtiming & ratchets) and `T12` (`leviathan-dsp` / `sampler.rs` stereo lane mixer & sampler loop/trim) own separate crates (`leviathan-core` vs. `leviathan-dsp`); either pairs cleanly in parallel with `T13` or `T14`, while `T11` and `T12` both add `#[serde(default)]` fields to `project.rs` and should rebase cleanly when combined.
 
 ### `T11` — Pattern Swing, Step Microtiming (`Nudge`) & Ratchet Retriggers
-- **Status**: `OPEN`
+- **Status**: `IN REVIEW` (implementation `8f75662`)
+- **Controls**: Pattern **Swing** and step **Nudge** / **Retrig** use the existing `SetPattern` and `SetCell` commands and edit history.
 - **Owned Files**: `crates/leviathan-core/src/lib.rs`, `crates/leviathan-core/src/song.rs`, `crates/leviathan-app/src/inspector_ui.rs`, `crates/leviathan-app/src/session_ui.rs`, `crates/leviathan-app/src/project.rs`, `crates/leviathan-app/src/main.rs`
 - **Goal**: Add hardware-tracker groove and sub-step articulation—per-pattern **Swing** (`50%`..`75%` delaying odd rows without changing total bar length), per-step **Microtiming Nudge** (`micro_offset: i8` in `-24..=24` sub-ticks, `-50%`..`+50%` of a row), and per-step **Ratchet / Retrigger Count** (`retrig: u8` in `1..=4` evenly spaced gate & voice re-fires across the step).
 - **Scope & Constraints**:
@@ -74,7 +75,8 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
   - `#![no_std]` unit tests in `leviathan-core` verifying bar-invariant swing timing, `1..=4` ratchet gate re-fires within a single step, bounded negative/positive microtiming offsets across row boundaries, and `#[serde(default)]` `.leviathan.json` round-trip in `project.rs`; `0` workspace compiler warnings.
 
 ### `T12` — 6-Lane Stereo Pan / Send Mixer & `VarSampler` Trim / Loop Controls
-- **Status**: `OPEN`
+- **Status**: `IN REVIEW` (implementation `8f75662`)
+- **Controls**: **Lane Mixer** and sampler **Start**, **End**, and **Sustain Loop** use `AudioCommand::SetLaneChannels` and `SetSampleRegion`.
 - **Owned Files**: `crates/leviathan-dsp/src/lib.rs`, `crates/leviathan-dsp/src/sampler.rs`, `crates/leviathan-app/src/lane_mix.rs`, new `crates/leviathan-app/src/mixer_ui.rs`, `crates/leviathan-app/src/sampler_ui.rs`, `crates/leviathan-app/src/audio.rs`, `crates/leviathan-app/src/export.rs`, `crates/leviathan-app/src/project.rs`, `crates/leviathan-app/src/main.rs`
 - **Goal**: Upgrade the 6-lane audio rack from fixed mono-summed center gain to a real per-lane stereo mixer (**Level** `0.0..=1.25`, constant-power **Pan** `-1.0..=+1.0`, and per-lane **Delay Send** `0.0..=1.0`), and add per-bank **Start / End Trim** (`0.0..=1.0`) plus **Forward Sustain Loop** to the 4-bank `UQ16.16` `VarSampler`.
 - **Scope & Constraints**:
