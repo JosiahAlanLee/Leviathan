@@ -300,8 +300,8 @@ mod tests {
             selected_pattern,
             chain,
             patterns: patterns.to_vec(),
-            samples: samples.clone()
-            custom_shader: None,,
+            samples: samples.clone(),
+            custom_shader: None,
         };
         save(&path, snapshot(120.0, 0.0, 0, LaneMix::default())).unwrap();
         let bpm = f64::from_bits(120.0_f64.to_bits() + 1);
