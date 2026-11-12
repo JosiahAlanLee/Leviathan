@@ -108,8 +108,8 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
 - **Acceptance Criteria**:
   - Unit tests for the clean-room MIDI byte parser (`NoteOn`, `vel=0` `NoteOff`, `Start`/`Stop`, ignored SysEx/malformed bytes) and headless port-enumeration fallback; 0 compiler warnings across all 3 OS runners.
 
-### `T10` — Custom User WGSL Shader Loading, Validation & Live Hot-Reload
-- **Status**: `OPEN`
+ ### `T10` — Custom User WGSL Shader Loading, Validation & Live Hot-Reload
+ - **Status**: `DONE`
 - **Owned Files**: `crates/leviathan-gpu/src/lib.rs`, `crates/leviathan-app/src/gpu_view.rs`, `crates/leviathan-app/src/project.rs`, `crates/leviathan-app/src/main.rs`
 - **Goal**: Allow users to drop or open custom `.wgsl` fragment shaders (matching Leviathan's 64-byte `VisualUniforms` + `prev_tex` + `prev_sampler` `@group(0)` ABI), automatically hot-reload when the `.wgsl` file's modification timestamp changes on disk, and keep the previous working pipeline alive if a shader edit fails validation.
 - **Scope & Constraints**:
