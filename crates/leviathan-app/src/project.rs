@@ -437,7 +437,7 @@ mod tests {
                 custom_shader: Some(shader.clone()),
                    },
     )
-    .unwrap(); );
+    .unwrap();
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.custom_shader, Some(shader));
 
