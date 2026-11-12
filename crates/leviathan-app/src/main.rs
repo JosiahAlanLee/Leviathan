@@ -29,7 +29,7 @@ use leviathan_core::{
     CvFrame, EngineConfig, FillCondition, LaunchTarget, NoteCell, Pattern, PatternChain,
     SongPlayer, SongStatus, SoundLock, NUM_LANES, ROWS_PER_PATTERN,
 };
-use leviathan_dsp::{MachineKind, MasterPeaks};
+use leviathan_dsp::{default_lane_patches, LanePatch, MachineKind, MasterPeaks};
 use link::SoundLinkBridge;
 use master_ui::MasterMeters;
 use midi::{MidiControls, MidiEvent, MidiReceiver, MidiTarget};
@@ -1186,7 +1186,7 @@ mod tests {
     }
 
     #[test]
-    fn midi_step_record_preserves_locks_and_uses_the_tracker_edit_step() {
+    fn midi_step_record_preserves__and_uses_the_tracker_edit_step() {
         use midi::MidiKey;
 
         let ctx = egui::Context::default();
