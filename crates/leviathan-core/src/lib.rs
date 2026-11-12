@@ -64,8 +64,7 @@ impl SoundLock {
         }
     }
 }
-}
-#[repr(C)]
+[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SoundLane {
     pub sound: SoundLock,
