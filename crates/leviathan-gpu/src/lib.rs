@@ -4,6 +4,218 @@ use leviathan_core::CvFrame;
 /// Maximum accepted custom `.wgsl` shader source size (`256 KiB`).
 pub const MAX_CUSTOM_WGSL_BYTES: usize = 256 * 1024;
 
+/// Width in texels of the `@group(1) @binding(0)` real-time audio texture (`audio_tex`).
+pub const AUDIO_TEX_WIDTH: u32 = 256;
+/// Height in texels of `audio_tex` (Row `0` = L/R/Mono waveform, Row `1` = 4-band spectrum).
+pub const AUDIO_TEX_HEIGHT: u32 = 2;
+/// Total byte length of one `256x2` `Rgba8Unorm` `audio_tex` upload (`2,048` bytes).
+pub const AUDIO_TEX_BYTES: usize = (AUDIO_TEX_WIDTH as usize) * (AUDIO_TEX_HEIGHT as usize) * 4;
+
+/// Lock-free `Copy` snapshot of 256 decimated stereo waveform samples and 4 smoothed band envelopes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AudioScopeSnapshot {
+    /// Left waveform mapped `[-1.0, +1.0] -> [0, 255]` (`128` = `0.0` silence).
+    pub wave_l: [u8; 256],
+    /// Right waveform mapped `[-1.0, +1.0] -> [0, 255]` (`128` = `0.0` silence).
+    pub wave_r: [u8; 256],
+    /// Smoothed `[sub, low_mid, high_mid, air]` energy envelopes in `[0.0, 1.0]`.
+    pub bands: [f32; 4],
+}
+
+impl Default for AudioScopeSnapshot {
+    fn default() -> Self {
+        Self {
+            wave_l: [128; 256],
+            wave_r: [128; 256],
+            bands: [0.0; 4],
+        }
+    }
+}
+
+impl AudioScopeSnapshot {
+    /// Packs this snapshot into a `256x2` `Rgba8Unorm` buffer (`2,048` bytes) for `audio_tex`.
+    ///
+    /// - Row `0` (`uv.y = 0.25`): `.r` = L wave, `.g` = R wave, `.b` = Mono wave, `.a` = `255`.
+    /// - Row `1` (`uv.y = 0.75`): `.r` = 256-bin interpolated spectrum curve (`sub..air`),
+    ///   `.g` = `sub` (`< 120 Hz`), `.b` = `low_mid` (`120..700 Hz`), `.a` = high/air (`> 700 Hz`).
+    pub fn pack_rgba8(&self, out: &mut [u8; AUDIO_TEX_BYTES]) {
+        for x in 0..256 {
+            let l = self.wave_l[x];
+            let r = self.wave_r[x];
+            let mono = ((u16::from(l) + u16::from(r)) / 2) as u8;
+            let row0 = x * 4;
+            out[row0] = l;
+            out[row0 + 1] = r;
+            out[row0 + 2] = mono;
+            out[row0 + 3] = 255;
+        }
+
+        let b = [
+            sanitize_unit(self.bands[0]),
+            sanitize_unit(self.bands[1]),
+            sanitize_unit(self.bands[2]),
+            sanitize_unit(self.bands[3]),
+        ];
+        let b_sub = unit_to_u8(b[0]);
+        let b_low = unit_to_u8(b[1]);
+        let b_high = unit_to_u8(0.5 * (b[2] + b[3]));
+
+        for x in 0..256 {
+            let pos = (x as f32 / 255.0) * 3.0;
+            let seg = (pos as usize).min(2);
+            let frac = pos - seg as f32;
+            let interp = b[seg] + (b[seg + 1] - b[seg]) * frac;
+            let row1 = 1024 + x * 4;
+            out[row1] = unit_to_u8(interp);
+            out[row1 + 1] = b_sub;
+            out[row1 + 2] = b_low;
+            out[row1 + 3] = b_high;
+        }
+    }
+}
+
+#[inline]
+fn sanitize_unit(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn unit_to_u8(v: f32) -> u8 {
+    (sanitize_unit(v) * 255.0).round() as u8
+}
+
+#[inline]
+fn sample_to_u8(s: f32) -> u8 {
+    let clean = if s.is_finite() {
+        s.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    ((clean * 0.5 + 0.5) * 255.0).round() as u8
+}
+
+#[inline]
+fn one_pole_coeff(cutoff_hz: f32, sample_rate: f32) -> f32 {
+    let sr = sample_rate.max(8_000.0);
+    let x = -core::f32::consts::TAU * cutoff_hz / sr;
+    (1.0 - x.exp()).clamp(0.0005, 0.99)
+}
+
+/// Zero-allocation real-time stereo waveform decimator and 4-band crossover envelope follower.
+pub struct AudioScopeTap {
+    ring_l: [u8; 256],
+    ring_r: [u8; 256],
+    write_pos: usize,
+    acc_l: f32,
+    acc_r: f32,
+    decim_count: u8,
+    a_sub: f32,
+    a_low: f32,
+    a_mid: f32,
+    attack: f32,
+    release: f32,
+    lp_sub: f32,
+    lp_low: f32,
+    lp_mid: f32,
+    bands: [f32; 4],
+}
+
+impl AudioScopeTap {
+    pub fn new(sample_rate: f32) -> Self {
+        let sr = if sample_rate.is_finite() && sample_rate > 0.0 {
+            sample_rate
+        } else {
+            48_000.0
+        };
+        let attack = (1.0 - (-1.0 / (sr * 0.004)).exp()).clamp(0.001, 0.5);
+        let release = (1.0 - (-1.0 / (sr * 0.075)).exp()).clamp(0.0001, 0.1);
+        Self {
+            ring_l: [128; 256],
+            ring_r: [128; 256],
+            write_pos: 0,
+            acc_l: 0.0,
+            acc_r: 0.0,
+            decim_count: 0,
+            a_sub: one_pole_coeff(120.0, sr),
+            a_low: one_pole_coeff(700.0, sr),
+            a_mid: one_pole_coeff(3_500.0, sr),
+            attack,
+            release,
+            lp_sub: 0.0,
+            lp_low: 0.0,
+            lp_mid: 0.0,
+            bands: [0.0; 4],
+        }
+    }
+
+    #[inline]
+    pub fn push_stereo(&mut self, left: f32, right: f32) {
+        let l = if left.is_finite() {
+            left.clamp(-2.0, 2.0)
+        } else {
+            0.0
+        };
+        let r = if right.is_finite() {
+            right.clamp(-2.0, 2.0)
+        } else {
+            0.0
+        };
+
+        self.acc_l += l;
+        self.acc_r += r;
+        self.decim_count += 1;
+        if self.decim_count >= 4 {
+            self.ring_l[self.write_pos] = sample_to_u8(self.acc_l * 0.25);
+            self.ring_r[self.write_pos] = sample_to_u8(self.acc_r * 0.25);
+            self.write_pos = (self.write_pos + 1) & 255;
+            self.acc_l = 0.0;
+            self.acc_r = 0.0;
+            self.decim_count = 0;
+        }
+
+        let mono = 0.5 * (l + r);
+        self.lp_sub += self.a_sub * (mono - self.lp_sub);
+        self.lp_low += self.a_low * (mono - self.lp_low);
+        self.lp_mid += self.a_mid * (mono - self.lp_mid);
+
+        let split = [
+            self.lp_sub.abs() * 1.8,
+            (self.lp_low - self.lp_sub).abs() * 2.2,
+            (self.lp_mid - self.lp_low).abs() * 2.4,
+            (mono - self.lp_mid).abs() * 2.6,
+        ];
+
+        for (env, &level) in self.bands.iter_mut().zip(&split) {
+            let target = level.min(1.0);
+            let coeff = if target > *env {
+                self.attack
+            } else {
+                self.release
+            };
+            *env += coeff * (target - *env);
+        }
+    }
+
+    pub fn snapshot(&self) -> AudioScopeSnapshot {
+        let mut wave_l = [128u8; 256];
+        let mut wave_r = [128u8; 256];
+        for i in 0..256 {
+            let src = (self.write_pos + i) & 255;
+            wave_l[i] = self.ring_l[src];
+            wave_r[i] = self.ring_r[src];
+        }
+        AudioScopeSnapshot {
+            wave_l,
+            wave_r,
+            bands: self.bands,
+        }
+    }
+}
+
 /// 16-byte aligned uniform block shared directly with WGSL shaders (`64` bytes total).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
@@ -83,6 +295,8 @@ var<uniform> u: VisualUniforms;
 var prev_tex: texture_2d<f32>;
 @group(0) @binding(2)
 var prev_sampler: sampler;
+@group(1) @binding(0)
+var audio_tex: texture_2d<f32>;
 
 struct VertexOut {
     @builtin(position) pos: vec4<f32>,
@@ -110,14 +324,20 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let r = length(p);
     let a = atan2(p.y, p.x);
 
+    let wave_sample = textureSample(audio_tex, prev_sampler, vec2<f32>(in.uv.x, 0.25));
+    let spec_sample = textureSample(audio_tex, prev_sampler, vec2<f32>(in.uv.x, 0.75));
+    let mono_wave = (wave_sample.b - 0.5) * 2.0;
+    let trace_dist = abs((in.uv.y - 0.5) + mono_wave * 0.28);
+    let scope_line = smoothstep(0.018, 0.003, trace_dist) * (0.35 + 0.65 * spec_sample.g);
+
     let ring = sin(10.0 * r - u.beat * 6.2831853 + 3.0 * sin(4.0 * a));
     let grid = cos(p.x * (6.0 + 8.0 * u.gate_energy.y)) * cos(p.y * (6.0 + 8.0 * u.gate_energy.z));
     let byte_pulse = f32(u.byte_mask & 255u) / 255.0;
-    let kick = u.gate_energy.x;
+    let kick = max(u.gate_energy.x, spec_sample.g * 0.85);
     let excite = vec3<f32>(
-        0.08 + 0.55 * max(ring, 0.0) + 0.35 * kick,
-        0.10 + 0.45 * abs(grid) + 0.18 * byte_pulse,
-        0.16 + 0.65 * max(-ring, 0.0) + 0.25 * u.gate_energy.w
+        0.08 + 0.55 * max(ring, 0.0) + 0.35 * kick + 0.25 * scope_line,
+        0.10 + 0.45 * abs(grid) + 0.18 * byte_pulse + 0.55 * scope_line,
+        0.16 + 0.65 * max(-ring, 0.0) + 0.25 * u.gate_energy.w + 0.35 * spec_sample.a + 0.40 * scope_line
     );
 
     let fb_rot = 0.035 * sin(u.roll_rad) + 0.015 * (u.pitch_norm.x * 0.2);
@@ -150,6 +370,10 @@ pub const STARTER_SHADER_TEMPLATE_WGSL: &str = r#"// Leviathan Custom Ping-Pong 
 //   - u.byte_mask     : 8-bit ByteBus bitmask (0..255)
 //   - u.frame_index   : monotonic render frame counter
 //   - u.width, height : render target dimensions in pixels
+//
+// Optional `@group(1) @binding(0)` real-time 256x2 audio texture (`audio_tex`):
+//   - uv.y = 0.25 (Row 0): .r = L wave, .g = R wave, .b = Mono wave (0.5 = silence)
+//   - uv.y = 0.75 (Row 1): .r = 256-bin spectrum, .g = sub, .b = low-mid, .a = high/air
 
 struct VisualUniforms {
     beat: f32,
@@ -170,6 +394,8 @@ var<uniform> u: VisualUniforms;
 var prev_tex: texture_2d<f32>;
 @group(0) @binding(2)
 var prev_sampler: sampler;
+@group(1) @binding(0)
+var audio_tex: texture_2d<f32>;
 
 struct VertexOut {
     @builtin(position) pos: vec4<f32>,
@@ -194,12 +420,17 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let s = sin(u.roll_rad);
     let p = vec2<f32>(uv_c.x * c - uv_c.y * s, uv_c.x * s + uv_c.y * c) * (1.35 - 0.6 * u.z_norm);
 
+    let wave_tex = textureSample(audio_tex, prev_sampler, vec2<f32>(in.uv.x, 0.25));
+    let spec_tex = textureSample(audio_tex, prev_sampler, vec2<f32>(in.uv.x, 0.75));
+    let scope_y = (wave_tex.b - 0.5) * 0.55;
+    let trace = smoothstep(0.016, 0.003, abs((in.uv.y - 0.5) + scope_y));
+
     let wave = 0.5 + 0.5 * sin(12.0 * length(p) - u.beat * 6.2831853);
     let byte_glow = f32(u.byte_mask & 255u) / 255.0;
     let fg = vec3<f32>(
-        0.12 + 0.65 * wave * (0.35 + 0.65 * u.gate_energy.x),
-        0.14 + 0.55 * abs(sin(p.x * 8.0)) * (0.3 + 0.7 * u.gate_energy.y) + 0.2 * byte_glow,
-        0.20 + 0.60 * abs(cos(p.y * 8.0)) * (0.3 + 0.7 * u.gate_energy.z)
+        0.12 + 0.65 * wave * (0.35 + 0.65 * max(u.gate_energy.x, spec_tex.g)) + 0.35 * trace,
+        0.14 + 0.55 * abs(sin(p.x * 8.0)) * (0.3 + 0.7 * u.gate_energy.y) + 0.2 * byte_glow + 0.65 * trace,
+        0.20 + 0.60 * abs(cos(p.y * 8.0)) * (0.3 + 0.7 * u.gate_energy.z) + 0.35 * spec_tex.r + 0.45 * trace
     );
 
     let drift = (in.uv - vec2<f32>(0.5, 0.5)) * (0.988 - 0.03 * u.gate_energy.x) + vec2<f32>(0.5, 0.5);
@@ -262,6 +493,8 @@ fn strip_wgsl_comments(src: &str) -> Result<String, String> {
 }
 
 /// Fast pre-flight contract check for custom Leviathan WGSL shaders before GPU compilation.
+///
+/// Accepts both `T10` `@group(0)`-only shaders and `T13` `@group(0)` + `@group(1)` (`audio_tex`) shaders.
 pub fn validate_wgsl_contract(source: &str) -> Result<(), String> {
     if source.trim().is_empty() {
         return Err("WGSL shader source is empty".to_string());
@@ -317,6 +550,21 @@ pub fn validate_wgsl_contract(source: &str) -> Result<(), String> {
                 "WGSL shader missing required Leviathan ABI marker `{marker}`"
             ));
         }
+    }
+
+    for bad_group in ["@group(2)", "@group(3)"] {
+        if stripped.contains(bad_group) {
+            return Err(format!(
+                "WGSL shader uses unsupported bind group `{bad_group}` (only @group(0) and optional @group(1) audio_tex are bound)"
+            ));
+        }
+    }
+
+    if stripped.contains("@group(1)") && !stripped.contains("texture_2d<f32>") {
+        return Err(
+            "WGSL @group(1) @binding(0) `audio_tex` must be declared as `texture_2d<f32>`"
+                .to_string(),
+        );
     }
 
     Ok(())
@@ -422,6 +670,7 @@ mod tests {
         assert!(FEEDBACK_SHADER_WGSL.contains("@group(0) @binding(0)"));
         assert!(FEEDBACK_SHADER_WGSL.contains("@group(0) @binding(1)"));
         assert!(FEEDBACK_SHADER_WGSL.contains("@group(0) @binding(2)"));
+        assert!(FEEDBACK_SHADER_WGSL.contains("@group(1) @binding(0)"));
         assert!(FEEDBACK_SHADER_WGSL.contains("fn vs_main"));
         assert!(FEEDBACK_SHADER_WGSL.contains("fn fs_main"));
         assert!(FEEDBACK_SHADER_WGSL.contains("textureSample(prev_tex, prev_sampler"));
@@ -445,17 +694,34 @@ mod tests {
     }
 
     #[test]
-    fn starter_wgsl_template_matches_leviathan_abi_contract() {
+    fn starter_wgsl_template_and_t10_group0_only_shaders_both_validate() {
         validate_wgsl_contract(FEEDBACK_SHADER_WGSL)
             .expect("built-in feedback shader must satisfy contract");
         validate_wgsl_contract(STARTER_SHADER_TEMPLATE_WGSL)
             .expect("starter template shader must satisfy contract");
+
+        // Verify backward compatibility with T10 custom shaders that only declare @group(0).
+        let t10_only = r#"
+            struct VisualUniforms { beat: f32, z_norm: f32, roll_rad: f32, feedback_norm: f32,
+                gate_energy: vec4<f32>, pitch_norm: vec4<f32>, byte_mask: u32, frame_index: u32,
+                width: f32, height: f32 };
+            @group(0) @binding(0) var<uniform> u: VisualUniforms;
+            @vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+                return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+            }
+            @fragment fn fs_main() -> @location(0) vec4<f32> {
+                return vec4<f32>(u.z_norm, 0.0, 0.0, 1.0);
+            }
+        "#;
+        validate_wgsl_contract(t10_only).expect("T10 @group(0)-only shader must remain valid");
 
         for marker in [
             "struct VisualUniforms",
             "@group(0) @binding(0)",
             "@group(0) @binding(1)",
             "@group(0) @binding(2)",
+            "@group(1) @binding(0)",
+            "audio_tex",
             "prev_tex",
             "prev_sampler",
             "fn vs_main",
@@ -469,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn wgsl_contract_validator_rejects_malformed_or_incomplete_shaders() {
+    fn wgsl_contract_validator_rejects_malformed_or_unsupported_group_shaders() {
         assert!(validate_wgsl_contract("   ").is_err());
         assert!(validate_wgsl_contract("// @vertex fn vs_main @fragment fn fs_main").is_err());
 
@@ -479,9 +745,60 @@ mod tests {
         let missing_fs = STARTER_SHADER_TEMPLATE_WGSL.replace("fn fs_main", "fn wrong_entry");
         assert!(validate_wgsl_contract(&missing_fs).is_err());
 
+        let unsupported_group2 =
+            format!("{STARTER_SHADER_TEMPLATE_WGSL}\n@group(2) @binding(0) var extra: sampler;");
+        assert!(validate_wgsl_contract(&unsupported_group2).is_err());
+
+        let wrong_group1_type = r#"
+            @group(0) @binding(0) var<uniform> u: f32;
+            @group(1) @binding(0) var<uniform> bad_audio: f32;
+            @vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }
+            @fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }
+        "#;
+        assert!(validate_wgsl_contract(wrong_group1_type).is_err());
+
         assert!(is_wgsl_filename("custom_feedback.wgsl"));
         assert!(is_wgsl_filename("PATCH.WGSL"));
         assert!(!is_wgsl_filename("kick_01.wav"));
         assert!(!is_wgsl_filename("project.leviathan.json"));
     }
-}
+
+    #[test]
+    fn audio_scope_tap_and_rgba8_packer_separate_low_and_high_bands() {
+        let sr = 48_000.0_f32;
+        let mut low_tap = AudioScopeTap::new(sr);
+        for n in 0..2_048 {
+            let phase = core::f32::consts::TAU * 55.0 * (n as f32 / sr);
+            let s = 0.8 * phase.sin();
+            low_tap.push_stereo(s, -s);
+        }
+        let low_snap = low_tap.snapshot();
+        assert!(
+            low_snap.bands[0] > low_snap.bands[3] * 3.0,
+            "55 Hz sub wave should concentrate in sub band: {:?}",
+            low_snap.bands
+        );
+        assert_ne!(low_snap.wave_l, [128; 256]);
+        assert_ne!(low_snap.wave_l, low_snap.wave_r);
+
+        let mut high_tap = AudioScopeTap::new(sr);
+        for n in 0..2_048 {
+            let phase = core::f32::consts::TAU * 7_000.0 * (n as f32 / sr);
+            let s = 0.8 * phase.sin();
+            high_tap.push_stereo(s, s);
+        }
+        let high_snap = high_tap.snapshot();
+        assert!(
+            high_snap.bands[3] > high_snap.bands[0] * 3.0,
+            "7 kHz tone should concentrate in air band: {:?}",
+            high_snap.bands
+        );
+
+        let mut texels = [0u8; AUDIO_TEX_BYTES];
+        low_snap.pack_rgba8(&mut texels);
+        // Row 0 alpha must all be 255.
+        assert!(texels[..1024].chunks_exact(4).all(|px| px[3] == 255));
+        // Row 1 x=0 (.r = sub) should exceed Row 1 x=255 (.r = air) for the 55 Hz test tone.
+        assert!(texels[1024] > texels[1024 + 255 * 4]);
+    }
+            }
