@@ -14,7 +14,11 @@ use crate::wav::{sample_peaks, DecodedWav};
 pub const PATTERN_BANK_CAPACITY: usize = 16;
 const PROJECT_VERSION: u32 = 1;
 const MAX_PROJECT_BYTES: u64 = 8 * 1024 * 1024;
-
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomShader {
+    pub name: String,
+    pub wgsl: String,
+}
 pub struct Project {
     pub bpm: f64,
     pub master_send: f32,
@@ -23,6 +27,7 @@ pub struct Project {
     pub selected_pattern: usize,
     pub chain: PatternChain,
     pub samples: [Option<DecodedWav>; NUM_BANKS],
+    pub custom_shader: Option<CustomShader>,
 }
 
 impl Project {
@@ -49,6 +54,8 @@ struct ProjectFile {
     selected_pattern: usize,
     chain: Vec<u8>,
     sample_banks: [Option<SampleFile>; NUM_BANKS],
+    #[serde(default)]
+    custom_shader: Option<CustomShader>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -135,6 +142,12 @@ impl ProjectFile {
                 .transpose()
                 .map_err(|error| format!("Bank B{bank}: {error}"))?;
         }
+        if let Some(ref shader) = self.custom_shader {
+            if shader.name.trim().is_empty() || shader.name.len() > 256 {
+                return Err("Invalid custom shader name".to_string());
+            }
+            leviathan_gpu::validate_wgsl_contract(&shader.wgsl)?;
+        }
         Ok(Project {
             bpm: self.bpm,
             master_send: self.master_send,
@@ -143,6 +156,7 @@ impl ProjectFile {
             selected_pattern: self.selected_pattern,
             chain,
             samples,
+        custom_shader: self.custom_shader,
         })
     }
 }
@@ -201,6 +215,7 @@ pub fn save(path: &Path, project: Project) -> Result<(), String> {
         sample_banks: core::array::from_fn(|bank| {
             project.samples[bank].as_ref().map(SampleFile::from)
         }),
+        custom_shader: project.custom_shader,
     };
     let mut bytes = serde_json::to_vec(&project).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
@@ -285,7 +300,8 @@ mod tests {
             selected_pattern,
             chain,
             patterns: patterns.to_vec(),
-            samples: samples.clone(),
+            samples: samples.clone()
+            custom_shader: None,,
         };
         save(&path, snapshot(120.0, 0.0, 0, LaneMix::default())).unwrap();
         let bpm = f64::from_bits(120.0_f64.to_bits() + 1);
@@ -331,6 +347,7 @@ mod tests {
             selected_pattern: 0,
             chain: vec![1],
             sample_banks: core::array::from_fn(|_| None),
+        custom_shader: None,
         };
         let mut json = serde_json::to_value(&project).unwrap();
         assert!(project_error(&json).contains("version"));
@@ -357,6 +374,7 @@ mod tests {
             selected_pattern: 0,
             chain: vec![],
             sample_banks: core::array::from_fn(|_| None),
+        custom_shader: None,
         };
         let json = serde_json::to_value(&project).unwrap();
         assert!(project_error(&json).contains("Invalid sound lock"));
@@ -376,6 +394,7 @@ mod tests {
             selected_pattern: 0,
             chain: vec![],
             sample_banks: core::array::from_fn(|_| None),
+        custom_shader: None,
         };
         let mut json = serde_json::to_value(project).unwrap();
         let fields = json.as_object_mut().unwrap();
@@ -391,6 +410,84 @@ mod tests {
         json["solo_mask"] = serde_json::json!(0);
         json["master_send"] = serde_json::json!(1.25);
         assert!(project_error(&json).contains("Master delay send"));
+    }
+
+    #[test]
+    fn custom_shader_round_trips_and_legacy_projects_default_to_none() {
+        let path = std::env::temp_dir()
+            .join(format!("leviathan-shader-rt-{}.json", std::process::id()));
+        let patterns = [Pattern::default()];
+        let chain = PatternChain::default();
+        let samples = core::array::from_fn(|_| None);
+        let shader = CustomShader {
+            name: "starter_custom.wgsl".to_string(),
+            wgsl: leviathan_gpu::STARTER_SHADER_TEMPLATE_WGSL.to_string(),
+        };
+
+        save
+            &path,
+            Project {
+                bpm: 120.0,
+                master_send: 0.25,
+                lane_mix: LaneMix::default(),
+                patterns: patterns.to_vec(),
+                selected_pattern: 0,
+                chain,
+                samples,
+                custom_shader: Some(shader.clone()),
+            ,(
+            &pathsave(
+            &path,
+            Project {
+                bpm: 120.0,
+                master_send: 0.25,
+                lane_mix: LaneMix::default(),
+                patterns: patterns.to_vec(),
+                selected_pattern: 0,
+                chain,
+                samples,
+                custom_shader: Some(shader.clone()),
+            },
+        )
+        .unwrap();(
+            &path,
+            Project {
+                bpm: 120.0,
+                master_send: 0.25,
+                lane_mix: LaneMix::default(),
+                patterns: patterns.to_vec(),
+                selected_pattern: 0,
+                chain,
+                samples,
+                custom_shader: Some(shader.clone()),
+            },
+        ),
+            120.0,
+            0.25,
+        )
+            &patterns,
+            0,
+            &chain,
+            &samples,
+            Some(&shader),
+        )
+        .unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.custom_shader, Some(shader));
+
+        let raw_bytes = fs::read(&path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_slice(&raw_bytes).unwrap();
+        json.as_object_mut().unwrap().remove("custom_shader");
+        let legacy: ProjectFile = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(legacy.into_project().unwrap().custom_shader, None);
+
+        json["custom_shader"] = serde_json::json!({
+            "name": "broken.wgsl",
+            "wgsl": "fn fs_main() {"
+        });
+        assert!(project_error(&json).contains("Unclosed"));
+
+        let _ = fs::remove_file(&path);
     }
 
     fn project_error(json: &serde_json::Value) -> String {

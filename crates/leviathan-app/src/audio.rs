@@ -4,14 +4,18 @@ use std::sync::Arc;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use leviathan_core::{
     AutomationRow, CvFrame, EngineConfig, LaunchTarget, NoteCell, Pattern, PatternChain,
-    SongPlayer, SongStatus, NUM_LANES, ROWS_PER_PATTERN,
+    SongPlayer, SongStatus, SoundLock, NUM_LANES, ROWS_PER_PATTERN,
 };
 use leviathan_dsp::{sampler::SampleBank, MasterPeaks, SynthRack};
 
+use crate::midi::{MidiEvent, MidiKey, MidiReceiver, MidiTarget};
 use crate::project::{Project, PATTERN_BANK_CAPACITY};
 
 pub enum AudioCommand {
-    SetPlaying(bool),
+    SetPlaying {
+        playing: bool,
+        request: u64,
+    },
     SetFill(bool),
     SetBpm(f64),
     SetMasterSend(f32),
@@ -43,12 +47,13 @@ pub enum AudioCommand {
     ResetSampleBank {
         bank: usize,
     },
+    SetMidiTarget(MidiTarget),
 }
 
 impl AudioCommand {
     pub fn apply_transport(&self, player: &mut SongPlayer, pattern_count: usize) {
         match self {
-            Self::SetPlaying(playing) => player.evaluator.playing = *playing,
+            Self::SetPlaying { playing, .. } => player.evaluator.playing = *playing,
             Self::SetFill(fill) => player.evaluator.fill_active = *fill,
             Self::SetBpm(bpm) => player.evaluator.config.bpm = bpm.clamp(40.0, 240.0),
             Self::Reset => player.reset_transport(pattern_count),
@@ -181,6 +186,17 @@ pub struct AudioTelemetry {
     pub cv: CvFrame,
     pub song: SongStatus,
     pub master: MasterPeaks,
+    pub playing: bool,
+    pub play_request: u64,
+}
+
+#[derive(Clone, Copy)]
+struct MidiPreview {
+    key: Option<MidiKey>,
+    pitch: f32,
+    velocity: f32,
+    lock: SoundLock,
+    retrigger: bool,
 }
 
 struct RtAudioWorker {
@@ -192,6 +208,10 @@ struct RtAudioWorker {
     tel_tx: rtrb::Producer<AudioTelemetry>,
     tel_divider: u32,
     generation: u64,
+    play_request: u64,
+    midi_events: Option<MidiReceiver>,
+    midi_target: MidiTarget,
+    midi_preview: [Option<MidiPreview>; NUM_LANES],
 }
 
 impl RtAudioWorker {
@@ -200,6 +220,7 @@ impl RtAudioWorker {
         sample_rate: f64,
         cmd_rx: rtrb::Consumer<AudioCommand>,
         tel_tx: rtrb::Producer<AudioTelemetry>,
+        midi_events: Option<MidiReceiver>,
     ) -> Self {
         let mut patterns: Box<[Pattern]> = std::iter::repeat_with(Pattern::default)
             .take(PATTERN_BANK_CAPACITY)
@@ -217,6 +238,10 @@ impl RtAudioWorker {
             tel_tx,
             tel_divider: 0,
             generation: 0,
+            play_request: 0,
+            midi_events,
+            midi_target: MidiTarget::default(),
+            midi_preview: [None; NUM_LANES],
         }
     }
 
@@ -265,6 +290,10 @@ impl RtAudioWorker {
                     self.synth.reset_master(project.master_send);
                     self.generation = project.generation;
                     self.tel_divider = 255;
+                    self.midi_preview = [None; NUM_LANES];
+                    if let Some(events) = &mut self.midi_events {
+                        events.discard_pending();
+                    }
                 }
                 AudioCommand::LoadSampleBank {
                     bank,
@@ -278,9 +307,94 @@ impl RtAudioWorker {
                 AudioCommand::ResetSampleBank { bank } => {
                     self.synth.sample_bank.reset_rom_bank(bank)
                 }
+                AudioCommand::SetPlaying { request, .. } => self.play_request = request,
+                AudioCommand::SetMidiTarget(target) => self.midi_target = target,
                 _ => {}
             }
         }
+        self.drain_midi();
+    }
+
+    fn drain_midi(&mut self) {
+        let Some(events) = &mut self.midi_events else {
+            return;
+        };
+        let (release, count) = events.begin_batch();
+        if release {
+            self.release_midi(None);
+        }
+        for _ in 0..count {
+            let event = self.midi_events.as_mut().and_then(MidiReceiver::pop);
+            match event {
+                Some(MidiEvent::NoteOn { key, velocity }) => {
+                    self.release_midi(Some(key));
+                    let target = self.midi_target;
+                    if target.pattern < self.pattern_count
+                        && target.lane < NUM_LANES
+                        && target.row < ROWS_PER_PATTERN
+                    {
+                        let cell = self.patterns[target.pattern].lanes[target.lane][target.row];
+                        let config = &self.player.evaluator.config;
+                        let semitones = i32::from(key.note) + config.key_offset - config.pitch_zero;
+                        self.midi_preview[target.lane] = Some(MidiPreview {
+                            key: Some(key),
+                            pitch: semitones as f32 / 12.0,
+                            velocity: f32::from(velocity) / 127.0 * config.v_high,
+                            lock: cell.lock,
+                            retrigger: true,
+                        });
+                    }
+                }
+                Some(MidiEvent::NoteOff(key)) => self.release_midi(Some(key)),
+                Some(event) => {
+                    if event.apply_transport(&mut self.player, self.pattern_count) {
+                        self.tel_divider = 255;
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+
+    fn release_midi(&mut self, key: Option<MidiKey>) {
+        for preview in self.midi_preview.iter_mut().flatten() {
+            if key.is_none() || preview.key == key {
+                preview.key = None;
+            }
+        }
+    }
+
+    fn render_with_midi(&mut self, mut cv: CvFrame, retrigger: bool) -> (f32, f32) {
+        let mut lanes = if retrigger { u8::MAX } else { 0 };
+        for (lane, slot) in self.midi_preview.iter_mut().enumerate() {
+            let Some(preview) = slot else { continue };
+            let bit = 1 << lane;
+            let held = preview.key.is_some();
+            let attack = std::mem::take(&mut preview.retrigger);
+            if !held && !attack && cv.gate_v[lane] > 2.5 {
+                *slot = None;
+                lanes |= bit;
+                continue;
+            }
+            // A held note keeps its own gate and attack through sequence launches.
+            // After release, preserve its tail until the next sequenced gate.
+            lanes &= !bit;
+            if attack {
+                lanes |= bit;
+            }
+            cv.pitch_v[lane] = preview.pitch;
+            cv.velocity_v[lane] = preview.velocity;
+            cv.locks[lane] = preview.lock;
+            cv.gate_v[lane] = if held || attack {
+                self.player.evaluator.config.v_high
+            } else {
+                0.0
+            };
+        }
+        if lanes != 0 {
+            self.synth.retrigger_lanes(lanes);
+        }
+        self.synth.render_stereo(&cv)
     }
 
     #[inline]
@@ -288,10 +402,14 @@ impl RtAudioWorker {
         let (cv, retrigger) = self
             .player
             .step_sample(&self.patterns[..self.pattern_count]);
-        if retrigger {
-            self.synth.retrigger_gates();
-        }
-        let pair = self.synth.render_stereo(&cv);
+        let pair = if self.midi_preview.iter().any(Option::is_some) {
+            self.render_with_midi(cv, retrigger)
+        } else {
+            if retrigger {
+                self.synth.retrigger_gates();
+            }
+            self.synth.render_stereo(&cv)
+        };
         self.tel_divider = self.tel_divider.wrapping_add(1);
         if retrigger || (self.tel_divider & 255) == 0 {
             let telemetry = AudioTelemetry {
@@ -299,6 +417,8 @@ impl RtAudioWorker {
                 cv,
                 song: self.player.status(),
                 master: self.synth.master_peaks(),
+                playing: self.player.evaluator.playing,
+                play_request: self.play_request,
             };
             // Carry the interval's peaks forward if the UI hasn't drained its ring yet.
             if self.tel_tx.push(telemetry).is_ok() {
@@ -313,6 +433,7 @@ pub fn try_start_audio(
     initial_pattern: Pattern,
     cmd_rx: rtrb::Consumer<AudioCommand>,
     tel_tx: rtrb::Producer<AudioTelemetry>,
+    midi_events: MidiReceiver,
 ) -> Result<(cpal::Stream, String), String> {
     let host = cpal::default_host();
     let Some(device) = host.default_output_device() else {
@@ -327,7 +448,13 @@ pub fn try_start_audio(
     let sample_rate = config.sample_rate as f64;
     let channels = (config.channels as usize).max(1);
 
-    let mut worker = Box::new(RtAudioWorker::new(initial_pattern, sample_rate, cmd_rx, tel_tx));
+    let mut worker = Box::new(RtAudioWorker::new(
+        initial_pattern,
+        sample_rate,
+        cmd_rx,
+        tel_tx,
+        Some(midi_events),
+    ));
 
     let err_fn = |err| eprintln!("leviathan audio stream error: {err}");
 
@@ -407,6 +534,7 @@ pub fn try_start_audio(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::midi::MidiControls;
     use crate::wav::{sample_peaks, DecodedWav};
     use leviathan_core::PlaybackRate;
 
@@ -442,7 +570,7 @@ mod tests {
         let (tx, rx) = rtrb::RingBuffer::new(8);
         let (tel_tx, mut tel_rx) = rtrb::RingBuffer::new(16);
         let mut audio = AudioControl::new(tx);
-        let mut worker = RtAudioWorker::new(Pattern::default(), 8_000.0, rx, tel_tx);
+        let mut worker = RtAudioWorker::new(Pattern::default(), 8_000.0, rx, tel_tx, None);
 
         let first = Pattern {
             length: 1,
@@ -482,8 +610,12 @@ mod tests {
             selected_pattern: 1,
             chain,
             samples,
+            custom_shader: None,
         };
-        audio.send(AudioCommand::SetPlaying(true));
+        audio.send(AudioCommand::SetPlaying {
+            playing: true,
+            request: 0,
+        });
         audio.send(AudioCommand::ReplaceProject(Arc::new(
             AudioProject::prepare(&project, 1),
         )));
@@ -493,7 +625,10 @@ mod tests {
         assert_eq!(&worker.synth.sample_bank.waves[0][..pcm.len()], &pcm);
 
         audio.send(AudioCommand::Launch(LaunchTarget::Chain));
-        audio.send(AudioCommand::SetPlaying(true));
+        audio.send(AudioCommand::SetPlaying {
+            playing: true,
+            request: 0,
+        });
         worker.drain_commands();
         for _ in 0..=1000 {
             worker.next_stereo();
@@ -521,7 +656,7 @@ mod tests {
         let (tx, rx) = rtrb::RingBuffer::new(8);
         let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(16);
         let mut audio = AudioControl::new(tx);
-        let mut worker = RtAudioWorker::new(Pattern::default(), 100.0, rx, tel_tx);
+        let mut worker = RtAudioWorker::new(Pattern::default(), 100.0, rx, tel_tx, None);
 
         let oversized = Project {
             bpm: 120.0,
@@ -531,6 +666,7 @@ mod tests {
             selected_pattern: PATTERN_BANK_CAPACITY + 2,
             chain: PatternChain::default(),
             samples: core::array::from_fn(|_| None),
+            custom_shader: None,
         };
         audio.send(AudioCommand::ReplaceProject(Arc::new(
             AudioProject::prepare(&oversized, 2),
@@ -540,12 +676,18 @@ mod tests {
         assert_eq!(worker.player.status().pattern, PATTERN_BANK_CAPACITY - 1);
 
         audio.send(AudioCommand::Launch(LaunchTarget::Pattern(0)));
-        audio.send(AudioCommand::SetPlaying(true));
+        audio.send(AudioCommand::SetPlaying {
+            playing: true,
+            request: 0,
+        });
         worker.drain_commands();
         for _ in 0..50 {
             worker.next_stereo();
         }
-        audio.send(AudioCommand::SetPlaying(false));
+        audio.send(AudioCommand::SetPlaying {
+            playing: false,
+            request: 0,
+        });
         audio.send(AudioCommand::SetPattern {
             index: 0,
             pattern: Arc::new(Pattern {
@@ -554,7 +696,10 @@ mod tests {
                 ..Pattern::default()
             }),
         });
-        audio.send(AudioCommand::SetPlaying(true));
+        audio.send(AudioCommand::SetPlaying {
+            playing: true,
+            request: 0,
+        });
         worker.drain_commands();
         worker.next_stereo();
         assert_eq!(worker.player.status().pattern, 0);
@@ -564,7 +709,7 @@ mod tests {
     fn master_peaks_survive_a_full_telemetry_ring() {
         let (_tx, rx) = rtrb::RingBuffer::new(1);
         let (tel_tx, mut tel_rx) = rtrb::RingBuffer::new(1);
-        let mut worker = RtAudioWorker::new(Pattern::default(), 48_000.0, rx, tel_tx);
+        let mut worker = RtAudioWorker::new(Pattern::default(), 48_000.0, rx, tel_tx, None);
         assert!(worker.tel_tx.push(AudioTelemetry::default()).is_ok());
 
         let lock = leviathan_core::SoundLock {
@@ -595,12 +740,12 @@ mod tests {
         assert!(reported.output[0] >= peaks.output[0] && reported.output[1] >= peaks.output[1]);
         assert_eq!(worker.synth.master_peaks(), MasterPeaks::default());
     }
-    #[test] 
+    #[test]
     fn set_automation_updates_live_cv_and_bytebus_telemetry() {
         let (tx, rx) = rtrb::RingBuffer::new(8);
         let (tel_tx, mut tel_rx) = rtrb::RingBuffer::new(16);
         let mut audio = AudioControl::new(tx);
-        let mut worker = RtAudioWorker::new(Pattern::default(), 100.0, rx, tel_tx);
+        let mut worker = RtAudioWorker::new(Pattern::default(), 100.0, rx, tel_tx, None);
 
         audio.send(AudioCommand::SetAutomation {
             pattern: 0,
@@ -612,7 +757,10 @@ mod tests {
                 byte_word: 0b0000_0101,
             },
         });
-        audio.send(AudioCommand::SetPlaying(true));
+        audio.send(AudioCommand::SetPlaying {
+            playing: true,
+            request: 0,
+        });
         worker.drain_commands();
         worker.next_stereo();
 
@@ -624,4 +772,121 @@ mod tests {
         assert!(telemetry.cv.bytebus_v[1] < 5.0);
         assert!(telemetry.cv.bytebus_v[2] > 5.0);
     }
-            }
+
+    #[test]
+    fn midi_auditions_when_stopped_and_releases_to_the_running_pattern() {
+        let (mut midi, receiver) = MidiControls::new();
+        let (mut tx, rx) = rtrb::RingBuffer::new(8);
+        let (tel_tx, mut tel_rx) = rtrb::RingBuffer::new(16);
+        let mut pattern = Pattern::default();
+        pattern.lanes[5][0] = NoteCell {
+            active: true,
+            midi: 48,
+            ..NoteCell::default()
+        };
+        let mut worker = RtAudioWorker::new(pattern, 48_000.0, rx, tel_tx, Some(receiver));
+        assert!(tx
+            .push(AudioCommand::SetMidiTarget(MidiTarget {
+                pattern: 0,
+                lane: 5,
+                row: 0
+            }))
+            .is_ok());
+        let key = MidiKey {
+            channel: 2,
+            note: 72,
+        };
+        midi.inject(MidiEvent::NoteOn { key, velocity: 100 });
+        worker.drain_commands();
+        assert!(!worker.player.evaluator.playing);
+        assert_eq!(worker.midi_preview[5].unwrap().pitch, 1.0);
+        let energy: f32 = (0..256)
+            .map(|_| {
+                let (left, right) = worker.next_stereo();
+                left.abs() + right.abs()
+            })
+            .sum();
+        assert!(energy > 0.1);
+        assert_eq!(tel_rx.pop().unwrap().cv.gate_v, [0.0; NUM_LANES]);
+
+        midi.inject(MidiEvent::Start);
+        midi.inject(MidiEvent::NoteOff(MidiKey { channel: 3, ..key }));
+        worker.drain_commands();
+        worker.next_stereo();
+        assert!(worker.player.evaluator.playing);
+        assert_eq!(worker.midi_preview[5].unwrap().key, Some(key));
+        midi.inject(MidiEvent::NoteOff(key));
+        worker.drain_commands();
+        worker.next_stereo();
+        assert!(worker.midi_preview[5].is_none());
+    }
+
+    #[test]
+    fn midi_note_on_and_off_in_one_batch_still_triggers_audition() {
+        let (mut midi, receiver) = MidiControls::new();
+        let (_tx, rx) = rtrb::RingBuffer::new(8);
+        let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(16);
+        let mut worker =
+            RtAudioWorker::new(Pattern::default(), 48_000.0, rx, tel_tx, Some(receiver));
+        let key = MidiKey {
+            channel: 0,
+            note: 60,
+        };
+        midi.inject(MidiEvent::NoteOn { key, velocity: 100 });
+        midi.inject(MidiEvent::NoteOff(key));
+        worker.drain_commands();
+        assert!(worker.midi_preview[0].unwrap().key.is_none());
+        let energy: f32 = (0..256)
+            .map(|_| {
+                let (left, right) = worker.next_stereo();
+                left.abs() + right.abs()
+            })
+            .sum();
+        assert!(energy > 0.1);
+    }
+
+    #[test]
+    fn midi_continue_preserves_sample_position_and_start_resets_it() {
+        let (mut midi, receiver) = MidiControls::new();
+        let (mut tx, rx) = rtrb::RingBuffer::new(8);
+        let (tel_tx, mut tel_rx) = rtrb::RingBuffer::new(16);
+        let mut worker =
+            RtAudioWorker::new(Pattern::default(), 48_000.0, rx, tel_tx, Some(receiver));
+        assert!(tx
+            .push(AudioCommand::SetPlaying {
+                playing: true,
+                request: 7
+            })
+            .is_ok());
+        worker.drain_commands();
+        for _ in 0..480 {
+            worker.next_stereo();
+        }
+        while tel_rx.pop().is_ok() {}
+        midi.inject(MidiEvent::Stop);
+        worker.drain_commands();
+        for _ in 0..160 {
+            worker.next_stereo();
+        }
+        let stopped = tel_rx.pop().unwrap();
+        assert!(!stopped.playing);
+        assert_eq!(stopped.play_request, 7);
+
+        midi.inject(MidiEvent::Continue);
+        worker.drain_commands();
+        worker.next_stereo();
+        let resumed = tel_rx.pop().unwrap();
+        assert!(resumed.playing);
+        assert_eq!(
+            resumed.cv.beat,
+            480.0 * EngineConfig::default().bpm / (60.0 * 48_000.0)
+        );
+
+        midi.inject(MidiEvent::Start);
+        worker.drain_commands();
+        worker.next_stereo();
+        let started = tel_rx.pop().unwrap();
+        assert!(started.playing);
+        assert_eq!((started.cv.beat, started.cv.row), (0.0, 0));
+    }
+}

@@ -12,6 +12,7 @@ eframe = { workspace = true }
 leviathan-core = { workspace = true, features = ["std", "serde"] }
 leviathan-dsp = { workspace = true, features = ["std"] }
 leviathan-gpu = { workspace = true }
+midir = { workspace = true }
 rtrb = { workspace = true }
 serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, features = ["float_roundtrip"] }
