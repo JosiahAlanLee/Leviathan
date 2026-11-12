@@ -86,7 +86,7 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
   - `#![no_std]` unit tests verifying constant-power pan law (`-1.0`, `0.0`, `+1.0`), `VarSampler` trim bounds and sustain loop wrap without buffer overrun, offline `export.rs` stereo pan parity, and legacy `.leviathan.json` `#[serde(default)]` loading; `0` workspace compiler warnings.
 
 ### `T13` — Real-Time `@group(1)` Audio Waveform & Band-Envelope Texture (`audio_tex`) for WGSL Shaders
-- **Status**: `OPEN`
+- **Status**: `DONE`
 - **Owned Files**: `crates/leviathan-gpu/src/lib.rs`, `crates/leviathan-app/src/gpu_view.rs`, `crates/leviathan-app/src/audio.rs`, `crates/leviathan-app/src/main.rs`
 - **Goal**: Feed live real-time stereo audio waveform samples and smoothed frequency-band energy envelopes from `RtAudioWorker` into a `256×2` `Rgba8Unorm` GPU texture (`audio_tex`) at `@group(1) @binding(0)` so built-in and custom `.wgsl` shaders can draw true audio oscilloscopes and spectrum-reactive visuals, plus a compact waveform scope toggle in the side panel.
 - **Scope & Constraints**:
