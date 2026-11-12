@@ -76,7 +76,7 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
 - `T7` (`SynthRack` / `audio.rs` mute-solo) and `T9` (`midi.rs` / `Cargo.toml` / `audio.rs`) both hook into `audio.rs` and `main.rs`, so run them sequentially or rebase cleanly.
 
 ### `T7` — Lock-Free Per-Lane Mute & Solo Controls (`M` / `S` Toggles & Shortcuts)
-- **Status**: `IN REVIEW` (implementation `96815d0`)
+- **Status**: ``DONE`
 - **Owned Files**: `crates/leviathan-dsp/src/lib.rs`, `crates/leviathan-app/src/audio.rs`, `crates/leviathan-app/src/tracker_keys.rs`, `crates/leviathan-app/src/project.rs`, `crates/leviathan-app/src/main.rs`
 - **Goal**: Add instant per-lane `Mute` (`M`) and `Solo` (`S`) controls in the 6-lane tracker header plus keyboard shortcuts (`Alt+1`..`Alt+6` mute lane, `Alt+Shift+1`..`Alt+Shift+6` solo lane, `Alt+0` clear all) without audio clicks.
 - **Scope & Constraints**:
@@ -88,7 +88,7 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
   - Unit tests covering mute/solo mask precedence, click-free/bounded `SynthRack` gain slew, and `#[serde(default)]` project round-trip; 0 compiler warnings.
 
 ### `T8` — Clean-Room Offline WAV Bounce & Per-Lane Stem Export
-- **Status**: `IN REVIEW` (implementation `96815d0`)
+- **Status**: ``DONE`
 - **Owned Files**: new `crates/leviathan-app/src/export.rs`, `crates/leviathan-app/src/wav.rs`, export dialog/button hook in `crates/leviathan-app/src/session_ui.rs` and `crates/leviathan-app/src/main.rs`
 - **Goal**: Bounce the selected `Pattern` or full `PatternChain` faster-than-realtime to stereo RIFF/WAV files (`16-bit PCM` or `32-bit IEEE float`, selectable `44.1` / `48` / `96 kHz` sample rate, loop count, and delay-tail seconds), with an optional 6-lane stem export mode.
 - **Scope & Constraints**:
@@ -100,7 +100,7 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
   - Round-trip unit test rendering a multi-lane pattern to both `16-bit PCM` and `32-bit float` WAV bytes and decoding them back via `wav::decode_wav_bytes` with verified frame counts, sample rates, and non-silent peaks; 0 compiler warnings.
 
 ### `T9` — External MIDI Input (Live Audition, Step Record & MIDI Transport)
-- **Status**: `IN REVIEW` (implementation `beac0d8`)
+- **Status**: ``DONE`
 - **Controls**: MIDI port selector, **Refresh MIDI**, and **MIDI REC**. `AudioCommand::SetMidiTarget` follows the cursor, and `SetPlaying { playing, request }` acknowledges local play/stop changes.
 - **Owned Files**: `Cargo.toml`, `crates/leviathan-app/Cargo.toml`, new `crates/leviathan-app/src/midi.rs`, `crates/leviathan-app/src/audio.rs`, `crates/leviathan-app/src/main.rs`
 - **Goal**: Support hardware/virtual MIDI input ports (`midir`) for live voice audition on the active lane, step-record note/velocity entry into the tracker grid, and MIDI `Start` (`0xFA`) / `Continue` (`0xFB`) / `Stop` (`0xFC`) transport sync.
