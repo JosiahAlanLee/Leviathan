@@ -1058,7 +1058,7 @@ mod tests {
             master_send: 0.0,
             lane_mix: LaneMix {
                 mute_mask: 1,
-                solo_mask: 0b11,
+                solo_mask: 0b11, ..LaneMix::default()
             },
             patterns: vec![Pattern::default(), selected],
             selected_pattern: 1,
