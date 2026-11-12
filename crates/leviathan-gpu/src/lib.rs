@@ -105,7 +105,7 @@ fn one_pole_coeff(cutoff_hz: f32, sample_rate: f32) -> f32 {
     (1.0 - x.exp()).clamp(0.0005, 0.99)
 }
 
-/// Zero-allocation real-time stereo waveform decimator and 4-band crossover envelope follower.
+/// Zero-allocation real-time stereo waveform decimator and stereo 4-band crossover envelope follower.
 pub struct AudioScopeTap {
     ring_l: [u8; 256],
     ring_r: [u8; 256],
@@ -118,9 +118,9 @@ pub struct AudioScopeTap {
     a_mid: f32,
     attack: f32,
     release: f32,
-    lp_sub: f32,
-    lp_low: f32,
-    lp_mid: f32,
+    lp_sub: [f32; 2],
+    lp_low: [f32; 2],
+    lp_mid: [f32; 2],
     bands: [f32; 4],
 }
 
@@ -145,9 +145,9 @@ impl AudioScopeTap {
             a_mid: one_pole_coeff(3_500.0, sr),
             attack,
             release,
-            lp_sub: 0.0,
-            lp_low: 0.0,
-            lp_mid: 0.0,
+            lp_sub: [0.0; 2],
+            lp_low: [0.0; 2],
+            lp_mid: [0.0; 2],
             bands: [0.0; 4],
         }
     }
@@ -177,16 +177,27 @@ impl AudioScopeTap {
             self.decim_count = 0;
         }
 
-        let mono = 0.5 * (l + r);
-        self.lp_sub += self.a_sub * (mono - self.lp_sub);
-        self.lp_low += self.a_low * (mono - self.lp_low);
-        self.lp_mid += self.a_mid * (mono - self.lp_mid);
+        let ch = [l, r];
+        for c in 0..2 {
+            self.lp_sub[c] += self.a_sub * (ch[c] - self.lp_sub[c]);
+            self.lp_low[c] += self.a_low * (ch[c] - self.lp_low[c]);
+            self.lp_mid[c] += self.a_mid * (ch[c] - self.lp_mid[c]);
+        }
+
+        let sub_mag = 0.5 * (self.lp_sub[0].abs() + self.lp_sub[1].abs());
+        let low_mag = 0.5
+            * ((self.lp_low[0] - self.lp_sub[0]).abs()
+                + (self.lp_low[1] - self.lp_sub[1]).abs());
+        let mid_mag = 0.5
+            * ((self.lp_mid[0] - self.lp_low[0]).abs()
+                + (self.lp_mid[1] - self.lp_low[1]).abs());
+        let air_mag = 0.5 * ((ch[0] - self.lp_mid[0]).abs() + (ch[1] - self.lp_mid[1]).abs());
 
         let split = [
-            self.lp_sub.abs() * 1.8,
-            (self.lp_low - self.lp_sub).abs() * 2.2,
-            (self.lp_mid - self.lp_low).abs() * 2.4,
-            (mono - self.lp_mid).abs() * 2.6,
+            sub_mag * 1.8,
+            low_mag * 2.2,
+            mid_mag * 2.4,
+            air_mag * 2.6,
         ];
 
         for (env, &level) in self.bands.iter_mut().zip(&split) {
@@ -700,7 +711,6 @@ mod tests {
         validate_wgsl_contract(STARTER_SHADER_TEMPLATE_WGSL)
             .expect("starter template shader must satisfy contract");
 
-        // Verify backward compatibility with T10 custom shaders that only declare @group(0).
         let t10_only = r#"
             struct VisualUniforms { beat: f32, z_norm: f32, roll_rad: f32, feedback_norm: f32,
                 gate_energy: vec4<f32>, pitch_norm: vec4<f32>, byte_mask: u32, frame_index: u32,
@@ -796,9 +806,7 @@ mod tests {
 
         let mut texels = [0u8; AUDIO_TEX_BYTES];
         low_snap.pack_rgba8(&mut texels);
-        // Row 0 alpha must all be 255.
         assert!(texels[..1024].chunks_exact(4).all(|px| px[3] == 255));
-        // Row 1 x=0 (.r = sub) should exceed Row 1 x=255 (.r = air) for the 55 Hz test tone.
         assert!(texels[1024] > texels[1024 + 255 * 4]);
     }
-            }
+}
