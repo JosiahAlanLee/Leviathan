@@ -1,0 +1,456 @@
+use std::fs::{self, File};
+use std::io::{self, BufWriter};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+
+use leviathan_core::{EngineConfig, LaunchTarget, SongPlayer, NUM_LANES};
+use leviathan_dsp::SynthRack;
+
+use crate::project::Project;
+use crate::wav::{StereoWav, WavEncoding};
+
+pub const SAMPLE_RATES: [u32; 3] = [44_100, 48_000, 96_000];
+const STEM_FILES: [&str; NUM_LANES] = [
+    "0-kick.wav",
+    "1-fm4.wav",
+    "2-sub.wav",
+    "3-air.wav",
+    "4-smpl.wav",
+    "5-acid.wav",
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ExportSource {
+    Pattern,
+    Chain,
+}
+
+#[derive(Clone, Copy)]
+pub struct ExportSettings {
+    pub source: ExportSource,
+    pub encoding: WavEncoding,
+    pub sample_rate: u32,
+    pub loops: u32,
+    pub tail_seconds: f64,
+    pub stems: bool,
+}
+
+impl Default for ExportSettings {
+    fn default() -> Self {
+        Self {
+            source: ExportSource::Pattern,
+            encoding: WavEncoding::Pcm16,
+            sample_rate: 48_000,
+            loops: 1,
+            tail_seconds: 0.5,
+            stems: false,
+        }
+    }
+}
+
+pub struct ExportRequest {
+    pub settings: ExportSettings,
+    pub destination: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+struct RenderPlan {
+    settings: ExportSettings,
+    target: LaunchTarget,
+    music_frames: u32,
+    frames: u32,
+}
+
+impl RenderPlan {
+    fn new(project: &Project, settings: ExportSettings) -> io::Result<Self> {
+        if !SAMPLE_RATES.contains(&settings.sample_rate)
+            || settings.loops == 0
+            || !settings.tail_seconds.is_finite()
+            || settings.tail_seconds < 0.0
+            || !(40.0..=240.0).contains(&project.bpm)
+        {
+            return Err(invalid("Invalid WAV export settings"));
+        }
+        let (target, duration) = match settings.source {
+            ExportSource::Pattern => {
+                let index = project.selected_pattern;
+                let pattern = project
+                    .patterns
+                    .get(index)
+                    .ok_or_else(|| invalid("Select a pattern to export"))?;
+                (LaunchTarget::Pattern(index), pattern.duration_beats())
+            }
+            ExportSource::Chain => {
+                let entries = project.chain.as_slice();
+                if entries.is_empty() {
+                    return Err(invalid("Add a pattern to the chain before exporting it"));
+                }
+                let mut duration = 0.0;
+                for &index in entries {
+                    let pattern = project
+                        .patterns
+                        .get(usize::from(index))
+                        .ok_or_else(|| invalid("Pattern chain contains a missing pattern"))?;
+                    duration += pattern.duration_beats();
+                }
+                (LaunchTarget::Chain, duration)
+            }
+        };
+
+        let beats = duration * f64::from(settings.loops);
+        let rate = f64::from(settings.sample_rate);
+        let estimate = (beats * (60.0 * rate) / project.bpm).ceil();
+        let tail = (settings.tail_seconds * rate).round();
+        let max_frames = settings.encoding.max_frames();
+        if estimate + tail > f64::from(max_frames) {
+            return Err(invalid("Export exceeds RIFF/WAV size"));
+        }
+        let mut music_frames = estimate as u32;
+        // Match the live sample clock at integer boundaries, including floating-point rounding.
+        let beat_at = |sample: u32| f64::from(sample) * project.bpm / (60.0 * rate);
+        if music_frames > 0 && beat_at(music_frames - 1) >= beats {
+            music_frames -= 1;
+        }
+        if beat_at(music_frames) < beats {
+            music_frames += 1;
+        }
+        let frames = music_frames + tail as u32;
+        if frames > max_frames {
+            return Err(invalid("Export exceeds RIFF/WAV size"));
+        }
+        Ok(Self {
+            settings,
+            target,
+            music_frames,
+            frames,
+        })
+    }
+}
+
+fn invalid(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+pub struct ExportJob {
+    worker: JoinHandle<io::Result<PathBuf>>,
+    written: Arc<AtomicU32>,
+    total_frames: u32,
+}
+
+impl ExportJob {
+    pub fn start(project: Project, fill: bool, request: ExportRequest) -> io::Result<Self> {
+        let plan = RenderPlan::new(&project, request.settings)?;
+        let written = Arc::new(AtomicU32::new(0));
+        let progress = Arc::clone(&written);
+        let worker = thread::Builder::new()
+            .name("leviathan-wav-export".into())
+            .spawn(move || {
+                write_outputs(&project, fill, plan, &request.destination, &progress)?;
+                Ok(request.destination)
+            })?;
+        Ok(Self {
+            worker,
+            written,
+            total_frames: plan.frames,
+        })
+    }
+
+    pub fn progress(&self) -> f32 {
+        self.written.load(Ordering::Relaxed) as f32 / self.total_frames as f32
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.worker.is_finished()
+    }
+
+    pub fn finish(self) -> io::Result<PathBuf> {
+        self.worker
+            .join()
+            .map_err(|_| io::Error::other("WAV export worker stopped unexpectedly"))?
+    }
+}
+
+fn render(
+    project: &Project,
+    fill: bool,
+    plan: RenderPlan,
+    progress: &AtomicU32,
+    mut write: impl FnMut([f32; 2], &[[f32; 2]; NUM_LANES]) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut player = SongPlayer::new(EngineConfig {
+        bpm: project.bpm,
+        sample_rate: f64::from(plan.settings.sample_rate),
+        ..EngineConfig::default()
+    });
+    player.set_chain(project.chain);
+    player.launch(plan.target, project.patterns.len());
+    player.evaluator.fill_active = fill;
+    player.evaluator.playing = true;
+
+    let mut rack = SynthRack::new(plan.settings.sample_rate as f32);
+    rack.sample_bank = project.sample_bank();
+    rack.set_lane_audible_mask(project.lane_mix.audible_mask());
+    rack.reset_voices();
+    rack.reset_master(project.master_send);
+
+    let mut stems = [[0.0; 2]; NUM_LANES];
+    for frame in 0..plan.frames {
+        if frame == plan.music_frames {
+            player.evaluator.playing = false;
+        }
+        let (cv, retrigger) = player.step_sample(&project.patterns);
+        if retrigger {
+            rack.retrigger_gates();
+        }
+        let (left, right) = if plan.settings.stems {
+            rack.render_stereo_with_stems(&cv, &mut stems)
+        } else {
+            rack.render_stereo(&cv)
+        };
+        write([left, right], &stems)?;
+        if frame & 1023 == 1023 {
+            progress.store(frame + 1, Ordering::Relaxed);
+        }
+    }
+    progress.store(plan.frames, Ordering::Relaxed);
+    Ok(())
+}
+
+fn write_outputs(
+    project: &Project,
+    fill: bool,
+    plan: RenderPlan,
+    destination: &Path,
+    progress: &AtomicU32,
+) -> io::Result<()> {
+    if plan.settings.stems {
+        require_new_folder(destination)?;
+    }
+    let stage = StagingDirectory::new(destination)?;
+    let names = if plan.settings.stems {
+        &STEM_FILES[..]
+    } else {
+        &[]
+    };
+    let mut writers = std::iter::once("master.wav")
+        .chain(names.iter().copied())
+        .map(|name| {
+            let file = File::create(stage.path.join(name))?;
+            StereoWav::new(
+                BufWriter::new(file),
+                plan.settings.encoding,
+                plan.settings.sample_rate,
+                plan.frames,
+            )
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    render(project, fill, plan, progress, |master, stems| {
+        writers[0].write_frame(master)?;
+        for (writer, &stem) in writers[1..].iter_mut().zip(stems) {
+            writer.write_frame(stem)?;
+        }
+        Ok(())
+    })?;
+    for writer in writers {
+        writer.finish()?.get_ref().sync_all()?;
+    }
+    if plan.settings.stems {
+        stage.publish(destination)?;
+    } else {
+        fs::rename(stage.path.join("master.wav"), destination)?;
+    }
+    Ok(())
+}
+
+fn require_new_folder(path: &Path) -> io::Result<()> {
+    if path.try_exists()? {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "Choose a new folder for stem export",
+        ));
+    }
+    Ok(())
+}
+
+// Staging beside the destination keeps the final rename on the same filesystem.
+struct StagingDirectory {
+    path: PathBuf,
+}
+
+impl StagingDirectory {
+    fn new(destination: &Path) -> io::Result<Self> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        loop {
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(".leviathan-export-{}-{id}.tmp", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn publish(mut self, destination: &Path) -> io::Result<()> {
+        require_new_folder(destination)?;
+        fs::rename(&self.path, destination)?;
+        self.path.clear();
+        Ok(())
+    }
+}
+
+impl Drop for StagingDirectory {
+    fn drop(&mut self) {
+        if !self.path.as_os_str().is_empty() {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lane_mix::LaneMix;
+    use crate::wav::decode_wav_bytes;
+    use leviathan_core::{NoteCell, Pattern, PatternChain, PlaybackRate};
+
+    fn project() -> Project {
+        let mut pattern = Pattern {
+            length: 1,
+            rate: PlaybackRate::EightX,
+            ..Pattern::default()
+        };
+        for lane in [0, 1, 5] {
+            pattern.lanes[lane][0] = NoteCell {
+                active: true,
+                midi: 48 + lane as u8 * 3,
+                velocity: 110,
+                ..NoteCell::default()
+            };
+        }
+        let second = Pattern {
+            rate: PlaybackRate::FourX,
+            ..pattern.clone()
+        };
+        let mut chain = PatternChain::default();
+        chain.push(0);
+        chain.push(1);
+        Project {
+            bpm: 120.0,
+            master_send: 0.3,
+            lane_mix: LaneMix::default(),
+            patterns: vec![pattern, second],
+            selected_pattern: 0,
+            chain,
+            samples: core::array::from_fn(|_| None),
+            custom_shader: None,
+        }
+    }
+
+    #[test]
+    fn pattern_round_trips_in_both_formats_with_loop_and_tail_frames() {
+        let project = project();
+        for (encoding, sample_rate, expected_frames) in [
+            (WavEncoding::Pcm16, 44_100, 1820),
+            (WavEncoding::Float32, 48_000, 1980),
+            (WavEncoding::Float32, 96_000, 3960),
+        ] {
+            let settings = ExportSettings {
+                encoding,
+                sample_rate,
+                loops: 2,
+                tail_seconds: 0.01,
+                ..ExportSettings::default()
+            };
+            let plan = RenderPlan::new(&project, settings).unwrap();
+            assert_eq!(plan.frames, expected_frames);
+            let mut wav = StereoWav::new(Vec::new(), encoding, sample_rate, plan.frames).unwrap();
+            let written = AtomicU32::new(0);
+            render(&project, false, plan, &written, |master, _| {
+                wav.write_frame(master)
+            })
+            .unwrap();
+            let bytes = wav.finish().unwrap();
+            assert_eq!(u16::from_le_bytes(bytes[22..24].try_into().unwrap()), 2);
+            assert_eq!(
+                u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize + 8,
+                bytes.len()
+            );
+            let decoded = decode_wav_bytes("bounce.wav", &bytes).unwrap();
+            assert_eq!(decoded.original_frames, expected_frames as usize);
+            assert_eq!(decoded.original_sr, sample_rate);
+            assert!(decoded.peaks.iter().any(|&peak| peak > 0.01));
+            assert_eq!(written.load(Ordering::Relaxed), expected_frames);
+        }
+    }
+
+    #[test]
+    fn chain_exports_aligned_stems_and_the_same_master_on_the_worker() {
+        let temp = StagingDirectory::new(&std::env::temp_dir().join("leviathan-test")).unwrap();
+        let stems = temp.path.join("stems");
+        let mut snapshot = project();
+        snapshot.lane_mix = LaneMix {
+            mute_mask: 1 << 1,
+            solo_mask: (1 << 0) | (1 << 1),
+        };
+        let settings = ExportSettings {
+            source: ExportSource::Chain,
+            stems: true,
+            loops: 2,
+            tail_seconds: 0.01,
+            ..ExportSettings::default()
+        };
+        let request = ExportRequest {
+            settings,
+            destination: stems.clone(),
+        };
+        assert_eq!(
+            ExportJob::start(snapshot, false, request)
+                .unwrap()
+                .finish()
+                .unwrap(),
+            stems
+        );
+        assert_eq!(fs::read_dir(&stems).unwrap().count(), NUM_LANES + 1);
+        for (lane, name) in STEM_FILES.iter().enumerate() {
+            let bytes = fs::read(stems.join(name)).unwrap();
+            let decoded = decode_wav_bytes(name, &bytes).unwrap();
+            assert_eq!(decoded.original_frames, 4980);
+            assert_eq!(decoded.original_sr, 48_000);
+            if lane == 0 {
+                assert!(decoded.peaks.iter().any(|&peak| peak > 0.01));
+            } else {
+                assert!(decoded.peaks.iter().all(|&peak| peak == 0.0));
+            }
+        }
+        let master = fs::read(stems.join("master.wav")).unwrap();
+        let mut snapshot = project();
+        snapshot.lane_mix = LaneMix {
+            mute_mask: 1 << 1,
+            solo_mask: (1 << 0) | (1 << 1),
+        };
+        let file = temp.path.join("mix.wav");
+        fs::write(&file, b"previous bounce").unwrap();
+        let plan = RenderPlan::new(
+            &snapshot,
+            ExportSettings {
+                stems: false,
+                ..settings
+            },
+        )
+        .unwrap();
+        write_outputs(&snapshot, false, plan, &file, &AtomicU32::new(0)).unwrap();
+        assert_eq!(fs::read(file).unwrap(), master);
+        let plan = RenderPlan::new(&snapshot, settings).unwrap();
+        assert_eq!(
+            write_outputs(&snapshot, false, plan, &stems, &AtomicU32::new(0))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(stems.join("master.wav")).unwrap(), master);
+    }
+}

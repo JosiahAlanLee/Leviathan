@@ -1,6 +1,7 @@
 use eframe::egui::{self, Key, Modifiers};
 use leviathan_core::{NoteCell, Pattern, NUM_LANES, ROWS_PER_PATTERN};
 
+use crate::lane_mix::{LaneMix, LaneMixAction};
 use crate::tracker_edit::{clear_rect, transpose_rect, BlockClipboard, BlockRect, EditHistory};
 
 const CMD_ONLY: Modifiers = Modifiers {
@@ -34,6 +35,46 @@ const CTRL_SHIFT: Modifiers = Modifiers {
     mac_cmd: false,
     command: false,
 };
+
+pub fn apply_lane_mix_shortcuts(ctx: &egui::Context, mix: &mut LaneMix) {
+    const DIGITS: [Key; NUM_LANES] = [
+        Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6,
+    ];
+    ctx.input_mut(|input| {
+        input.events.retain(|event| {
+            let egui::Event::Key {
+                key, physical_key, pressed: true, repeat, modifiers,
+            } = event
+            else {
+                return true;
+            };
+            if !modifiers.alt || modifiers.ctrl || modifiers.command || modifiers.mac_cmd {
+                return true;
+            }
+            let action = if !modifiers.shift
+                && (*key == Key::Num0 || *physical_key == Some(Key::Num0))
+            {
+                LaneMixAction::Clear
+            } else if let Some(lane) = DIGITS
+                .iter()
+                .position(|&digit| digit == *key)
+                .or_else(|| DIGITS.iter().position(|&digit| Some(digit) == *physical_key))
+            {
+                if modifiers.shift {
+                    LaneMixAction::Solo(lane)
+                } else {
+                    LaneMixAction::Mute(lane)
+                }
+            } else {
+                return true;
+            };
+            if !*repeat {
+                mix.apply(action);
+            }
+            false
+        });
+    });
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubColumn {

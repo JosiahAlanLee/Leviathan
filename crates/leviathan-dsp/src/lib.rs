@@ -13,6 +13,7 @@ use sampler::{SampleBank, VarClockSamplerVoice};
 pub use master::MasterPeaks;
 
 pub const MACHINE_COUNT: usize = 7;
+pub const ALL_LANES_AUDIBLE: u8 = (1 << NUM_LANES) - 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MachineKind {
@@ -180,6 +181,7 @@ struct VoiceState {
     env: f32,
     pitch_env: f32,
     prev_gate: bool,
+    output_gain: f32,
     ic1eq: f32,
     ic2eq: f32,
     rng: u32,
@@ -194,6 +196,7 @@ impl Default for VoiceState {
             env: 0.0,
             pitch_env: 0.0,
             prev_gate: false,
+            output_gain: 1.0,
             ic1eq: 0.0,
             ic2eq: 0.0,
             rng: 0x9e37_79b9,
@@ -206,6 +209,8 @@ impl Default for VoiceState {
 pub struct SynthRack {
     sample_rate: f32,
     voices: [VoiceState; NUM_LANES],
+    audible_mask: u8,
+    lane_slew: f32,
     master: MasterBus,
     pub sample_bank: SampleBank,
     pub counter: ByteBusCounter,
@@ -216,24 +221,31 @@ impl SynthRack {
         let sample_rate = sample_rate.max(8_000.0);
         Self {
             sample_rate,
-            voices: Self::fresh_voices(),
+            voices: Self::fresh_voices(ALL_LANES_AUDIBLE),
+            audible_mask: ALL_LANES_AUDIBLE,
+            lane_slew: 1.0 / (1.0 + sample_rate * 0.004),
             master: MasterBus::new(sample_rate),
             sample_bank: SampleBank::new(),
             counter: ByteBusCounter::default(),
         }
     }
 
-    fn fresh_voices() -> [VoiceState; NUM_LANES] {
+    fn fresh_voices(audible_mask: u8) -> [VoiceState; NUM_LANES] {
         let mut voices = core::array::from_fn(|_| VoiceState::default());
         for (i, v) in voices.iter_mut().enumerate() {
             v.rng ^= (i as u32 + 1).wrapping_mul(0x85eb_ca6b);
+            v.output_gain = lane_target(audible_mask, i);
         }
         voices
     }
 
     pub fn reset_voices(&mut self) {
-        self.voices = Self::fresh_voices();
+        self.voices = Self::fresh_voices(self.audible_mask);
         self.counter = ByteBusCounter::default();
+    }
+
+    pub fn set_lane_audible_mask(&mut self, mask: u8) {
+        self.audible_mask = mask & ALL_LANES_AUDIBLE;
     }
 
     pub fn set_master_send(&mut self, send: f32) {
@@ -264,7 +276,27 @@ impl SynthRack {
         }
     }
 
+    #[inline]
     pub fn render_stereo(&mut self, cv: &CvFrame) -> (f32, f32) {
+        self.render_mix(cv, None)
+    }
+
+    /// Renders the master and taps each lane after gain and pan, before the master bus.
+    #[inline]
+    pub fn render_stereo_with_stems(
+        &mut self,
+        cv: &CvFrame,
+        stems: &mut [[f32; 2]; NUM_LANES],
+    ) -> (f32, f32) {
+        self.render_mix(cv, Some(stems))
+    }
+
+    #[inline]
+    fn render_mix(
+        &mut self,
+        cv: &CvFrame,
+        mut stems: Option<&mut [[f32; 2]; NUM_LANES]>,
+    ) -> (f32, f32) {
         let _bus_step = self.counter.step(cv.bytebus_v[8] > 5.0, cv.reset_v > 5.0);
         let dt = 1.0 / self.sample_rate;
         let mut left = 0.0_f32;
@@ -340,9 +372,23 @@ impl SynthRack {
             v.ic1eq = 2.0 * v1 - v.ic1eq;
             v.ic2eq = 2.0 * v2 - v.ic2eq;
 
+            // Keep the voice running under the mute so it resumes at the same phase.
+            let target = lane_target(self.audible_mask, lane);
+            let difference = target - v.output_gain;
+            v.output_gain = if difference.abs() < 1e-5 {
+                target
+            } else {
+                v.output_gain + self.lane_slew * difference
+            };
+            let signal = v2 * v.output_gain;
             let pan = 0.2 + 0.6 * (lane as f32 / (NUM_LANES.saturating_sub(1)) as f32);
-            left += v2 * (1.0 - pan) * 0.45;
-            right += v2 * pan * 0.45;
+            let lane_left = signal * (1.0 - pan) * 0.45;
+            let lane_right = signal * pan * 0.45;
+            if let Some(stems) = &mut stems {
+                stems[lane] = [lane_left, lane_right];
+            }
+            left += lane_left;
+            right += lane_right;
         }
 
         let [left, right] = self.master.process([left, right]);
@@ -350,10 +396,52 @@ impl SynthRack {
     }
 }
 
+fn lane_target(audible_mask: u8, lane: usize) -> f32 {
+    if audible_mask & (1 << lane) != 0 {
+        1.0
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use leviathan_core::{EngineConfig, NoteCell, Pattern, TrackerEvaluator};
+
+    #[test]
+    fn lane_mute_slews_for_a_sustained_voice_and_keeps_other_lanes_audible() {
+        let cv = CvFrame {
+            gate_v: [10.0; NUM_LANES],
+            velocity_v: [10.0; NUM_LANES],
+            ..CvFrame::default()
+        };
+        let mut rack = SynthRack::new(48_000.0);
+        let mut stems = [[0.0; 2]; NUM_LANES];
+        for _ in 0..160 {
+            rack.render_stereo_with_stems(&cv, &mut stems);
+        }
+        rack.set_lane_audible_mask(ALL_LANES_AUDIBLE & !(1 << 1));
+        let mut previous = 1.0;
+        for _ in 0..192 {
+            rack.render_stereo_with_stems(&cv, &mut stems);
+            let gain = rack.voices[1].output_gain;
+            assert!(gain <= previous && previous - gain < 0.006);
+            previous = gain;
+        }
+        assert!((0.36..0.38).contains(&previous));
+        assert_eq!(rack.voices[0].output_gain, 1.0);
+        for _ in 0..3000 {
+            rack.render_stereo_with_stems(&cv, &mut stems);
+        }
+        assert_eq!(stems[1], [0.0; 2]);
+        assert!(stems[0].iter().any(|value| value.abs() > 1e-5));
+
+        rack.set_lane_audible_mask(ALL_LANES_AUDIBLE);
+        rack.render_stereo_with_stems(&cv, &mut stems);
+        assert!((0.0..0.006).contains(&rack.voices[1].output_gain));
+        assert!(rack.voices[1].prev_gate);
+    }
 
     #[test]
     fn synth_rack_renders_fm_and_sampler_sound_locks() {

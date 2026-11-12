@@ -5,6 +5,7 @@ use leviathan_core::{
     LaunchTarget, Pattern, PatternChain, PlaybackRate, SongStatus, MAX_CHAIN_ENTRIES,
 };
 
+use crate::export_ui::ExportUi;
 use crate::project::PATTERN_BANK_CAPACITY;
 
 pub enum ProjectAction {
@@ -46,10 +47,10 @@ impl ProjectUi {
         });
     }
 
-    pub fn toolbar(&mut self, ui: &mut egui::Ui) -> Option<ProjectAction> {
+    pub fn toolbar(&mut self, ui: &mut egui::Ui, export: &mut ExportUi) -> Option<ProjectAction> {
         let mut action = None;
         ui.horizontal_wrapped(|ui| {
-            let (open, save_as, save) = if self.dialog.is_none() {
+            let (open, save_as, save) = if self.dialog.is_none() && !export.dialog_open() {
                 ui.input_mut(|input| {
                     (
                         input.consume_key(Modifiers::COMMAND, Key::O),
@@ -77,6 +78,7 @@ impl ProjectUi {
                     self.choose(FileOperation::Save);
                 }
             }
+            export.toolbar(ui, self.dialog.is_none());
             if !self.status.is_empty() {
                 if self.failed {
                     ui.colored_label(ui.visuals().error_fg_color, &self.status);

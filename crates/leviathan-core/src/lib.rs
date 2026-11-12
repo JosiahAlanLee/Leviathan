@@ -181,6 +181,10 @@ impl Default for Pattern {
 }
 
 impl Pattern {
+    pub fn duration_beats(&self) -> f64 {
+        self.timing().duration_beats()
+    }
+
     fn timing(&self) -> PatternTiming {
         PatternTiming {
             rows: self.length.clamp(1, ROWS_PER_PATTERN),

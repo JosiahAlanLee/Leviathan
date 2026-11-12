@@ -39,6 +39,10 @@ Leviathan uses a strict hexagonal ("ports and adapters") layout so external GPU,
 
 The transport's **Delay send** feeds a short stereo ping-pong delay and saves with the project. The L/R meters show output peaks in dBFS. **CLIP** holds for one second when the mix exceeds full scale before limiting.
 
+Use **M** and **S** in each lane header, or `Alt+1`–`Alt+6` to mute, `Alt+Shift+1`–`Alt+Shift+6` to solo, and `Alt+0` to clear both. Mute takes precedence on a soloed lane. Both settings save with the project.
+
+**Export WAV…** bounces the selected pattern or song chain with a loop count and tail length. Choose 16-bit PCM or 32-bit float at 44.1, 48, or 96 kHz. Stem export creates a new folder with six stereo lane files taken before the master bus plus `master.wav`. The bounce captures the current lane mix, delay send, and FILL state.
+
 ## Quick Start
 
 ```bash

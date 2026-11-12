@@ -19,6 +19,7 @@ pub enum AudioCommand {
     SetFill(bool),
     SetBpm(f64),
     SetMasterSend(f32),
+    SetLaneAudibleMask(u8),
     Reset,
     Launch(LaunchTarget),
     SetChain(PatternChain),
@@ -71,6 +72,7 @@ pub struct AudioProject {
     generation: u64,
     bpm: f64,
     master_send: f32,
+    audible_mask: u8,
     patterns: Vec<Pattern>,
     selected_pattern: usize,
     chain: PatternChain,
@@ -79,20 +81,15 @@ pub struct AudioProject {
 
 impl AudioProject {
     pub fn prepare(project: &Project, generation: u64) -> Self {
-        let mut sample_bank = SampleBank::new();
-        for (bank, sample) in project.samples.iter().enumerate() {
-            if let Some(sample) = sample {
-                sample_bank.load_pcm_with_rate(bank, &sample.samples, sample.c4_rate_hz);
-            }
-        }
         Self {
             generation,
             bpm: project.bpm,
             master_send: project.master_send,
+            audible_mask: project.lane_mix.audible_mask(),
             patterns: project.patterns.clone(),
             selected_pattern: project.selected_pattern,
             chain: project.chain,
-            sample_bank,
+            sample_bank: project.sample_bank(),
         }
     }
 
@@ -256,6 +253,7 @@ impl RtAudioWorker {
             command.apply_transport(&mut self.player, self.pattern_count);
             match command {
                 AudioCommand::SetMasterSend(send) => self.synth.set_master_send(send),
+                AudioCommand::SetLaneAudibleMask(mask) => self.synth.set_lane_audible_mask(mask),
                 AudioCommand::SetCell {
                     pattern,
                     lane,
@@ -287,6 +285,7 @@ impl RtAudioWorker {
                     }
                     self.pattern_count = project.patterns.len().min(self.patterns.len());
                     self.synth.sample_bank.clone_from(&project.sample_bank);
+                    self.synth.set_lane_audible_mask(project.audible_mask);
                     self.synth.reset_voices();
                     self.synth.reset_master(project.master_send);
                     self.generation = project.generation;
@@ -606,6 +605,7 @@ mod tests {
         let project = Project {
             bpm: 120.0,
             master_send: 0.4,
+            lane_mix: Default::default(),
             patterns: vec![first, second],
             selected_pattern: 1,
             chain,
@@ -661,6 +661,7 @@ mod tests {
         let oversized = Project {
             bpm: 120.0,
             master_send: 0.0,
+            lane_mix: Default::default(),
             patterns: vec![Pattern::default(); PATTERN_BANK_CAPACITY + 4],
             selected_pattern: PATTERN_BANK_CAPACITY + 2,
             chain: PatternChain::default(),

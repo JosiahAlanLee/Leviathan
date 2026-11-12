@@ -1,6 +1,9 @@
 mod audio;
+mod export;
+mod export_ui;
 mod gpu_view;
 mod inspector_ui;
+mod lane_mix;
 mod link;
 mod master_ui;
 mod midi;
@@ -14,8 +17,10 @@ mod wav;
 use std::sync::Arc;
 
 use eframe::egui;
+use export_ui::ExportUi;
 use gpu_view::FeedbackViewport;
 use inspector_ui::{InspectorEdits, LANE_NAMES};
+use lane_mix::LaneMix;
 use leviathan_core::{
     CvFrame, EngineConfig, FillCondition, LaunchTarget, NoteCell, Pattern, PatternChain,
     SongPlayer, SongStatus, SoundLock, NUM_LANES, ROWS_PER_PATTERN,
@@ -168,12 +173,14 @@ struct LeviathanApp {
     selected_pattern: usize,
     chain: PatternChain,
     project_ui: ProjectUi,
+    export_ui: ExportUi,
     project_generation: u64,
     inspector_drag_recorded: bool,
     playing: bool,
     fill_active: bool,
     bpm: f64,
     master_send: f32,
+    lane_mix: LaneMix,
     master_meters: MasterMeters,
     sound_link: SoundLinkBridge,
     midi: MidiControls,
@@ -236,12 +243,14 @@ impl LeviathanApp {
             selected_pattern: 0,
             chain: PatternChain::default(),
             project_ui: ProjectUi::default(),
+            export_ui: ExportUi::default(),
             project_generation: 0,
             inspector_drag_recorded: false,
             playing: false,
             fill_active: false,
             bpm: 132.0,
             master_send: 0.0,
+            lane_mix: LaneMix::default(),
             master_meters: MasterMeters::default(),
             sound_link: SoundLinkBridge::default(),
             midi,
@@ -448,19 +457,23 @@ impl LeviathanApp {
         }
     }
 
+    fn project_snapshot(&self) -> project::Project {
+        project::Project {
+            bpm: self.bpm,
+            master_send: self.master_send,
+            lane_mix: self.lane_mix,
+            patterns: self.patterns.clone(),
+            selected_pattern: self.selected_pattern,
+            chain: self.chain,
+            samples: self.sampler_ui.samples.clone(),
+custom_shader: self.viewport.custom_shader().cloned(),
+        }
+    }
+
     fn apply_project_action(&mut self, action: ProjectAction) {
         match action {
             ProjectAction::Save(path) => {
-                let result = project::save(
-                    &path,
-                    self.bpm,
-                    self.master_send,
-                    &self.patterns,
-                    self.selected_pattern,
-                    &self.chain,
-                    &self.sampler_ui.samples,
-                    self.viewport.custom_shader(),
-                );
+                let result = project::save(&path, self.project_snapshot());
                 self.project_ui.finish(path, "Saved", result);
             }
             ProjectAction::Open(path) => {
@@ -475,6 +488,7 @@ impl LeviathanApp {
         let prepared = Arc::new(AudioProject::prepare(&project, self.project_generation));
         self.bpm = project.bpm;
         self.master_send = project.master_send;
+        self.lane_mix = project.lane_mix;
         self.master_meters = MasterMeters::default();
         self.histories = (0..project.patterns.len())
             .map(|_| EditHistory::default())
@@ -502,6 +516,7 @@ impl LeviathanApp {
 impl eframe::App for LeviathanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.audio.flush();
+        self.export_ui.poll(ctx);
         let mut peaks = MasterPeaks::default();
         while let Ok(telemetry) = self.tel_rx.pop() {
             if telemetry.generation == self.project_generation {
@@ -518,7 +533,7 @@ impl eframe::App for LeviathanApp {
 
         let (file, arrangement) = egui::TopBottomPanel::top("project_and_patterns")
             .show(ctx, |ui| {
-                let file = self.project_ui.toolbar(ui);
+                let file = self.project_ui.toolbar(ui, &mut self.export_ui);
                 let arrangement = session_ui::draw_arrangement(
                     ui,
                     &self.patterns,
@@ -530,28 +545,41 @@ impl eframe::App for LeviathanApp {
                 (file, arrangement)
             })
             .inner;
+        let modal_open = self.project_ui.dialog_open() || self.export_ui.dialog_open();
         if let Some(action) = file.or_else(|| self.project_ui.show_dialog(ctx)) {
             self.apply_project_action(action);
-        } else if !self.project_ui.dialog_open() {
+        } else if !modal_open {
             if let Some(action) = arrangement {
                 self.apply_arrangement_action(action);
             }
         }
+        if let Some(request) = self.export_ui.show_dialog(
+            ctx,
+            self.selected_pattern,
+            !self.chain.as_slice().is_empty(),
+        ) {
+            let snapshot = self.project_snapshot();
+            self.export_ui.start(ctx, snapshot, self.fill_active, request);
+        }
 
         let selected = self.selected_pattern;
+        let previous_audible = self.lane_mix.audible_mask();
+        if !modal_open && !ctx.wants_keyboard_input() {
+            tracker_keys::apply_lane_mix_shortcuts(ctx, &mut self.lane_mix);
+        }
 
         if !ctx.input(|i| i.pointer.any_down()) {
             self.inspector_drag_recorded = false;
         }
 
-        if !self.project_ui.dialog_open()
+        if !modal_open
             && !ctx.wants_keyboard_input()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space))
         {
             self.toggle_playing();
         }
 
-        if !self.project_ui.dialog_open() {
+        if !modal_open {
             match self.cursor.handle_input(
                 ctx,
                 &mut self.patterns[selected],
@@ -785,8 +813,8 @@ impl eframe::App for LeviathanApp {
                     .min_col_width(82.0)
                     .show(ui, |ui| {
                         ui.monospace("ROW");
-                        for name in LANE_NAMES {
-                            ui.monospace(name);
+                        for (lane, name) in LANE_NAMES.into_iter().enumerate() {
+                            self.lane_mix.header(ui, name, lane);
                         }
                         ui.end_row();
 
@@ -901,6 +929,10 @@ impl eframe::App for LeviathanApp {
             });
         });
 
+        let audible = self.lane_mix.audible_mask();
+        if audible != previous_audible {
+            self.send_audio(AudioCommand::SetLaneAudibleMask(audible));
+        }
         self.sync_midi_target();
         if self.playing || self.audio.has_pending() || self.master_meters.is_active(now) {
             ctx.request_repaint();
@@ -1027,6 +1059,15 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = offline_app(&ctx);
         app.master_send = 0.35;
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                key(Key::Num2, Modifiers::ALT),
+                key(Key::Num4, Modifiers::ALT | Modifiers::SHIFT),
+            ],
+        );
+        assert_eq!(app.lane_mix, LaneMix { mute_mask: 0b10, solo_mask: 0b1000 });
         app.apply_arrangement_action(ArrangementAction::AppendToChain);
         app.apply_arrangement_action(ArrangementAction::AddPattern { clone: true });
         app.apply_arrangement_action(ArrangementAction::SetRate(PlaybackRate::Half));
@@ -1059,6 +1100,10 @@ mod tests {
         frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
         std::fs::remove_file(path).unwrap();
         assert_eq!(app.master_send, 0.35);
+        assert_eq!(app.lane_mix, LaneMix { mute_mask: 0b10, solo_mask: 0b1000 });
+        frame(&ctx, &mut app, Vec::new());
+        frame(&ctx, &mut app, vec![key(Key::Num0, Modifiers::ALT)]);
+        assert_eq!(app.lane_mix, LaneMix::default());
         assert_eq!(app.selected_pattern, 1);
         assert_eq!(app.patterns[1].rate, PlaybackRate::Half);
         assert_eq!(app.chain.as_slice(), &[0, 1]);
