@@ -51,6 +51,12 @@ cargo test --workspace
 cargo run --release -p leviathan-app
 ```
 
+## MIDI input
+
+Select an input in the **MIDI** menu. Use **Refresh MIDI** to rescan and **Off** to disconnect. A held note auditions the instrument and sound locks at the tracker cursor on that lane. Release returns the lane to the sequence.
+
+Arm **MIDI REC** to enter notes and velocities at the cursor with the current edit step. MIDI Start resets playback, Continue resumes from the current position, and Stop pauses. Playback uses the project BPM.
+
 ## Roadmap & Multi-Agent Coordination
 
 - [ROADMAP.md](ROADMAP.md) — completed milestones (`M1`–`M9`) and scoped next-step workstreams (`T1`–`T6`) with owned files and acceptance criteria.

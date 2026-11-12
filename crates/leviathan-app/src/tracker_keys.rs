@@ -269,6 +269,29 @@ impl TrackerCursor {
         self.moved_this_frame = true;
     }
 
+    pub fn enter_note(
+        &mut self,
+        pattern: &mut Pattern,
+        history: &mut EditHistory,
+        midi: u8,
+        velocity: Option<u8>,
+    ) -> CellUpdate {
+        history.record_before_edit(pattern);
+        let (lane, row) = (self.lane, self.row);
+        let cell = &mut pattern.lanes[lane][row];
+        cell.active = true;
+        cell.air = false;
+        cell.midi = midi;
+        cell.velocity = velocity.unwrap_or(if cell.velocity == 0 { 100 } else { cell.velocity });
+        let update = CellUpdate {
+            lane,
+            row,
+            cell: *cell,
+        };
+        self.advance_row();
+        update
+    }
+
     pub fn handle_input(
         &mut self,
         ctx: &egui::Context,
@@ -620,22 +643,9 @@ impl TrackerCursor {
                     for &(k, _) in PIANO_BINDINGS.iter().chain(UPPER_EXT_BINDINGS.iter()) {
                         if i.consume_key(Modifiers::NONE, k) {
                             if let Some(midi) = midi_for_piano_key(k, self.base_octave) {
-                                history.record_before_edit(pattern);
-                                let l = self.lane;
-                                let r = self.row;
-                                let cell = &mut pattern.lanes[l][r];
-                                cell.active = true;
-                                cell.air = false;
-                                cell.midi = midi;
-                                if cell.velocity == 0 {
-                                    cell.velocity = 100;
-                                }
-                                sync = PatternSync::Single(CellUpdate {
-                                    lane: l,
-                                    row: r,
-                                    cell: *cell,
-                                });
-                                self.advance_row();
+                                sync = PatternSync::Single(
+                                    self.enter_note(pattern, history, midi, None),
+                                );
                             }
                             break;
                         }
