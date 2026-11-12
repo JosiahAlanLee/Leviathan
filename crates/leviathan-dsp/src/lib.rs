@@ -3,6 +3,7 @@
 pub mod fm;
 mod master;
 pub mod sampler;
+pub mod spec;
 
 use core::f32::consts::{FRAC_1_PI, FRAC_1_SQRT_2, FRAC_2_PI, PI, TAU};
 use fm::FourOpFmVoice;
@@ -11,6 +12,7 @@ use master::{MasterBus, MAX_SEND};
 use sampler::{SampleBank, VarClockSamplerVoice};
 
 pub use master::{MasterPeaks, StereoDelay};
+pub use spec::{default_lane_patches, machine_spec, LanePatch, MachineSpec, ParamSpec, DEFAULT_LANE_MACHINES, DEFAULT_LANE_PATCHES, MACHINE_SPECS};
 
 pub const MACHINE_COUNT: usize = 7;
 pub const ALL_LANES_AUDIBLE: u8 = (1 << NUM_LANES) - 1;
@@ -117,6 +119,54 @@ impl MachineKind {
             Self::AcidLead => "ACID",
             Self::ChordStab => "CHRD",
         }
+    }
+    pub const ALL: [Self; MACHINE_COUNT] = [
+        Self::KickDrum,
+        Self::FourOpFm,
+        Self::SubBass,
+        Self::NoiseWash,
+        Self::VarSampler,
+        Self::AcidLead,
+        Self::ChordStab,
+    ];
+
+    pub const fn from_id(id: usize) -> Self {
+        match id % MACHINE_COUNT {
+            0 => Self::KickDrum,
+            1 => Self::FourOpFm,
+            2 => Self::SubBass,
+            3 => Self::NoiseWash,
+            4 => Self::VarSampler,
+            5 => Self::AcidLead,
+            _ => Self::ChordStab,
+        }
+    }
+
+    pub const fn from_patch_and_lock(patch: &LanePatch, lock: &SoundLock) -> Self {
+        if lock.machine >= 0 {
+            Self::from_id(lock.machine as usize)
+        } else {
+            patch.machine
+        }
+    }
+
+    pub const fn spec(self) -> &'static MachineSpec {
+        spec::machine_spec(self)
+    }
+
+    pub const fn slug(self) -> &'static str {
+        self.spec().slug
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        self.spec().name
+    }
+
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        MACHINE_SPECS
+            .iter()
+            .find(|s| s.slug == slug)
+            .map(|s| s.kind)
     }
 }
 
@@ -269,6 +319,19 @@ impl Default for VoiceState {
             sampler: VarClockSamplerVoice::default(),
         }
     }
+
+impl VoiceState {
+    pub fn reset_synthesis(&mut self) {
+        self.phase = 0.0;
+        self.env = 0.0;
+        self.pitch_env = 0.0;
+        self.prev_gate = false;
+        self.ic1eq = 0.0;
+        self.ic2eq = 0.0;
+        self.fm = FourOpFmVoice::default();
+        self.sampler = VarClockSamplerVoice::default();
+    }
+}
 }
 
 pub struct SynthRack {
@@ -280,6 +343,7 @@ pub struct SynthRack {
     master: MasterBus,
     pub sample_bank: SampleBank,
     pub counter: ByteBusCounter,
+    lane_patches: [LanePatch; NUM_LANES],
 }
 
 impl SynthRack {
@@ -294,8 +358,32 @@ impl SynthRack {
             master: MasterBus::new(sample_rate),
             sample_bank: SampleBank::new(),
             counter: ByteBusCounter::default(),
+            lane_patches: DEFAULT_LANE_PATCHES,
+        }
+
+    pub fn lane_patches(&self) -> &[LanePatch; NUM_LANES] {
+        &self.lane_patches
+    }
+
+    pub fn lane_patch(&self, lane: usize) -> LanePatch {
+        self.lane_patches[lane.min(NUM_LANES - 1)]
+    }
+
+    pub fn set_lane_patch(&mut self, lane: usize, patch: LanePatch) {
+        if lane < NUM_LANES {
+            let clean = patch.sanitized();
+            if self.lane_patches[lane].machine != clean.machine {
+                self.voices[lane].reset_synthesis();
+            }
+            self.lane_patches[lane] = clean;
         }
     }
+
+    pub fn set_lane_patches(&mut self, patches: [LanePatch; NUM_LANES]) {
+        for (lane, patch) in patches.into_iter().enumerate() {
+            self.set_lane_patch(lane, patch);
+        }
+    }    }
 
     fn fresh_voices(
         audible_mask: u8,
@@ -393,9 +481,12 @@ impl SynthRack {
 
         for (lane, v) in self.voices.iter_mut().enumerate() {
             let gate_high = cv.gate_v[lane] > 2.5;
-            let lock = &cv.locks[lane];
-            let machine = MachineKind::from_lane_and_lock(lane, lock);
-
+            let raw_lock = &cv.locks[lane];
+let patch = &self.lane_patches[lane];
+let resolved_lock = patch.resolve_lock(raw_lock);
+let lock = &resolved_lock;
+let machine = MachineKind::from_patch_and_lock(patch, raw_lock);
+            
             if gate_high && (!v.prev_gate || cv.retrigger_mask & (1 << lane) != 0) {
                 v.env = (cv.velocity_v[lane] / 10.0).clamp(0.1, 1.0);
                 v.pitch_env = 1.0;
@@ -411,7 +502,7 @@ impl SynthRack {
 
             let base_hz = v_oct_to_hz(cv.pitch_v[lane]);
             let freq = match machine {
-                MachineKind::KickDrum => 48.0 + 175.0 * v.pitch_env,
+            MachineKind::KickDrum => 48.0 + (175.0 + (lock.values[4] - 0.5) * 160.0) * v.pitch_env,
                 MachineKind::SubBass => base_hz * 0.5,
                 _ => base_hz,
             };
@@ -429,35 +520,54 @@ impl SynthRack {
                     fast_tanh(drive * fast_sin_turns(v.phase) * v.env)
                 }
                 MachineKind::FourOpFm => v.fm.step_sample(base_hz, self.sample_rate, v.env, lock),
-                MachineKind::SubBass => {
-                    let saw = 2.0 * v.phase - 1.0;
-                    fast_tanh(1.6 * (0.65 * fast_sin_turns(v.phase) + 0.35 * saw)) * v.env
-                }
-                MachineKind::NoiseWash => noise * v.env * 0.55,
-                MachineKind::VarSampler => {
-                    v.sampler.step_sample_gated(
-                        &self.sample_bank,
-                        base_hz,
-                        self.sample_rate,
-                        lock,
-                        gate_high,
-                    ) * v.env
-                }
-                MachineKind::AcidLead => (2.0 * v.phase - 1.0) * v.env,
-                MachineKind::ChordStab => {
-                    let fifth = fast_sin_turns(v.phase * 1.498_307);
-                    0.5 * (fast_sin_turns(v.phase) + fifth) * v.env
-                }
-            };
+                           MachineKind::SubBass => {
+                let saw = 2.0 * v.phase - 1.0;
+                let drive = 1.6 + (lock.values[1] - 0.5) * 2.0;
+                fast_tanh(drive * (0.65 * fast_sin_turns(v.phase) + 0.35 * saw)) * v.env
+            }
+            MachineKind::NoiseWash => noise * v.env * (0.55 + (lock.values[1] - 0.5) * 0.70),
+            MachineKind::VarSampler => {
+                v.sampler.step_sample_gated(
+                    &self.sample_bank,
+                    base_hz,
+                    self.sample_rate,
+                    lock,
+                    gate_high,
+                ) * v.env
+            }
+            MachineKind::AcidLead => {
+                let saw = 2.0 * v.phase - 1.0;
+                let shaped = if (lock.values[1] - 0.5).abs() < 1e-6 {
+                    saw
+                } else {
+                    fast_tanh((1.0 + lock.values[1] * 2.4) * saw)
+                };
+                shaped * v.env
+            }
+            MachineKind::ChordStab => {
+                let fifth =
+                    fast_sin_turns(v.phase * (1.498_307 + (lock.values[1] - 0.5) * 0.04));
+                0.5 * (fast_sin_turns(v.phase) + fifth) * v.env
+            }
+        };
 
-            let cutoff_norm = lock_param(lock, 2, (0.22 + 0.52 * v.env).clamp(0.05, 0.88))
-                .clamp(0.04, 0.88);
-            let g = (cutoff_norm * 0.72).clamp(0.01, 0.78);
-            let k = if matches!(machine, MachineKind::AcidLead) {
-                0.55_f32
-            } else {
-                0.85_f32
-            };
+        let cutoff_norm = if raw_lock.has_param(2) {
+            raw_lock.values[2]
+        } else {
+            (0.22 + (lock.values[2] - 0.5) * 0.8 + 0.52 * v.env).clamp(0.05, 0.88)
+        }
+        .clamp(0.04, 0.88);
+        let g = (cutoff_norm * 0.72).clamp(0.01, 0.78);
+        let base_k = if matches!(machine, MachineKind::AcidLead) {
+            0.55_f32
+        } else {
+            0.85_f32
+        };
+        let k = if matches!(machine, MachineKind::FourOpFm | MachineKind::VarSampler) {
+            base_k
+        } else {
+            (base_k - (lock.values[3] - 0.5) * 0.70).clamp(0.12, 1.40)
+        };
             let a1 = 1.0 / (1.0 + g * (g + k));
             let a2 = g * a1;
             let a3 = g * a2;
@@ -665,5 +775,56 @@ mod tests {
             *slot = ctr.step(true, false);
         }
         assert_eq!(seq, [1, 2, 1, 0, 1]);
+    }
+    #[test]
+    fn dual_lanes_same_machine_render_independent_base_patches() {
+        let mut rack = SynthRack::new(48_000.0);
+        let mut patch_a = LanePatch::for_machine(MachineKind::FourOpFm);
+        patch_a.params[1] = 0.05;
+        let mut patch_b = LanePatch::for_machine(MachineKind::FourOpFm);
+        patch_b.params[1] = 0.95;
+        rack.set_lane_patch(0, patch_a);
+        rack.set_lane_patch(1, patch_b);
+
+        let mut cv = CvFrame::default();
+        cv.gate_v[0] = 5.0;
+        cv.gate_v[1] = 5.0;
+        cv.velocity_v[0] = 8.0;
+        cv.velocity_v[1] = 8.0;
+
+        let mut energy_a = 0.0_f32;
+        let mut energy_b = 0.0_f32;
+        let mut diff_energy = 0.0_f32;
+        let mut stems = [[0.0_f32; 2]; NUM_LANES];
+        for _ in 0..256 {
+            let (l, r) = rack.render_stereo_with_stems(&cv, &mut stems);
+            assert!(l.is_finite() && r.is_finite());
+            let a = stems[0][0] + stems[0][1];
+            let b = stems[1][0] + stems[1][1];
+            energy_a += a * a;
+            energy_b += b * b;
+            diff_energy += (a - b) * (a - b);
+        }
+        assert!(energy_a > 1e-4);
+        assert!(energy_b > 1e-4);
+        assert!(diff_energy > 1e-3);
+    }
+
+    #[test]
+    fn machine_spec_slugs_and_masked_step_locks_preserve_base_patch() {
+        for kind in MachineKind::ALL {
+            assert_eq!(MachineKind::from_slug(kind.slug()), Some(kind));
+            assert_eq!(kind.short_name(), kind.spec().badge);
+        }
+        let mut patch = LanePatch::for_machine(MachineKind::ChordStab);
+        patch.params[0] = 0.90;
+        patch.params[2] = 0.80;
+        let mut step_lock = SoundLock::default();
+        step_lock.mask = 1 << 2;
+        step_lock.values[2] = 0.12;
+        let resolved = patch.resolve_lock(&step_lock);
+        assert_eq!(resolved.machine, MachineKind::ChordStab as i16);
+        assert!((resolved.values[0] - 0.90).abs() < 1e-6);
+        assert!((resolved.values[2] - 0.12).abs() < 1e-6);
     }
 }
