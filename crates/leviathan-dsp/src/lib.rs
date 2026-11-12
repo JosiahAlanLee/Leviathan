@@ -4,16 +4,79 @@ pub mod fm;
 mod master;
 pub mod sampler;
 
-use core::f32::consts::{FRAC_1_PI, FRAC_2_PI, PI, TAU};
+use core::f32::consts::{FRAC_1_PI, FRAC_1_SQRT_2, FRAC_2_PI, PI, TAU};
 use fm::FourOpFmVoice;
 use leviathan_core::{CvFrame, SoundLock, NUM_LANES};
-use master::MasterBus;
+use master::{MasterBus, MAX_SEND};
 use sampler::{SampleBank, VarClockSamplerVoice};
 
-pub use master::MasterPeaks;
+pub use master::{MasterPeaks, StereoDelay};
 
 pub const MACHINE_COUNT: usize = 7;
 pub const ALL_LANES_AUDIBLE: u8 = (1 << NUM_LANES) - 1;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LaneChannel {
+    pub level: f32,
+    pub pan: f32,
+    pub delay_send: f32,
+}
+
+impl LaneChannel {
+    const fn dry(level: f32, pan: f32) -> Self {
+        Self {
+            level,
+            pan,
+            delay_send: 0.0,
+        }
+    }
+
+    pub fn is_valid(self) -> bool {
+        // Range checks also reject NaN and infinities.
+        (0.0..=1.25).contains(&self.level)
+            && (-1.0..=1.0).contains(&self.pan)
+            && (0.0..=1.0).contains(&self.delay_send)
+    }
+
+    fn slew(&mut self, target: Self, coefficient: f32) {
+        self.level = slew(self.level, target.level, coefficient);
+        self.pan = slew(self.pan, target.pan, coefficient);
+        self.delay_send = slew(self.delay_send, target.delay_send, coefficient);
+    }
+}
+
+// Match the stereo gains of the original fixed lane spread in old projects.
+pub const DEFAULT_LANE_CHANNELS: [LaneChannel; NUM_LANES] = [
+    LaneChannel::dry(0.824_621_14, -0.668_698_43),
+    LaneChannel::dry(0.751_531_8, -0.421_323_33),
+    LaneChannel::dry(0.712_179_8, -0.144_335_06),
+    LaneChannel::dry(0.712_179_8, 0.144_335_06),
+    LaneChannel::dry(0.751_531_8, 0.421_323_33),
+    LaneChannel::dry(0.824_621_14, 0.668_698_43),
+];
+
+#[inline]
+fn stereo_pan(pan: f32) -> [f32; 2] {
+    // Rotate the unit vector at center using the tangent half-angle formula.
+    // Factoring the numerators gives exact zeros at the hard-pan endpoints.
+    const TAN_PI_8_SQUARED: f32 = 0.171_572_88;
+    let scale = FRAC_1_SQRT_2 / (1.0 + TAN_PI_8_SQUARED * pan * pan);
+    let offset = TAN_PI_8_SQUARED * pan;
+    [
+        (1.0 - pan) * (1.0 + offset) * scale,
+        (1.0 + pan) * (1.0 - offset) * scale,
+    ]
+}
+
+#[inline]
+fn slew(value: f32, target: f32, coefficient: f32) -> f32 {
+    let difference = target - value;
+    if difference.abs() < 1e-5 {
+        target
+    } else {
+        value + coefficient * difference
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MachineKind {
@@ -182,6 +245,7 @@ struct VoiceState {
     pitch_env: f32,
     prev_gate: bool,
     output_gain: f32,
+    channel: LaneChannel,
     ic1eq: f32,
     ic2eq: f32,
     rng: u32,
@@ -197,6 +261,7 @@ impl Default for VoiceState {
             pitch_env: 0.0,
             prev_gate: false,
             output_gain: 1.0,
+            channel: LaneChannel::dry(1.0, 0.0),
             ic1eq: 0.0,
             ic2eq: 0.0,
             rng: 0x9e37_79b9,
@@ -210,6 +275,7 @@ pub struct SynthRack {
     sample_rate: f32,
     voices: [VoiceState; NUM_LANES],
     audible_mask: u8,
+    channels: [LaneChannel; NUM_LANES],
     lane_slew: f32,
     master: MasterBus,
     pub sample_bank: SampleBank,
@@ -221,8 +287,9 @@ impl SynthRack {
         let sample_rate = sample_rate.max(8_000.0);
         Self {
             sample_rate,
-            voices: Self::fresh_voices(ALL_LANES_AUDIBLE),
+            voices: Self::fresh_voices(ALL_LANES_AUDIBLE, DEFAULT_LANE_CHANNELS),
             audible_mask: ALL_LANES_AUDIBLE,
+            channels: DEFAULT_LANE_CHANNELS,
             lane_slew: 1.0 / (1.0 + sample_rate * 0.004),
             master: MasterBus::new(sample_rate),
             sample_bank: SampleBank::new(),
@@ -230,22 +297,32 @@ impl SynthRack {
         }
     }
 
-    fn fresh_voices(audible_mask: u8) -> [VoiceState; NUM_LANES] {
+    fn fresh_voices(
+        audible_mask: u8,
+        channels: [LaneChannel; NUM_LANES],
+    ) -> [VoiceState; NUM_LANES] {
         let mut voices = core::array::from_fn(|_| VoiceState::default());
         for (i, v) in voices.iter_mut().enumerate() {
             v.rng ^= (i as u32 + 1).wrapping_mul(0x85eb_ca6b);
             v.output_gain = lane_target(audible_mask, i);
+            v.channel = channels[i];
         }
         voices
     }
 
     pub fn reset_voices(&mut self) {
-        self.voices = Self::fresh_voices(self.audible_mask);
+        self.voices = Self::fresh_voices(self.audible_mask, self.channels);
         self.counter = ByteBusCounter::default();
     }
 
     pub fn set_lane_audible_mask(&mut self, mask: u8) {
         self.audible_mask = mask & ALL_LANES_AUDIBLE;
+    }
+
+    pub fn set_lane_channels(&mut self, channels: [LaneChannel; NUM_LANES]) {
+        if channels.iter().all(|channel| channel.is_valid()) {
+            self.channels = channels;
+        }
     }
 
     pub fn set_master_send(&mut self, send: f32) {
@@ -278,7 +355,7 @@ impl SynthRack {
 
     #[inline]
     pub fn render_stereo(&mut self, cv: &CvFrame) -> (f32, f32) {
-        self.render_mix(cv, None)
+        self.render_mix(cv, None, None)
     }
 
     /// Renders the master and taps each lane after gain and pan, before the master bus.
@@ -288,7 +365,17 @@ impl SynthRack {
         cv: &CvFrame,
         stems: &mut [[f32; 2]; NUM_LANES],
     ) -> (f32, f32) {
-        self.render_mix(cv, Some(stems))
+        self.render_mix(cv, Some(stems), None)
+    }
+
+    /// Includes each lane's own contribution to the delay in its stem.
+    pub fn render_stereo_with_wet_stems(
+        &mut self,
+        cv: &CvFrame,
+        stems: &mut [[f32; 2]; NUM_LANES],
+        delays: &mut [StereoDelay; NUM_LANES],
+    ) -> (f32, f32) {
+        self.render_mix(cv, Some(stems), Some(delays))
     }
 
     #[inline]
@@ -296,18 +383,20 @@ impl SynthRack {
         &mut self,
         cv: &CvFrame,
         mut stems: Option<&mut [[f32; 2]; NUM_LANES]>,
+        mut stem_delays: Option<&mut [StereoDelay; NUM_LANES]>,
     ) -> (f32, f32) {
         let _bus_step = self.counter.step(cv.bytebus_v[8] > 5.0, cv.reset_v > 5.0);
         let dt = 1.0 / self.sample_rate;
-        let mut left = 0.0_f32;
-        let mut right = 0.0_f32;
+        let mut dry_mix = [0.0_f32; 2];
+        let mut delay_mix = [0.0_f32; 2];
+        let master_send = self.master.next_send();
 
         for (lane, v) in self.voices.iter_mut().enumerate() {
             let gate_high = cv.gate_v[lane] > 2.5;
             let lock = &cv.locks[lane];
             let machine = MachineKind::from_lane_and_lock(lane, lock);
 
-            if gate_high && !v.prev_gate {
+            if gate_high && (!v.prev_gate || cv.retrigger_mask & (1 << lane) != 0) {
                 v.env = (cv.velocity_v[lane] / 10.0).clamp(0.1, 1.0);
                 v.pitch_env = 1.0;
                 v.fm.trigger();
@@ -346,7 +435,13 @@ impl SynthRack {
                 }
                 MachineKind::NoiseWash => noise * v.env * 0.55,
                 MachineKind::VarSampler => {
-                    v.sampler.step_sample(&self.sample_bank, base_hz, self.sample_rate, lock) * v.env
+                    v.sampler.step_sample_gated(
+                        &self.sample_bank,
+                        base_hz,
+                        self.sample_rate,
+                        lock,
+                        gate_high,
+                    ) * v.env
                 }
                 MachineKind::AcidLead => (2.0 * v.phase - 1.0) * v.env,
                 MachineKind::ChordStab => {
@@ -373,25 +468,32 @@ impl SynthRack {
             v.ic2eq = 2.0 * v2 - v.ic2eq;
 
             // Keep the voice running under the mute so it resumes at the same phase.
-            let target = lane_target(self.audible_mask, lane);
-            let difference = target - v.output_gain;
-            v.output_gain = if difference.abs() < 1e-5 {
-                target
-            } else {
-                v.output_gain + self.lane_slew * difference
-            };
-            let signal = v2 * v.output_gain;
-            let pan = 0.2 + 0.6 * (lane as f32 / (NUM_LANES.saturating_sub(1)) as f32);
-            let lane_left = signal * (1.0 - pan) * 0.45;
-            let lane_right = signal * pan * 0.45;
-            if let Some(stems) = &mut stems {
-                stems[lane] = [lane_left, lane_right];
+            v.output_gain = slew(
+                v.output_gain,
+                lane_target(self.audible_mask, lane),
+                self.lane_slew,
+            );
+            v.channel.slew(self.channels[lane], self.lane_slew);
+            let signal = v2 * v.output_gain * v.channel.level * 0.45;
+            let dry = stereo_pan(v.channel.pan).map(|gain| signal * gain);
+            // The master send raises the baseline for every channel. The lane
+            // send uses the remaining range so the total stays bounded.
+            let send_gain = master_send + v.channel.delay_send * (MAX_SEND - master_send);
+            let send = dry.map(|sample| sample * send_gain);
+            for channel in 0..2 {
+                dry_mix[channel] += dry[channel];
+                delay_mix[channel] += send[channel];
             }
-            left += lane_left;
-            right += lane_right;
+            if let Some(stems) = &mut stems {
+                stems[lane] = if let Some(delays) = &mut stem_delays {
+                    delays[lane].mix(dry, send)
+                } else {
+                    dry
+                };
+            }
         }
 
-        let [left, right] = self.master.process([left, right]);
+        let [left, right] = self.master.process(dry_mix, delay_mix);
         (left, right)
     }
 }
@@ -408,6 +510,47 @@ fn lane_target(audible_mask: u8, lane: usize) -> f32 {
 mod tests {
     use super::*;
     use leviathan_core::{EngineConfig, NoteCell, Pattern, TrackerEvaluator};
+
+    #[test]
+    fn pan_is_constant_power_and_defaults_reproduce_the_old_spread() {
+        assert_eq!(stereo_pan(0.0), [FRAC_1_SQRT_2; 2]);
+        assert_eq!(stereo_pan(-1.0)[1], 0.0);
+        assert_eq!(stereo_pan(1.0)[0], 0.0);
+        for i in -100..=100 {
+            let [l, r] = stereo_pan(i as f32 * 0.01);
+            assert!((l * l + r * r - 1.0).abs() < 5e-7);
+        }
+        for (lane, channel) in DEFAULT_LANE_CHANNELS.iter().enumerate() {
+            let actual = stereo_pan(channel.pan).map(|gain| gain * channel.level);
+            let old = 0.2 + 0.6 * lane as f32 / 5.0;
+            assert!((actual[0] - (1.0 - old)).abs() < 2e-7);
+            assert!((actual[1] - old).abs() < 2e-7);
+            assert_eq!(channel.delay_send, 0.0);
+        }
+    }
+
+    #[test]
+    fn live_mixer_changes_slew_then_reach_the_snapshot_values() {
+        let mut rack = SynthRack::new(48_000.0);
+        let mut target = DEFAULT_LANE_CHANNELS;
+        target[0] = LaneChannel {
+            level: 0.0,
+            pan: 1.0,
+            delay_send: 1.0,
+        };
+        rack.set_lane_channels(target);
+        rack.render_stereo(&CvFrame::default());
+        let actual = rack.voices[0].channel;
+        assert!((0.8..DEFAULT_LANE_CHANNELS[0].level).contains(&actual.level));
+        assert!((DEFAULT_LANE_CHANNELS[0].pan..-0.65).contains(&actual.pan));
+        assert!((0.0..0.01).contains(&actual.delay_send));
+        assert!(actual.delay_send > 0.0);
+        for _ in 0..4096 {
+            rack.render_stereo(&CvFrame::default());
+        }
+        assert_eq!(rack.voices[0].channel, target[0]);
+        assert_eq!(rack.voices[1].channel, target[1]);
+    }
 
     #[test]
     fn lane_mute_slews_for_a_sustained_voice_and_keeps_other_lanes_audible() {

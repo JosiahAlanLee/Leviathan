@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use eframe::egui;
-use leviathan_dsp::sampler::{NUM_BANKS, ROM_WAVE_LEN};
+use leviathan_dsp::sampler::{SampleRegion, NUM_BANKS, ROM_WAVE_LEN};
 
 use crate::wav::{decode_wav_bytes, load_wav_file, DecodedWav};
 
@@ -30,6 +30,10 @@ pub enum BankAction {
     },
     ResetRom {
         bank: usize,
+    },
+    SetRegion {
+        bank: usize,
+        region: SampleRegion,
     },
 }
 
@@ -74,6 +78,7 @@ pub struct SamplerBankUi {
     pub status_msg: String,
     pub slots: [BankSlotMeta; NUM_BANKS],
     pub samples: [Option<DecodedWav>; NUM_BANKS],
+    pub regions: [SampleRegion; NUM_BANKS],
 }
 
 impl Default for SamplerBankUi {
@@ -84,6 +89,7 @@ impl Default for SamplerBankUi {
             status_msg: "Drop .wav file(s) anywhere on window to load into B0-B3.".to_string(),
             slots: core::array::from_fn(BankSlotMeta::rom_default),
             samples: core::array::from_fn(|_| None),
+            regions: [SampleRegion::default(); NUM_BANKS],
         }
     }
 }
@@ -118,8 +124,13 @@ impl SamplerBankUi {
         self.samples[b] = Some(wav);
     }
 
-    pub fn restore(&mut self, samples: [Option<DecodedWav>; NUM_BANKS]) {
+    pub fn restore(
+        &mut self,
+        samples: [Option<DecodedWav>; NUM_BANKS],
+        regions: [SampleRegion; NUM_BANKS],
+    ) {
         *self = Self::default();
+        self.regions = regions;
         for (bank, sample) in samples.into_iter().enumerate() {
             if let Some(sample) = sample {
                 self.set_sample(bank, sample);
@@ -202,12 +213,52 @@ impl SamplerBankUi {
             }
         });
 
-        let meta = &self.slots[self.active_bank];
+        let bank = self.active_bank;
+        let meta = &self.slots[bank];
         ui.monospace(format!(
             "B{}: {} ({} fr @ {} Hz)",
-            self.active_bank, meta.label, meta.frames, meta.sample_rate
+            bank, meta.label, meta.frames, meta.sample_rate
         ));
 
+        let before = self.regions[bank];
+        let region = &mut self.regions[bank];
+        ui.horizontal_wrapped(|ui| {
+            let mut start = region.trim_start * 100.0;
+            let mut end = region.trim_end * 100.0;
+            ui.label("Start");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut start)
+                        .range(0.0..=100.0)
+                        .speed(0.25)
+                        .suffix("%"),
+                )
+                .changed()
+            {
+                region.trim_start = start / 100.0;
+            }
+            ui.label("End");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut end)
+                        .range(0.0..=100.0)
+                        .speed(0.25)
+                        .suffix("%"),
+                )
+                .changed()
+            {
+                region.trim_end = end / 100.0;
+            }
+            ui.checkbox(&mut region.loop_enabled, "Sustain Loop")
+                .on_hover_text("Repeat the trimmed region while the lane gate is high");
+        });
+        if before != *region {
+            actions.push(BankAction::SetRegion {
+                bank,
+                region: *region,
+            });
+        }
+        let trim = region.frames(meta.frames);
         egui::Frame::canvas(ui.style()).show(ui, |ui| {
             let (resp, painter) =
                 ui.allocate_painter(egui::vec2(340.0, 38.0), egui::Sense::hover());
@@ -215,11 +266,30 @@ impl SamplerBankUi {
             let mid_y = rect.center().y;
             let half_h = rect.height() * 0.44;
             let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(95, 195, 250));
+            let start_x = rect.left() + trim.start as f32 / meta.frames as f32 * rect.width();
+            let end_x = rect.left() + trim.end as f32 / meta.frames as f32 * rect.width();
 
             for (i, &pk) in meta.peaks.iter().enumerate() {
                 let x = rect.left() + (i as f32 + 0.5) * (rect.width() / 64.0);
                 let dy = (pk * half_h).max(1.0);
-                painter.line_segment([egui::pos2(x, mid_y - dy), egui::pos2(x, mid_y + dy)], stroke);
+                let color = if x >= start_x && x < end_x {
+                    stroke.color
+                } else {
+                    stroke.color.gamma_multiply(0.3)
+                };
+                painter.line_segment(
+                    [egui::pos2(x, mid_y - dy), egui::pos2(x, mid_y + dy)],
+                    egui::Stroke::new(stroke.width, color),
+                );
+            }
+            for (x, color) in [
+                (start_x, egui::Color32::LIGHT_GREEN),
+                (end_x, egui::Color32::LIGHT_RED),
+            ] {
+                painter.line_segment(
+                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                    egui::Stroke::new(1.0_f32, color),
+                );
             }
         });
 

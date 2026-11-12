@@ -6,7 +6,10 @@ use leviathan_core::{
     AutomationRow, CvFrame, EngineConfig, LaunchTarget, NoteCell, Pattern, PatternChain,
     SongPlayer, SongStatus, SoundLock, NUM_LANES, ROWS_PER_PATTERN,
 };
-use leviathan_dsp::{sampler::SampleBank, MasterPeaks, SynthRack};
+use leviathan_dsp::{
+    sampler::{SampleBank, SampleRegion},
+    LaneChannel, MasterPeaks, SynthRack,
+};
 
 use crate::midi::{MidiEvent, MidiKey, MidiReceiver, MidiTarget};
 use crate::project::{Project, PATTERN_BANK_CAPACITY};
@@ -20,6 +23,7 @@ pub enum AudioCommand {
     SetBpm(f64),
     SetMasterSend(f32),
     SetLaneAudibleMask(u8),
+    SetLaneChannels([LaneChannel; NUM_LANES]),
     Reset,
     Launch(LaunchTarget),
     SetChain(PatternChain),
@@ -47,6 +51,10 @@ pub enum AudioCommand {
     ResetSampleBank {
         bank: usize,
     },
+    SetSampleRegion {
+        bank: usize,
+        region: SampleRegion,
+    },
     SetMidiTarget(MidiTarget),
 }
 
@@ -73,6 +81,7 @@ pub struct AudioProject {
     bpm: f64,
     master_send: f32,
     audible_mask: u8,
+    lane_channels: [LaneChannel; NUM_LANES],
     patterns: Vec<Pattern>,
     selected_pattern: usize,
     chain: PatternChain,
@@ -86,6 +95,7 @@ impl AudioProject {
             bpm: project.bpm,
             master_send: project.master_send,
             audible_mask: project.lane_mix.audible_mask(),
+            lane_channels: project.lane_mix.dsp_channels(),
             patterns: project.patterns.clone(),
             selected_pattern: project.selected_pattern,
             chain: project.chain,
@@ -207,6 +217,7 @@ struct RtAudioWorker {
     cmd_rx: rtrb::Consumer<AudioCommand>,
     tel_tx: rtrb::Producer<AudioTelemetry>,
     tel_divider: u32,
+    last_reported_gates: [f32; NUM_LANES],
     generation: u64,
     play_request: u64,
     midi_events: Option<MidiReceiver>,
@@ -237,6 +248,7 @@ impl RtAudioWorker {
             cmd_rx,
             tel_tx,
             tel_divider: 0,
+            last_reported_gates: [0.0; NUM_LANES],
             generation: 0,
             play_request: 0,
             midi_events,
@@ -254,6 +266,7 @@ impl RtAudioWorker {
             match command {
                 AudioCommand::SetMasterSend(send) => self.synth.set_master_send(send),
                 AudioCommand::SetLaneAudibleMask(mask) => self.synth.set_lane_audible_mask(mask),
+                AudioCommand::SetLaneChannels(channels) => self.synth.set_lane_channels(channels),
                 AudioCommand::SetCell {
                     pattern,
                     lane,
@@ -286,6 +299,7 @@ impl RtAudioWorker {
                     self.pattern_count = project.patterns.len().min(self.patterns.len());
                     self.synth.sample_bank.clone_from(&project.sample_bank);
                     self.synth.set_lane_audible_mask(project.audible_mask);
+                    self.synth.set_lane_channels(project.lane_channels);
                     self.synth.reset_voices();
                     self.synth.reset_master(project.master_send);
                     self.generation = project.generation;
@@ -306,6 +320,9 @@ impl RtAudioWorker {
                 }
                 AudioCommand::ResetSampleBank { bank } => {
                     self.synth.sample_bank.reset_rom_bank(bank)
+                }
+                AudioCommand::SetSampleRegion { bank, region } => {
+                    self.synth.sample_bank.set_region(bank, region);
                 }
                 AudioCommand::SetPlaying { request, .. } => self.play_request = request,
                 AudioCommand::SetMidiTarget(target) => self.midi_target = target,
@@ -379,6 +396,7 @@ impl RtAudioWorker {
             // A held note keeps its own gate and attack through sequence launches.
             // After release, preserve its tail until the next sequenced gate.
             lanes &= !bit;
+            cv.retrigger_mask &= !bit;
             if attack {
                 lanes |= bit;
             }
@@ -411,7 +429,11 @@ impl RtAudioWorker {
             self.synth.render_stereo(&cv)
         };
         self.tel_divider = self.tel_divider.wrapping_add(1);
-        if retrigger || (self.tel_divider & 255) == 0 {
+        if retrigger
+            || cv.retrigger_mask != 0
+            || cv.gate_v != self.last_reported_gates
+            || (self.tel_divider & 255) == 0
+        {
             let telemetry = AudioTelemetry {
                 generation: self.generation,
                 cv,
@@ -422,6 +444,7 @@ impl RtAudioWorker {
             };
             // Carry the interval's peaks forward if the UI hasn't drained its ring yet.
             if self.tel_tx.push(telemetry).is_ok() {
+                self.last_reported_gates = cv.gate_v;
                 self.synth.clear_master_peaks();
             }
         }
@@ -534,9 +557,119 @@ pub fn try_start_audio(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::export::{ExportJob, ExportRequest, ExportSettings};
     use crate::midi::MidiControls;
-    use crate::wav::{sample_peaks, DecodedWav};
+    use crate::wav::{sample_peaks, DecodedWav, WavEncoding};
     use leviathan_core::PlaybackRate;
+
+    #[test]
+    fn wav_master_matches_the_live_mix_and_stems_include_the_lane_echo() {
+        let (tx, rx) = rtrb::RingBuffer::new(8);
+        let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(32);
+        let mut audio = AudioControl::new(tx);
+        let mut worker = RtAudioWorker::new(Pattern::default(), 48_000.0, rx, tel_tx, None);
+        let mut pattern = Pattern {
+            length: 1,
+            rate: PlaybackRate::EightX,
+            ..Pattern::default()
+        };
+        pattern.lanes[4][0] = NoteCell {
+            active: true,
+            gate_fraction: 0.8,
+            retrig: 3,
+            lock: SoundLock {
+                mask: 1 << 3,
+                ..SoundLock::default()
+            },
+            ..NoteCell::default()
+        };
+        let mut lane_mix = crate::lane_mix::LaneMix::default();
+        lane_mix.channels[4].0 = LaneChannel {
+            level: 1.0,
+            pan: -1.0,
+            delay_send: 0.75,
+        };
+        let mut sample_regions = [SampleRegion::default(); leviathan_dsp::sampler::NUM_BANKS];
+        sample_regions[0] = SampleRegion {
+            trim_start: 0.05,
+            trim_end: 0.2,
+            loop_enabled: true,
+        };
+        let project = Project {
+            bpm: 120.0,
+            master_send: 0.0,
+            lane_mix,
+            patterns: vec![pattern],
+            selected_pattern: 0,
+            chain: PatternChain::default(),
+            samples: Default::default(),
+            sample_regions,
+            custom_shader: None,
+        };
+        audio.send(AudioCommand::ReplaceProject(Arc::new(
+            AudioProject::prepare(&project, 1),
+        )));
+        audio.send(AudioCommand::SetPlaying {
+            playing: true,
+            request: 1,
+        });
+        worker.drain_commands();
+        assert_eq!(worker.synth.sample_bank.regions[0], sample_regions[0]);
+
+        let destination =
+            std::env::temp_dir().join(format!("leviathan-mixer-parity-{}", std::process::id()));
+        let request = ExportRequest {
+            destination: destination.clone(),
+            settings: ExportSettings {
+                encoding: WavEncoding::Float32,
+                stems: true,
+                tail_seconds: 0.04,
+                ..ExportSettings::default()
+            },
+        };
+        ExportJob::start(project, false, request)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let master = std::fs::read(destination.join("master.wav")).unwrap();
+        let stem = std::fs::read(destination.join("4-smpl.wav")).unwrap();
+        std::fs::remove_dir_all(destination).unwrap();
+        let frames = 750 + 1920;
+        assert_eq!(stem.len(), master.len());
+        let data_offset = master.len() - frames * 8;
+        for bytes in [&master, &stem] {
+            assert_eq!(&bytes[data_offset - 8..data_offset - 4], b"data");
+            let data_len = u32::from_le_bytes(bytes[data_offset - 4..data_offset].try_into().unwrap());
+            assert_eq!(data_len as usize, frames * 8);
+        }
+        let read_channel = |bytes: &[u8], frame: usize, channel: usize| {
+            let offset = data_offset + 8 * frame + 4 * channel;
+            f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+        };
+        let mut dry_energy = 0.0;
+        let mut wet_energy = 0.0;
+        for frame in 0..frames {
+            if frame == 750 {
+                audio.send(AudioCommand::SetPlaying {
+                    playing: false,
+                    request: 2,
+                });
+                worker.drain_commands();
+            }
+            let (left, right) = worker.next_stereo();
+            assert_eq!(read_channel(&master, frame, 0), left);
+            assert_eq!(read_channel(&master, frame, 1), right);
+            let stem_right = read_channel(&stem, frame, 1);
+            if frame < 1008 {
+                assert_eq!(right, 0.0);
+                assert_eq!(stem_right, 0.0);
+                dry_energy += read_channel(&stem, frame, 0).abs();
+            } else {
+                wet_energy += stem_right.abs();
+            }
+        }
+        assert!(dry_energy > 0.1 && wet_energy > 0.1);
+    }
 
     #[test]
     fn full_command_ring_preserves_order_and_snapshot_ownership() {
@@ -610,6 +743,7 @@ mod tests {
             selected_pattern: 1,
             chain,
             samples,
+            sample_regions: Default::default(),
             custom_shader: None,
         };
         audio.send(AudioCommand::SetPlaying {
@@ -666,6 +800,7 @@ mod tests {
             selected_pattern: PATTERN_BANK_CAPACITY + 2,
             chain: PatternChain::default(),
             samples: core::array::from_fn(|_| None),
+            sample_regions: Default::default(),
             custom_shader: None,
         };
         audio.send(AudioCommand::ReplaceProject(Arc::new(

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use leviathan_core::{EngineConfig, LaunchTarget, SongPlayer, NUM_LANES};
-use leviathan_dsp::SynthRack;
+use leviathan_dsp::{StereoDelay, SynthRack};
 
 use crate::project::Project;
 use crate::wav::{StereoWav, WavEncoding};
@@ -192,10 +192,20 @@ fn render(
     let mut rack = SynthRack::new(plan.settings.sample_rate as f32);
     rack.sample_bank = project.sample_bank();
     rack.set_lane_audible_mask(project.lane_mix.audible_mask());
+    rack.set_lane_channels(project.lane_mix.dsp_channels());
     rack.reset_voices();
     rack.reset_master(project.master_send);
 
     let mut stems = [[0.0; 2]; NUM_LANES];
+    let mut stem_delays: Option<Box<[StereoDelay; NUM_LANES]>> = plan.settings.stems.then(|| {
+        std::iter::repeat_with(|| StereoDelay::new(plan.settings.sample_rate as f32))
+            .take(NUM_LANES)
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+            .try_into()
+            .ok()
+            .unwrap()
+    });
     for frame in 0..plan.frames {
         if frame == plan.music_frames {
             player.evaluator.playing = false;
@@ -204,8 +214,8 @@ fn render(
         if retrigger {
             rack.retrigger_gates();
         }
-        let (left, right) = if plan.settings.stems {
-            rack.render_stereo_with_stems(&cv, &mut stems)
+        let (left, right) = if let Some(delays) = &mut stem_delays {
+            rack.render_stereo_with_wet_stems(&cv, &mut stems, delays)
         } else {
             rack.render_stereo(&cv)
         };
@@ -346,6 +356,7 @@ mod tests {
             selected_pattern: 0,
             chain,
             samples: core::array::from_fn(|_| None),
+            sample_regions: Default::default(),
             custom_shader: None,
         }
     }
@@ -395,6 +406,7 @@ mod tests {
         snapshot.lane_mix = LaneMix {
             mute_mask: 1 << 1,
             solo_mask: (1 << 0) | (1 << 1),
+            ..LaneMix::default()
         };
         let settings = ExportSettings {
             source: ExportSource::Chain,
@@ -431,6 +443,7 @@ mod tests {
         snapshot.lane_mix = LaneMix {
             mute_mask: 1 << 1,
             solo_mask: (1 << 0) | (1 << 1),
+            ..LaneMix::default()
         };
         let file = temp.path.join("mix.wav");
         fs::write(&file, b"previous bounce").unwrap();

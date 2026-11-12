@@ -34,10 +34,12 @@ Leviathan uses a strict hexagonal ("ports and adapters") layout so external GPU,
 
 ## Projects, Pattern Chains & Offline WAV Export
 
-- **Save** (`Ctrl/Cmd+S`) stores the pattern bank, chain, tempo, master delay send, lane mute/solo state, sound locks, visual automation, custom WGSL shader, and decoded WAV banks in a single `.leviathan.json` file. **Save As** (`Ctrl/Cmd+Shift+S`) chooses a new path, and **Open** (`Ctrl/Cmd+O`) restores the session with playback paused.
+- **Save** (`Ctrl/Cmd+S`) stores the pattern bank, chain, tempo, mixer, sound locks, visual automation, custom WGSL shader, and sampler banks with their trim and loop settings in a single `.leviathan.json` file. **Save As** (`Ctrl/Cmd+Shift+S`) chooses a new path, and **Open** (`Ctrl/Cmd+O`) restores the session with playback paused.
 - **New Pattern** and **Clone** build a bank of up to 16 patterns with independent playback rate multipliers (`1/4x`..`4x`). **Add Pattern** appends patterns to a 64-entry song chain, and **Cue Chain** launches the chain on the next bar.
-- **Delay send** feeds the stereo ping-pong master delay, DC blocker, and soft-knee limiter with live L/R peak meters. Use **M** and **S** in each lane header (or keyboard shortcuts) for click-free per-lane mute and solo.
-- **Export WAV...** bounces the selected pattern or full song chain on a background worker thread (with configurable loop count, tail length, `16-bit PCM` or `32-bit IEEE float` encoding, and optional aligned per-lane stem files).
+- **Swing** delays odd rows from 50% to 75% of each two-row pair while preserving pattern length. In the step inspector, **Nudge** moves a hit by up to 24 ticks either way (48 ticks per row), and **Retrig** divides the step into up to four evenly spaced hits. Nudges stay within the pattern, with later hits taking over overlapping notes on the same lane.
+- Open **Lane Mixer** in the side panel for each lane's level, constant-power pan, and delay send. The master delay send raises all lanes' send together. **M** and **S** in the lane headers control mute and solo.
+- In **VarSampler Banks**, **Start** and **End** mark the active sample region. **Sustain Loop** repeats that region while the lane gate is high and finishes the current pass on release. With sustain looping off, the step's loop and scan locks work within the trim.
+- **Export WAV...** bounces the selected pattern or full chain with the same timing, mixer, and sampler settings as live playback. Optional aligned stereo stems include each lane's delay contribution before master DC blocking and limiting.
 
 ## Custom WGSL Shaders & SoundLink UDP
 

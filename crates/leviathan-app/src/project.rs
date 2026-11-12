@@ -4,8 +4,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use leviathan_core::{Pattern, PatternChain, MAX_CHAIN_ENTRIES, ROWS_PER_PATTERN};
-use leviathan_dsp::sampler::{SampleBank, MAX_WAVE_LEN, NUM_BANKS};
+use leviathan_core::{
+    Pattern, PatternChain, MAX_CHAIN_ENTRIES, MAX_NUDGE, MAX_RETRIG, MAX_SWING, ROWS_PER_PATTERN,
+};
+use leviathan_dsp::sampler::{SampleBank, SampleRegion, MAX_WAVE_LEN, NUM_BANKS};
 use serde::{Deserialize, Serialize};
 
 use crate::lane_mix::LaneMix;
@@ -27,6 +29,7 @@ pub struct Project {
     pub selected_pattern: usize,
     pub chain: PatternChain,
     pub samples: [Option<DecodedWav>; NUM_BANKS],
+    pub sample_regions: [SampleRegion; NUM_BANKS],
     pub custom_shader: Option<CustomShader>,
 }
 
@@ -37,6 +40,7 @@ impl Project {
             if let Some(sample) = sample {
                 bank.load_pcm_with_rate(index, &sample.samples, sample.c4_rate_hz);
             }
+            bank.set_region(index, self.sample_regions[index]);
         }
         bank
     }
@@ -55,8 +59,22 @@ struct ProjectFile {
     chain: Vec<u8>,
     sample_banks: [Option<SampleFile>; NUM_BANKS],
     #[serde(default)]
+    sample_regions: [StoredSampleRegion; NUM_BANKS],
+    #[serde(default)]
     custom_shader: Option<CustomShader>,
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "SampleRegion")]
+struct SampleRegionDef {
+    trim_start: f32,
+    trim_end: f32,
+    loop_enabled: bool,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(transparent)]
+struct StoredSampleRegion(#[serde(with = "SampleRegionDef")] SampleRegion);
 
 #[derive(Serialize, Deserialize)]
 struct SampleFile {
@@ -113,7 +131,7 @@ impl ProjectFile {
             return Err("Master delay send must be between 0 and 1".to_string());
         }
         if !self.lane_mix.is_valid() {
-            return Err("Invalid lane mute or solo mask".to_string());
+            return Err("Invalid lane mute or solo mask or mixer settings".to_string());
         }
         if !(1..=PATTERN_BANK_CAPACITY).contains(&self.patterns.len())
             || self.selected_pattern >= self.patterns.len()
@@ -136,6 +154,12 @@ impl ProjectFile {
             chain.push(id);
         }
         let mut samples = core::array::from_fn(|_| None);
+        let sample_regions = self.sample_regions.map(|region| region.0);
+        for (bank, region) in sample_regions.iter().enumerate() {
+            if !region.is_valid() {
+                return Err(format!("Bank B{bank}: invalid sample trim"));
+            }
+        }
         for (bank, sample) in self.sample_banks.into_iter().enumerate() {
             samples[bank] = sample
                 .map(SampleFile::decode)
@@ -156,7 +180,8 @@ impl ProjectFile {
             selected_pattern: self.selected_pattern,
             chain,
             samples,
-        custom_shader: self.custom_shader,
+            sample_regions,
+            custom_shader: self.custom_shader,
         })
     }
 }
@@ -165,6 +190,9 @@ fn validate_pattern(pattern: &Pattern) -> Result<(), &'static str> {
     if !(1..=ROWS_PER_PATTERN).contains(&pattern.length) {
         return Err("Invalid pattern length");
     }
+    if !(0.5..=MAX_SWING).contains(&pattern.swing) {
+        return Err("Pattern swing must be between 50% and 75%");
+    }
     for cell in pattern.lanes.iter().flatten() {
         if cell.midi > 127
             || cell.velocity > 127
@@ -172,6 +200,11 @@ fn validate_pattern(pattern: &Pattern) -> Result<(), &'static str> {
             || !(0.0..=1.0).contains(&cell.gate_fraction)
         {
             return Err("Invalid note cell");
+        }
+        if !(-MAX_NUDGE..=MAX_NUDGE).contains(&cell.micro_offset)
+            || !(1..=MAX_RETRIG).contains(&cell.retrig)
+        {
+            return Err("Invalid step nudge or retrigger count");
         }
         if !(-1..=6).contains(&cell.lock.machine)
             || cell.lock.mask > 0xff
@@ -215,6 +248,7 @@ pub fn save(path: &Path, project: Project) -> Result<(), String> {
         sample_banks: core::array::from_fn(|bank| {
             project.samples[bank].as_ref().map(SampleFile::from)
         }),
+        sample_regions: project.sample_regions.map(StoredSampleRegion),
         custom_shader: project.custom_shader,
     };
     let mut bytes = serde_json::to_vec(&project).map_err(|error| error.to_string())?;
@@ -261,11 +295,14 @@ mod tests {
             std::env::temp_dir().join(format!("leviathan-round-trip-{}.json", std::process::id()));
         let mut patterns = [Pattern::default(), Pattern::default()];
         patterns[1].rate = PlaybackRate::Half;
+        patterns[1].swing = 0.625;
         patterns[1].lanes[4][63] = NoteCell {
             active: true,
             air: true,
             fill: FillCondition::WhenNoFill,
             probability: 37,
+            micro_offset: -9,
+            retrig: 3,
             lock: SoundLock {
                 machine: 4,
                 mask: 0x11,
@@ -293,6 +330,13 @@ mod tests {
             peaks: sample_peaks(&pcm),
             samples: Arc::clone(&pcm),
         });
+        let mut sample_regions = [SampleRegion::default(); NUM_BANKS];
+        sample_regions[0].trim_end = 0.125;
+        sample_regions[2] = SampleRegion {
+            trim_start: 0.25,
+            trim_end: 0.75,
+            loop_enabled: true,
+        };
         let snapshot = |bpm, master_send, selected_pattern, lane_mix| Project {
             bpm,
             master_send,
@@ -301,25 +345,33 @@ mod tests {
             chain,
             patterns: patterns.to_vec(),
             samples: samples.clone(),
+            sample_regions,
             custom_shader: None,
         };
         save(&path, snapshot(120.0, 0.0, 0, LaneMix::default())).unwrap();
         let bpm = f64::from_bits(120.0_f64.to_bits() + 1);
         let send = 0.37_f32;
-        let mix = LaneMix {
+        let mut mix = LaneMix {
             mute_mask: 0b10,
             solo_mask: 0b1010,
+            ..LaneMix::default()
         };
+        mix.channels[4].0.level = 1.25;
+        mix.channels[4].0.pan = -0.5;
+        mix.channels[4].0.delay_send = 0.75;
         save(&path, snapshot(bpm, send, 1, mix)).unwrap();
         let project = load(&path).unwrap();
         fs::remove_file(path).unwrap();
         assert_eq!(project.bpm.to_bits(), bpm.to_bits());
         assert_eq!(project.master_send.to_bits(), send.to_bits());
         assert_eq!(project.lane_mix, mix);
+        assert_eq!(project.sample_regions, sample_regions);
+        assert_eq!(project.sample_bank().regions, sample_regions);
         assert_eq!(project.selected_pattern, 1);
         assert_eq!(project.chain, chain);
         for (original, loaded) in patterns.iter().zip(&project.patterns) {
             assert_eq!(original.rate, loaded.rate);
+            assert_eq!(original.swing, loaded.swing);
             assert_eq!(original.lanes, loaded.lanes);
             assert_eq!(original.automation, loaded.automation);
         }
@@ -347,7 +399,8 @@ mod tests {
             selected_pattern: 0,
             chain: vec![1],
             sample_banks: core::array::from_fn(|_| None),
-        custom_shader: None,
+            sample_regions: Default::default(),
+            custom_shader: None,
         };
         let mut json = serde_json::to_value(&project).unwrap();
         assert!(project_error(&json).contains("version"));
@@ -374,14 +427,15 @@ mod tests {
             selected_pattern: 0,
             chain: vec![],
             sample_banks: core::array::from_fn(|_| None),
-        custom_shader: None,
+            sample_regions: Default::default(),
+            custom_shader: None,
         };
         let json = serde_json::to_value(&project).unwrap();
         assert!(project_error(&json).contains("Invalid sound lock"));
     }
 
     #[test]
-    fn older_projects_default_to_dry_and_unmuted() {
+    fn older_projects_default_to_straight_timing_and_the_original_mix() {
         let project = ProjectFile {
             version: PROJECT_VERSION,
             bpm: 120.0,
@@ -389,22 +443,65 @@ mod tests {
             lane_mix: LaneMix {
                 mute_mask: 1,
                 solo_mask: 2,
+                ..LaneMix::default()
             },
             patterns: vec![Pattern::default()],
             selected_pattern: 0,
             chain: vec![],
             sample_banks: core::array::from_fn(|_| None),
-        custom_shader: None,
+            sample_regions: Default::default(),
+            custom_shader: None,
         };
         let mut json = serde_json::to_value(project).unwrap();
         let fields = json.as_object_mut().unwrap();
-        for field in ["master_send", "mute_mask", "solo_mask"] {
+        for field in [
+            "master_send",
+            "mute_mask",
+            "solo_mask",
+            "channels",
+            "sample_regions",
+        ] {
             assert!(fields.remove(field).is_some());
+        }
+        let pattern = json["patterns"][0].as_object_mut().unwrap();
+        pattern.remove("swing");
+        for lane in pattern.get_mut("lanes").unwrap().as_array_mut().unwrap() {
+            for cell in lane.as_array_mut().unwrap() {
+                let cell = cell.as_object_mut().unwrap();
+                cell.remove("micro_offset");
+                cell.remove("retrig");
+            }
         }
         let old: ProjectFile = serde_json::from_value(json.clone()).unwrap();
         let old = old.into_project().unwrap();
         assert_eq!(old.master_send, 0.0);
         assert_eq!(old.lane_mix, LaneMix::default());
+        assert_eq!(old.sample_regions, [SampleRegion::default(); NUM_BANKS]);
+        assert_eq!(old.patterns[0].swing, 0.5);
+        assert_eq!(old.patterns[0].lanes[0][0], NoteCell::default());
+        json["patterns"][0]["swing"] = serde_json::json!(0.8);
+        assert!(project_error(&json).contains("swing"));
+        json["patterns"][0]["swing"] = serde_json::json!(0.5);
+        json["patterns"][0]["lanes"][0][0]["micro_offset"] = serde_json::json!(-25);
+        assert!(project_error(&json).contains("nudge"));
+        json["patterns"][0]["lanes"][0][0]["micro_offset"] = serde_json::json!(0);
+        json["patterns"][0]["lanes"][0][0]["retrig"] = serde_json::json!(0);
+        assert!(project_error(&json).contains("retrigger count"));
+        json["patterns"][0]["lanes"][0][0]["retrig"] = serde_json::json!(1);
+        json["channels"] = serde_json::to_value(LaneMix::default().channels).unwrap();
+        for (field, value) in [("level", 1.251), ("pan", -1.01), ("delay_send", 1.01)] {
+            let mut invalid = json.clone();
+            invalid["channels"][0][field] = serde_json::json!(value);
+            assert!(project_error(&invalid).contains("mixer settings"));
+        }
+        json["sample_regions"] = serde_json::json!([
+            {"trim_start": -0.1, "trim_end": 1.0, "loop_enabled": true},
+            {"trim_start": 0.0, "trim_end": 1.0, "loop_enabled": false},
+            {"trim_start": 0.0, "trim_end": 1.0, "loop_enabled": false},
+            {"trim_start": 0.0, "trim_end": 1.0, "loop_enabled": false}
+        ]);
+        assert!(project_error(&json).contains("invalid sample trim"));
+        json.as_object_mut().unwrap().remove("sample_regions");
         json["solo_mask"] = serde_json::json!(0x80);
         assert!(project_error(&json).contains("mute or solo mask"));
         json["solo_mask"] = serde_json::json!(0);
@@ -434,6 +531,7 @@ mod tests {
                 selected_pattern: 0,
                 chain,
                 samples,
+                sample_regions: Default::default(),
                 custom_shader: Some(shader.clone()),
                    },
     )
