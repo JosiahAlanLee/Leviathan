@@ -319,7 +319,7 @@ impl Default for VoiceState {
             sampler: VarClockSamplerVoice::default(),
         }
     }
-
+}
 impl VoiceState {
     pub fn reset_synthesis(&mut self) {
         self.phase = 0.0;
@@ -331,7 +331,6 @@ impl VoiceState {
         self.fm = FourOpFmVoice::default();
         self.sampler = VarClockSamplerVoice::default();
     }
-}
 }
 
 pub struct SynthRack {
@@ -360,7 +359,7 @@ impl SynthRack {
             counter: ByteBusCounter::default(),
             lane_patches: DEFAULT_LANE_PATCHES,
         }
-
+    }
     pub fn lane_patches(&self) -> &[LanePatch; NUM_LANES] {
         &self.lane_patches
     }
@@ -383,7 +382,7 @@ impl SynthRack {
         for (lane, patch) in patches.into_iter().enumerate() {
             self.set_lane_patch(lane, patch);
         }
-    }    }
+    }  
 
     fn fresh_voices(
         audible_mask: u8,
