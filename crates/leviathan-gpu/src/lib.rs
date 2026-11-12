@@ -780,7 +780,8 @@ mod tests {
         for n in 0..2_048 {
             let phase = core::f32::consts::TAU * 55.0 * (n as f32 / sr);
             let s = 0.8 * phase.sin();
-            low_tap.push_stereo(s, -s);
+            // Unequal in-phase channels exercise the stereo waves and mono bands.
+            low_tap.push_stereo(s, 0.5 * s);
         }
         let low_snap = low_tap.snapshot();
         assert!(

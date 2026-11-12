@@ -302,10 +302,10 @@ impl LeviathanApp {
         }
     }
 
-    fn read_midi(&mut self, ctx: &egui::Context) {
+    fn read_midi(&mut self, ctx: &egui::Context, modal_open: bool) {
         let (_, count) = self.midi.events.begin_batch();
         let record = self.midi.record_armed
-            && !self.project_ui.dialog_open()
+            && !modal_open
             && ctx.memory(|memory| memory.top_modal_layer().is_none());
         for _ in 0..count {
             match self.midi.events.pop() {
@@ -602,7 +602,7 @@ impl eframe::App for LeviathanApp {
             }
         }
 
-        self.read_midi(ctx);
+        self.read_midi(ctx, modal_open);
         self.sync_midi_target();
         let (hovering_wav, mut bank_actions) = self.sampler_ui.poll_drag_and_drop(ctx);
         let hovering_wgsl = self.viewport.poll_shader_drop(ctx);
