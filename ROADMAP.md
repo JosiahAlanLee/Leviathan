@@ -232,7 +232,7 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
 - **Acceptance** — Verify that the two frame readers travel in opposite directions in Bidir mode and preserve phase accuracy over 128,000 samples. Measure the resonant and bass-cut responses. Check wrap and mode transitions for discontinuities, keep per-lane state within 96 bytes and `SynthRack` under 262,144 bytes, and verify existing OTIS project and WAV behavior.
 - **Behavioral references** — [FIZMO User’s Guide](https://www.vintagesynth.com/sites/default/files/2017-05/FIZMO_Users_Guide.pdf) and [ASR-10 Musician’s Manual](https://ensoniq.manymanuals.com/digital-pianos/asr-10/instruction-manual-11191/208).
 
-## Wave 6 (T25–T26 — Converter Profiles and Formant FM)
+## Wave 6 (T25–T27 — Converter Profiles, Formant FM, and Triple VAST)
 
 ### `T25` – Converter Word Formats and DAC Coloration
 
@@ -252,3 +252,14 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
 - **Macros** — `Decay` 0.45, `FmIndex` 0.38, `WaveRcm` 0.25, `FormantHz` 0.42, `SkirtUnv` 0.30, `AlgRatio` 0.35, `FilterCut` 0.68, `ResoDac` 0.32.
 - **Acceptance** — Verify voiced and unvoiced responses, vowel centers over multiple octaves, audible wavetable modulation, bounded feedback, and smooth converter transitions. Save and reload a project using the lane patch and ID-15 step locks, verify audible WAV stems, and compare live and offline master samples. Keep voice state within 128 bytes and the rack under 262,144 bytes.
 - **Behavioral references** — [SY77 operating manual](https://chrisarndt.de/files/yamaha/sy77/SY77%20-%20Operating%20Manual%20-%20Complete.pdf), [SY77 service manual](https://manualzz.com/doc/24299236/yamaha-sy77-music-synthesizer-service-manual), and [FS1R owner's manual](https://usa.yamaha.com/files/download/other_assets/5/333335/FS1RE1.PDF).
+
+### `T27` – K26 Triple VAST
+
+- **Status** — `IMPLEMENTED` (`67d54c8`). Select `K26` in Lane Patch or Step Lock. The saved slug is `k26` and the numeric lock ID is `16`. The original VAST voice remains at ID `9`.
+- **Source and prefilter** — `SourceKey` selects PolyBLEP detuned saws, windowed hard sync, a nine-partial drawbar mix, or the existing generated OTIS wavetables. Within each zone the macro adjusts timbre. `PreTilt` moves from low-pass through dry to band-pass before the nonlinear stage. A pad gives the shaper headroom.
+- **Nonlinear block** — `TripleAlg` selects sinusoidal shaping, signed 16-bit wrap, distortion with high-frequency emphasis, or two-pole all-pass and ring modulation. Position within a zone sets drive. Block changes crossfade with a 5 ms time constant and preserve the outgoing block's drive. A DC blocker follows the shaper.
+- **Postfilter** — Two low-pass stages shape the post-shaper spectrum. `PostReso` adds resonance below center. Above center it blends in two series all-pass sections for phaser notches.
+- **Recursive FUNs** — `FunEq` selects a logistic map, feedback sine, quantizer, leaky diode, sample-and-hold, or slew limiter. FUN1 feeds FUN2. The two evaluate at 500 Hz from the note envelope and LFO signals 135° apart. These equations and the fixed three-stage routing are Leviathan voicings inspired by the K2600.
+- **Macros** — `Decay` 0.48, `SourceKey` 0.25, `PreTilt` 0.52, `TripleAlg` 0.30, `FunEq` 0.35, `FunDepth` 0.46, `PostCut` 0.64, `PostReso` 0.36.
+- **Acceptance** — Exercise all sixteen source and shaper combinations, measure the prefilter and phaser responses, check held-note block transitions and bounded FUN recursion, and verify project round trips and live/WAV parity. Voice state fits in 128 bytes and `SynthRack` stays under 262,144 bytes. The voice shares the existing OTIS tables.
+- **Behavioral references** — [K2600 v2 Musician’s Guide supplement](https://www.manualslib.com/manual/399279/Kurzweil-K2600-V2-0-Musicians-Guide-Supplement-Rev-A.html?page=9), [K2600 Musician’s Guide chapter on FUNs](https://www.manualslib.com/manual/399273/Kurzweil-K2600-Musicians-Guide-Rev-A-Part-Number-910330-Chap-17.html), and [K2661 Musician’s Guide](https://kurzweil.com/wp-content/uploads/2019/10/MG_K2661.pdf).
