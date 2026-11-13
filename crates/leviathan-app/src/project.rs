@@ -9,7 +9,7 @@ use leviathan_core::{
     ROWS_PER_PATTERN, SOUND_PARAMS,
 };
 use leviathan_dsp::sampler::{SampleBank, SampleRegion, MAX_WAVE_LEN, NUM_BANKS};
-use leviathan_dsp::{default_lane_patches, LanePatch, MachineKind};
+use leviathan_dsp::{default_lane_patches, BenderParams, LanePatch, MachineKind};
 use serde::{Deserialize, Serialize};
 
 use crate::lane_mix::LaneMix;
@@ -26,6 +26,7 @@ pub struct CustomShader {
 pub struct Project {
     pub bpm: f64,
     pub master_send: f32,
+    pub bender_params: BenderParams,
     pub lane_mix: LaneMix,
     pub lane_patches: [LanePatch; NUM_LANES],
     pub patterns: Vec<Pattern>,
@@ -55,6 +56,8 @@ struct ProjectFile {
     bpm: f64,
     #[serde(default)]
     master_send: f32,
+    #[serde(default, with = "BenderParamsDef")]
+    bender_params: BenderParams,
     #[serde(flatten)]
     lane_mix: LaneMix,
     /// Per-lane instrument patches; absent in projects saved before `T15`.
@@ -68,6 +71,15 @@ struct ProjectFile {
     sample_regions: [StoredSampleRegion; NUM_BANKS],
     #[serde(default)]
     custom_shader: Option<CustomShader>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "BenderParams")]
+struct BenderParamsDef {
+    shift_norm: f32,
+    feedback: f32,
+    decay: f32,
+    freeze: bool,
 }
 
 /// On-disk form of a `LanePatch`: the machine is stored by its stable slug.
@@ -167,6 +179,9 @@ impl ProjectFile {
         if !(0.0..=1.0).contains(&self.master_send) {
             return Err("Master delay send must be between 0 and 1".to_string());
         }
+        if !self.bender_params.is_valid() {
+            return Err("BEND shift, feedback and decay must be between 0 and 1".to_string());
+        }
         if !self.lane_mix.is_valid() {
             return Err("Invalid lane mute or solo mask or mixer settings".to_string());
         }
@@ -218,6 +233,7 @@ impl ProjectFile {
         Ok(Project {
             bpm: self.bpm,
             master_send: self.master_send,
+            bender_params: self.bender_params,
             lane_mix: self.lane_mix,
             lane_patches,
             patterns: self.patterns,
@@ -285,6 +301,7 @@ pub fn save(path: &Path, project: Project) -> Result<(), String> {
         version: PROJECT_VERSION,
         bpm: project.bpm,
         master_send: project.master_send,
+        bender_params: project.bender_params,
         lane_mix: project.lane_mix,
         lane_patches: Some(core::array::from_fn(|lane| {
             StoredLanePatch::from(&project.lane_patches[lane])
@@ -340,7 +357,7 @@ mod tests {
     fn project_replaces_saved_file_and_round_trips_patterns_and_embedded_samples() {
         let path =
             std::env::temp_dir().join(format!("leviathan-round-trip-{}.json", std::process::id()));
-        let mut patterns = [Pattern::default(), Pattern::default()];
+        let mut patterns: Vec<_> = std::iter::repeat_with(Pattern::default).take(2).collect();
         patterns[1].rate = PlaybackRate::Half;
         patterns[1].swing = 0.625;
         patterns[1].lanes[4][63] = NoteCell {
@@ -362,7 +379,9 @@ mod tests {
             roll: -0.0,
             feedback: 0.42,
             byte_word: 0x98,
+            byte_override: false,
         };
+        patterns[1].automation[1].byte_override = true;
         let mut chain = PatternChain::default();
         for id in [0, 1, 1] {
             assert!(chain.push(id));
@@ -384,14 +403,21 @@ mod tests {
             trim_end: 0.75,
             loop_enabled: true,
         };
+        let bender_params = BenderParams {
+            shift_norm: 0.16,
+            feedback: 0.8,
+            decay: 0.7,
+            freeze: true,
+        };
         let snapshot = |bpm, master_send, selected_pattern, lane_mix| Project {
             bpm,
             master_send,
+            bender_params,
             lane_patches: default_lane_patches(),
             lane_mix,
             selected_pattern,
             chain,
-            patterns: patterns.to_vec(),
+            patterns: patterns.clone(),
             samples: samples.clone(),
             sample_regions,
             custom_shader: None,
@@ -407,16 +433,19 @@ mod tests {
         mix.channels[4].0.level = 1.25;
         mix.channels[4].0.pan = -0.5;
         mix.channels[4].0.delay_send = 0.75;
+        mix.channels[4].0.fx_send = 0.61;
         save(&path, snapshot(bpm, send, 1, mix)).unwrap();
         let project = load(&path).unwrap();
         fs::remove_file(path).unwrap();
         assert_eq!(project.bpm.to_bits(), bpm.to_bits());
         assert_eq!(project.master_send.to_bits(), send.to_bits());
+        assert_eq!(project.bender_params, bender_params);
         assert_eq!(project.lane_mix, mix);
         assert_eq!(project.sample_regions, sample_regions);
         assert_eq!(project.sample_bank().regions, sample_regions);
         assert_eq!(project.selected_pattern, 1);
         assert_eq!(project.chain, chain);
+        assert_eq!(project.patterns[1].automation[1].fixed_byte(), Some(0x00));
         for (original, loaded) in patterns.iter().zip(&project.patterns) {
             assert_eq!(original.rate, loaded.rate);
             assert_eq!(original.swing, loaded.swing);
@@ -442,6 +471,7 @@ mod tests {
             version: PROJECT_VERSION + 1,
             bpm: 120.0,
             master_send: 0.0,
+            bender_params: Default::default(),
             lane_patches: None,
             lane_mix: LaneMix::default(),
             patterns: vec![Pattern::default()],
@@ -471,6 +501,7 @@ mod tests {
             version: PROJECT_VERSION,
             bpm: 120.0,
             master_send: 0.0,
+            bender_params: Default::default(),
             lane_patches: None,
             lane_mix: LaneMix::default(),
             patterns: vec![pat],
@@ -491,13 +522,16 @@ mod tests {
         let engines = [
             MachineKind::CzPhaseDist,
             MachineKind::PolivoksSub,
-            MachineKind::VastFunSynth,
+            MachineKind::ByteBusR2r,
+            MachineKind::ElectroPerc,
+            MachineKind::WestCoastLpg,
+            MachineKind::OtisTranswave,
         ];
         let mut pattern = Pattern::default();
         let mut patches = default_lane_patches();
         for (lane, engine) in engines.into_iter().enumerate() {
             patches[lane] = LanePatch::for_machine(engine);
-            patches[lane].params[0] = (lane + 1) as f32 / 4.0;
+            patches[lane].params[0] = (lane + 1) as f32 / NUM_LANES as f32;
             pattern.lanes[lane][0].lock.machine = engines[(lane + 1) % engines.len()] as i16;
             pattern.lanes[lane][0].lock.mask = 1 << 3;
             pattern.lanes[lane][0].lock.values[3] = 0.75;
@@ -507,6 +541,7 @@ mod tests {
             Project {
                 bpm: 120.0,
                 master_send: 0.0,
+                bender_params: Default::default(),
                 lane_patches: patches,
                 lane_mix: LaneMix::default(),
                 patterns: vec![pattern.clone()],
@@ -518,6 +553,8 @@ mod tests {
             },
         )
         .unwrap();
+        let stored = fs::read_to_string(&path).unwrap();
+        assert!(stored.contains(r#""machine":"bbus""#));
         let project = load(&path).unwrap();
         fs::remove_file(&path).unwrap();
         assert_eq!(project.lane_patches, patches);
@@ -530,6 +567,7 @@ mod tests {
             version: PROJECT_VERSION,
             bpm: 120.0,
             master_send: 0.5,
+            bender_params: Default::default(),
             lane_patches: None,
             lane_mix: LaneMix {
                 mute_mask: 1,
@@ -547,12 +585,17 @@ mod tests {
         let fields = json.as_object_mut().unwrap();
         for field in [
             "master_send",
+            "bender_params",
             "mute_mask",
             "solo_mask",
             "channels",
             "sample_regions",
         ] {
             assert!(fields.remove(field).is_some());
+        }
+        json["patterns"][0]["automation"][1]["byte_word"] = serde_json::json!(0x70);
+        for row in json["patterns"][0]["automation"].as_array_mut().unwrap() {
+            row.as_object_mut().unwrap().remove("byte_override");
         }
         let pattern = json["patterns"][0].as_object_mut().unwrap();
         pattern.remove("swing");
@@ -566,10 +609,13 @@ mod tests {
         let old: ProjectFile = serde_json::from_value(json.clone()).unwrap();
         let old = old.into_project().unwrap();
         assert_eq!(old.master_send, 0.0);
+        assert_eq!(old.bender_params, BenderParams::default());
         assert_eq!(old.lane_mix, LaneMix::default());
         assert_eq!(old.sample_regions, [SampleRegion::default(); NUM_BANKS]);
         assert_eq!(old.patterns[0].swing, 0.5);
         assert_eq!(old.patterns[0].lanes[0][0], NoteCell::default());
+        assert_eq!(old.patterns[0].automation[0].fixed_byte(), None);
+        assert_eq!(old.patterns[0].automation[1].fixed_byte(), Some(0x70));
         json["patterns"][0]["swing"] = serde_json::json!(0.8);
         assert!(project_error(&json).contains("swing"));
         json["patterns"][0]["swing"] = serde_json::json!(0.5);
@@ -580,7 +626,17 @@ mod tests {
         assert!(project_error(&json).contains("retrigger count"));
         json["patterns"][0]["lanes"][0][0]["retrig"] = serde_json::json!(1);
         json["channels"] = serde_json::to_value(LaneMix::default().channels).unwrap();
-        for (field, value) in [("level", 1.251), ("pan", -1.01), ("delay_send", 1.01)] {
+        for channel in json["channels"].as_array_mut().unwrap() {
+            assert!(channel.as_object_mut().unwrap().remove("fx_send").is_some());
+        }
+        json["channels"][0]["delay_send"] = serde_json::json!(0.72);
+        let pre_bend = serde_json::from_value::<ProjectFile>(json.clone())
+            .unwrap()
+            .into_project()
+            .unwrap();
+        assert_eq!(pre_bend.lane_mix.channels[0].0.delay_send, 0.72);
+        assert!(pre_bend.lane_mix.dsp_channels().iter().all(|channel| channel.fx_send == 0.0));
+        for (field, value) in [("level", 1.251), ("pan", -1.01), ("delay_send", 1.01), ("fx_send", 1.01)] {
             let mut invalid = json.clone();
             invalid["channels"][0][field] = serde_json::json!(value);
             assert!(project_error(&invalid).contains("mixer settings"));
@@ -596,6 +652,11 @@ mod tests {
         json["solo_mask"] = serde_json::json!(0x80);
         assert!(project_error(&json).contains("mute or solo mask"));
         json["solo_mask"] = serde_json::json!(0);
+        json["bender_params"] = serde_json::json!({
+            "shift_norm": 0.5, "decay": 0.4, "feedback": 1.1, "freeze": false
+        });
+        assert!(project_error(&json).contains("BEND shift, feedback and decay"));
+        json.as_object_mut().unwrap().remove("bender_params");
         json["master_send"] = serde_json::json!(1.25);
         assert!(project_error(&json).contains("Master delay send"));
     }
@@ -622,6 +683,7 @@ mod tests {
             Project {
                 bpm: 120.0,
                 master_send: 0.25,
+                bender_params: Default::default(),
                 lane_patches: default_lane_patches(),
                 lane_mix,
                 patterns: patterns.to_vec(),

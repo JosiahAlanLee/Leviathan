@@ -153,7 +153,8 @@ impl ExportUi {
 
             let stems_before = self.settings.stems;
             if ui
-                .checkbox(&mut self.settings.stems, "Include six lane stems")
+                .checkbox(&mut self.settings.stems, "Include stems")
+                .on_hover_text("Exports each lane and a shared BEND return when a lane sends to it.")
                 .changed()
                 && self.path == default_path(stems_before)
             {

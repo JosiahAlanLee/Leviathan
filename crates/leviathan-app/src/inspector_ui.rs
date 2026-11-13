@@ -266,27 +266,42 @@ pub fn draw(
         auto_dirty = true;
     }
 
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Byte");
-        if ui
-            .add(egui::DragValue::new(&mut edit_auto.byte_word).range(0..=255))
-            .on_hover_text("8-bit ByteBus word emitted on this row (0..=255)")
-            .changed()
-        {
-            auto_dirty = true;
+    let mut fixed_byte = edit_auto.fixed_byte().is_some();
+    if ui
+        .checkbox(&mut fixed_byte, "Fixed ByteBus word")
+        .on_hover_text("Use the byte below, including 0x00. When off, use the live lane gate mask.")
+        .changed()
+    {
+        edit_auto.byte_override = fixed_byte;
+        if !fixed_byte {
+            edit_auto.byte_word = 0;
         }
-        ui.monospace(format!("0x{:02X}", edit_auto.byte_word));
-        for bit in 0..8u8 {
-            let high = ((edit_auto.byte_word >> bit) & 1) != 0;
+        auto_dirty = true;
+    }
+    ui.add_enabled_ui(fixed_byte, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Byte");
             if ui
-                .selectable_label(high, format!("{bit}"))
-                .on_hover_text(format!("Toggle ByteBus bit B{bit}"))
-                .clicked()
+                .add(egui::DragValue::new(&mut edit_auto.byte_word).range(0..=255))
+                .changed()
             {
-                edit_auto.byte_word ^= 1 << bit;
+                edit_auto.byte_override = true;
                 auto_dirty = true;
             }
-        }
+            ui.monospace(format!("0x{:02X}", edit_auto.byte_word));
+            for bit in 0..8u8 {
+                let high = ((edit_auto.byte_word >> bit) & 1) != 0;
+                if ui
+                    .selectable_label(high, format!("{bit}"))
+                    .on_hover_text(format!("Toggle ByteBus bit B{bit}"))
+                    .clicked()
+                {
+                    edit_auto.byte_word ^= 1 << bit;
+                    edit_auto.byte_override = true;
+                    auto_dirty = true;
+                }
+            }
+        });
     });
 
     if auto_dirty {

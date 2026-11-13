@@ -30,7 +30,7 @@ use leviathan_core::{
     CvFrame, EngineConfig, FillCondition, LaunchTarget, NoteCell, Pattern, PatternChain,
     SongPlayer, SongStatus, SoundLock, NUM_LANES, ROWS_PER_PATTERN,
 };
-use leviathan_dsp::{default_lane_patches, LanePatch, MachineKind, MasterPeaks};
+use leviathan_dsp::{default_lane_patches, BenderParams, LanePatch, MachineKind, MasterPeaks};
 use link::SoundLinkBridge;
 use locks_ui::draw_lane_patch_inspector;
 use master_ui::MasterMeters;
@@ -187,6 +187,7 @@ struct LeviathanApp {
     fill_active: bool,
     bpm: f64,
     master_send: f32,
+    bender_params: BenderParams,
     lane_mix: LaneMix,
     lane_patches: [LanePatch; NUM_LANES],
     master_meters: MasterMeters,
@@ -260,6 +261,7 @@ impl LeviathanApp {
             fill_active: false,
             bpm: 132.0,
             master_send: 0.0,
+            bender_params: BenderParams::default(),
             lane_mix: LaneMix::default(),
             lane_patches: default_lane_patches(),
             master_meters: MasterMeters::default(),
@@ -612,6 +614,7 @@ impl LeviathanApp {
         project::Project {
             bpm: self.bpm,
             master_send: self.master_send,
+            bender_params: self.bender_params,
             lane_mix: self.lane_mix,
             lane_patches: self.lane_patches,
             patterns: self.patterns.clone(),
@@ -641,6 +644,7 @@ impl LeviathanApp {
         let prepared = Arc::new(AudioProject::prepare(&project, self.project_generation));
         self.bpm = project.bpm;
         self.master_send = project.master_send;
+        self.bender_params = project.bender_params;
         self.lane_mix = project.lane_mix;
         self.lane_patches = project.lane_patches;
         self.master_meters = MasterMeters::default();
@@ -879,6 +883,9 @@ impl eframe::App for LeviathanApp {
                     ui.separator();
                     self.viewport.draw_shader_controls(ui, hovering_wgsl);
                     mixer_ui::draw(ui, &mut self.lane_mix, &self.lane_patches);
+                    if master_ui::draw_bender(ui, &mut self.bender_params) {
+                        self.send_audio(AudioCommand::SetBenderParams(self.bender_params));
+                    }
                     let safe_lane = sel_lane.min(NUM_LANES - 1);
                     if draw_lane_patch_inspector(ui, safe_lane, &mut self.lane_patches[safe_lane]) {
                         self.send_audio(AudioCommand::SetLanePatch {
@@ -1470,6 +1477,13 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = offline_app(&ctx);
         app.master_send = 0.35;
+        let bender_params = BenderParams {
+            shift_norm: 0.76,
+            freeze: true,
+            ..BenderParams::default()
+        };
+        app.bender_params = bender_params;
+        app.lane_mix.channels[3].0.fx_send = 0.48;
         frame(
             &ctx,
             &mut app,
@@ -1512,11 +1526,14 @@ mod tests {
         frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
         std::fs::remove_file(path).unwrap();
         assert_eq!(app.master_send, 0.35);
+        assert_eq!(app.bender_params, bender_params);
+        assert_eq!(app.lane_mix.channels[3].0.fx_send, 0.48);
         assert_eq!(app.lane_mix.mute_mask, 0b10);
         assert_eq!(app.lane_mix.solo_mask, 0b1000);
         frame(&ctx, &mut app, Vec::new());
         frame(&ctx, &mut app, vec![key(Key::Num0, Modifiers::ALT)]);
-        assert_eq!(app.lane_mix, LaneMix::default());
+        assert_eq!((app.lane_mix.mute_mask, app.lane_mix.solo_mask), (0, 0));
+        assert_eq!(app.lane_mix.channels[3].0.fx_send, 0.48);
         assert_eq!(app.selected_pattern, 1);
         assert_eq!(app.patterns[1].rate, PlaybackRate::Half);
         assert_eq!(app.chain.as_slice(), &[0, 1]);

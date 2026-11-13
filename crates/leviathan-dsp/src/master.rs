@@ -1,3 +1,5 @@
+use crate::bender::{BenderParams, SpoonBenderBus};
+
 const DELAY_FRAMES: usize = 8192;
 const DELAY_SECONDS: [f32; 2] = [0.017, 0.021];
 const FEEDBACK: f32 = 0.28;
@@ -64,6 +66,7 @@ impl StereoDelay {
 
 pub(super) struct MasterBus {
     delay: StereoDelay,
+    bender: SpoonBenderBus,
     send: f32,
     send_target: f32,
     send_step: f32,
@@ -79,6 +82,7 @@ impl MasterBus {
         let dc_pole = 1.0 / (1.0 + core::f32::consts::TAU * 8.0 / sample_rate);
         Self {
             delay: StereoDelay::new(sample_rate),
+            bender: SpoonBenderBus::new(sample_rate),
             send: 0.0,
             send_target: 0.0,
             send_step: 1.0 / (1.0 + sample_rate * 0.01),
@@ -94,10 +98,15 @@ impl MasterBus {
         self.send_target = finite_sample(send).clamp(0.0, 1.0) * MAX_SEND;
     }
 
+    pub(super) fn set_bender_params(&mut self, params: BenderParams) {
+        self.bender.set_params(params);
+    }
+
     pub(super) fn reset(&mut self, send: f32) {
         self.set_send(send);
         self.send = self.send_target;
         self.delay.clear();
+        self.bender.reset();
         self.dc_input = [0.0; 2];
         self.dc_output = [0.0; 2];
         self.peaks = MasterPeaks::default();
@@ -113,9 +122,16 @@ impl MasterBus {
         self.send
     }
 
-    pub(super) fn process(&mut self, dry: [f32; 2], send: [f32; 2]) -> [f32; 2] {
-        let mix = self.delay.mix(dry.map(finite_sample), send);
+    pub(super) fn process(
+        &mut self,
+        dry: [f32; 2],
+        delay_send: [f32; 2],
+        fx_send: [f32; 2],
+    ) -> ([f32; 2], [f32; 2]) {
+        let mix = self.delay.mix(dry.map(finite_sample), delay_send);
+        let wet = self.bender.process(fx_send);
         for (channel, sample) in mix.into_iter().enumerate() {
+            let sample = sample + wet[channel];
             self.dc_output[channel] = flush_tail(
                 (sample - self.dc_input[channel]) * self.dc_gain
                     + self.dc_pole * self.dc_output[channel],
@@ -132,7 +148,7 @@ impl MasterBus {
             output: output.map(f32::abs),
             clipped: levels.map(|level| level > 1.0),
         });
-        output
+        (output, wet)
     }
 }
 
@@ -169,7 +185,7 @@ mod tests {
 
     fn render(bus: &mut MasterBus, dry: [f32; 2]) -> [f32; 2] {
         let send = bus.next_send();
-        bus.process(dry, dry.map(|sample| sample * send))
+        bus.process(dry, dry.map(|sample| sample * send), [0.0; 2]).0
     }
 
     #[test]
