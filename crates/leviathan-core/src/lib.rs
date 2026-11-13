@@ -193,6 +193,9 @@ pub struct AutomationRow {
     pub roll: f32,     // -1.0..=1.0
     pub feedback: f32, // 0.0..=1.0
     pub byte_word: u8,
+    /// Select a fixed byte even when it is zero. Legacy nonzero words are fixed too.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub byte_override: bool,
 }
 
 impl Default for AutomationRow {
@@ -202,7 +205,14 @@ impl Default for AutomationRow {
             roll: 0.0,
             feedback: 0.35,
             byte_word: 0,
+            byte_override: false,
         }
+    }
+}
+
+impl AutomationRow {
+    pub fn fixed_byte(self) -> Option<u8> {
+        (self.byte_override || self.byte_word != 0).then_some(self.byte_word)
     }
 }
 
@@ -596,7 +606,7 @@ impl TrackerEvaluator {
         }
 
         let auto = &pattern.automation[row];
-        let bus_word = if auto.byte_word != 0 { auto.byte_word } else { hit_mask };
+        let bus_word = auto.fixed_byte().unwrap_or(hit_mask);
 
         CvFrame {
             beat,
@@ -663,6 +673,40 @@ mod tests {
         assert_eq!(frame[5], 10.0);
         assert_eq!(frame[7], 10.0);
         assert_eq!(frame[8], 10.0);
+    }
+
+    #[test]
+    fn bytebus_fixed_zero_and_live_gate_mask_are_distinct_between_clock_edges() {
+        let mut pattern = Pattern {
+            rate: PlaybackRate::EightX,
+            ..Pattern::default()
+        };
+        for row in 0..=2 {
+            pattern.lanes[1][row] = NoteCell {
+                active: true,
+                gate_fraction: 1.0,
+                ..NoteCell::default()
+            };
+        }
+        pattern.automation[1].byte_override = true;
+        pattern.automation[2].byte_word = 0xa4;
+        let mut eval = TrackerEvaluator::new(EngineConfig {
+            bpm: 120.0,
+            ..EngineConfig::default()
+        });
+        eval.playing = true;
+        let mut row_starts = [None; 3];
+        for _ in 0..1_501 {
+            let cv = eval.step_sample(&pattern);
+            if cv.row < row_starts.len() {
+                row_starts[cv.row].get_or_insert(cv);
+            }
+        }
+        let [auto, fixed_zero, legacy_nonzero] = row_starts.map(Option::unwrap);
+        assert_eq!(auto.bytebus_v, encode_bytebus_frame(0x02, true));
+        assert_eq!(fixed_zero.gate_v[1], 10.0);
+        assert_eq!(fixed_zero.bytebus_v, encode_bytebus_frame(0x00, true));
+        assert_eq!(legacy_nonzero.bytebus_v, encode_bytebus_frame(0xa4, true));
     }
 
     #[test]

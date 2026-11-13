@@ -624,12 +624,14 @@ mod tests {
             roll: -0.5,
             feedback: 0.75,
             byte_word: 42,
+            byte_override: true,
         };
         pattern.automation[6] = AutomationRow {
             z: 0.625,
             roll: 0.75,
             feedback: 0.25,
             byte_word: 21,
+            byte_override: false,
         };
         let endpoints = (pattern.automation[2], pattern.automation[6]);
         let before = pattern.automation[4];

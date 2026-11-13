@@ -1,7 +1,9 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
+mod bbus;
 mod bender;
 mod cz;
+mod dac;
 pub mod fm;
 mod master;
 mod otis;
@@ -19,6 +21,7 @@ use leviathan_core::{CvFrame, SoundLock, NUM_LANES};
 use master::{MasterBus, MAX_SEND};
 use sampler::{SampleBank, VarClockSamplerVoice};
 
+pub use bbus::{ByteBusReceiver, ByteBusSource};
 pub use bender::{BenderParams, BENDER_MAX_SHIFT_HZ};
 pub use master::{MasterPeaks, StereoDelay};
 pub use spec::{
@@ -26,7 +29,7 @@ pub use spec::{
     DEFAULT_LANE_PATCHES, MACHINE_SPECS,
 };
 
-pub const MACHINE_COUNT: usize = 13;
+pub const MACHINE_COUNT: usize = 14;
 pub const ALL_LANES_AUDIBLE: u8 = (1 << NUM_LANES) - 1;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -111,6 +114,7 @@ pub enum MachineKind {
     ElectroPerc = 10,
     WestCoastLpg = 11,
     OtisTranswave = 12,
+    ByteBusR2r = 13,
 }
 
 impl MachineKind {
@@ -140,6 +144,7 @@ impl MachineKind {
         Self::ElectroPerc,
         Self::WestCoastLpg,
         Self::OtisTranswave,
+        Self::ByteBusR2r,
     ];
 
     pub const fn from_id(id: usize) -> Self {
@@ -163,6 +168,7 @@ impl MachineKind {
                 | Self::ElectroPerc
                 | Self::WestCoastLpg
                 | Self::OtisTranswave
+                | Self::ByteBusR2r
         )
     }
 
@@ -327,6 +333,7 @@ struct VoiceState {
     perc: perc::Voice,
     west: west::Voice,
     otis: otis::Voice,
+    bbus: bbus::Voice,
     active_machine: Option<MachineKind>,
     note_pitch: f32,
     note_lock: SoundLock,
@@ -352,6 +359,7 @@ impl Default for VoiceState {
             perc: perc::Voice::default(),
             west: west::Voice::default(),
             otis: otis::Voice::default(),
+            bbus: bbus::Voice::default(),
             active_machine: None,
             note_pitch: 0.0,
             note_lock: SoundLock::default(),
@@ -374,6 +382,7 @@ impl VoiceState {
         self.perc = perc::Voice::default();
         self.west = west::Voice::default();
         self.otis = otis::Voice::default();
+        self.bbus = bbus::Voice::default();
         self.active_machine = None;
     }
 
@@ -385,6 +394,7 @@ impl VoiceState {
         patch: &LanePatch,
         sample_rate: f32,
         sample_bank: &SampleBank,
+        bus_word: Option<u8>,
     ) -> f32 {
         let gate = cv.gate_v[lane] > 2.5;
         let velocity = cv.velocity_v[lane];
@@ -436,6 +446,9 @@ impl VoiceState {
                 }
                 MachineKind::WestCoastLpg => self.west.step(hz, sample_rate, gate, trigger, &params),
                 MachineKind::OtisTranswave => self.otis.step(hz, sample_rate, trigger, &params),
+                MachineKind::ByteBusR2r => {
+                    self.bbus.step(hz, sample_rate, gate, trigger, bus_word, &params)
+                }
                 _ => 0.0,
             };
         }
@@ -655,7 +668,13 @@ impl SynthRack {
 
     #[inline]
     pub fn render_stereo(&mut self, cv: &CvFrame) -> (f32, f32) {
-        self.render_mix(cv, None, None).0
+        self.render_mix(cv, None, None, bbus::tracker_word(cv)).0
+    }
+
+    /// Renders with an already decoded external ByteBus word. Use
+    /// `ByteBusReceiver` for raw clocked voltages and `None` for standalone.
+    pub fn render_stereo_with_bytebus(&mut self, cv: &CvFrame, word: Option<u8>) -> (f32, f32) {
+        self.render_mix(cv, None, None, word).0
     }
 
     /// Renders the master and taps each lane after gain and pan, before the master bus.
@@ -665,7 +684,7 @@ impl SynthRack {
         cv: &CvFrame,
         stems: &mut [[f32; 2]; NUM_LANES],
     ) -> (f32, f32) {
-        self.render_mix(cv, Some(stems), None).0
+        self.render_mix(cv, Some(stems), None, bbus::tracker_word(cv)).0
     }
 
     /// Includes each lane's own contribution to the delay in its stem.
@@ -686,7 +705,7 @@ impl SynthRack {
         stems: &mut [[f32; 2]; NUM_LANES],
         delays: &mut [StereoDelay; NUM_LANES],
     ) -> ((f32, f32), [f32; 2]) {
-        self.render_mix(cv, Some(stems), Some(delays))
+        self.render_mix(cv, Some(stems), Some(delays), bbus::tracker_word(cv))
     }
 
     #[inline]
@@ -695,6 +714,7 @@ impl SynthRack {
         cv: &CvFrame,
         mut stems: Option<&mut [[f32; 2]; NUM_LANES]>,
         mut stem_delays: Option<&mut [StereoDelay; NUM_LANES]>,
+        bus_word: Option<u8>,
     ) -> ((f32, f32), [f32; 2]) {
         let _bus_step = self.counter.step(cv.bytebus_v[8] > 5.0, cv.reset_v > 5.0);
         let mut dry_mix = [0.0_f32; 2];
@@ -709,6 +729,7 @@ impl SynthRack {
                 &self.lane_patches[lane],
                 self.sample_rate,
                 &self.sample_bank,
+                bus_word,
             );
 
             // Keep the voice running under the mute so it resumes at the same phase.
@@ -963,6 +984,7 @@ mod tests {
             (MachineKind::ElectroPerc, 10, "perc", "PERC"),
             (MachineKind::WestCoastLpg, 11, "west", "WEST"),
             (MachineKind::OtisTranswave, 12, "otis", "OTIS"),
+            (MachineKind::ByteBusR2r, 13, "bbus", "BBUS"),
         ] {
             assert_eq!((kind.spec().id, kind.slug(), kind.short_name()), (id, slug, badge));
         }
@@ -989,6 +1011,31 @@ mod tests {
             ),
             patch.machine
         );
+    }
+
+    #[test]
+    fn rack_uses_clocked_zero_until_the_next_publication() {
+        let mut rack = SynthRack::new(48_000.0);
+        rack.set_lane_patch(0, LanePatch::for_machine(MachineKind::ByteBusR2r));
+        let mut cv = CvFrame::default();
+        cv.gate_v[0] = 10.0;
+        cv.velocity_v[0] = 10.0;
+        let render = |rack: &mut SynthRack, unpublished| {
+            rack.reset_voices();
+            rack.reset_master(0.0);
+            let mut receiver = ByteBusReceiver::default();
+            let mut samples = [0.0; 256];
+            for (i, sample) in samples.iter_mut().enumerate() {
+                let byte = if i < 128 { 0 } else { unpublished };
+                let raw = leviathan_core::encode_bytebus_frame(byte, i == 0);
+                let word = receiver.step(ByteBusSource::Clocked, &raw);
+                *sample = rack.render_stereo_with_bytebus(&cv, word).0;
+            }
+            samples
+        };
+        let held = render(&mut rack, 0);
+        assert!(held.iter().any(|sample| sample.abs() > 0.03));
+        assert_eq!(render(&mut rack, 0xf7), held);
     }
 
     #[test]

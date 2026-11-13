@@ -379,7 +379,9 @@ mod tests {
             roll: -0.0,
             feedback: 0.42,
             byte_word: 0x98,
+            byte_override: false,
         };
+        patterns[1].automation[1].byte_override = true;
         let mut chain = PatternChain::default();
         for id in [0, 1, 1] {
             assert!(chain.push(id));
@@ -443,6 +445,7 @@ mod tests {
         assert_eq!(project.sample_bank().regions, sample_regions);
         assert_eq!(project.selected_pattern, 1);
         assert_eq!(project.chain, chain);
+        assert_eq!(project.patterns[1].automation[1].fixed_byte(), Some(0x00));
         for (original, loaded) in patterns.iter().zip(&project.patterns) {
             assert_eq!(original.rate, loaded.rate);
             assert_eq!(original.swing, loaded.swing);
@@ -519,7 +522,7 @@ mod tests {
         let engines = [
             MachineKind::CzPhaseDist,
             MachineKind::PolivoksSub,
-            MachineKind::VastFunSynth,
+            MachineKind::ByteBusR2r,
             MachineKind::ElectroPerc,
             MachineKind::WestCoastLpg,
             MachineKind::OtisTranswave,
@@ -550,6 +553,8 @@ mod tests {
             },
         )
         .unwrap();
+        let stored = fs::read_to_string(&path).unwrap();
+        assert!(stored.contains(r#""machine":"bbus""#));
         let project = load(&path).unwrap();
         fs::remove_file(&path).unwrap();
         assert_eq!(project.lane_patches, patches);
@@ -588,6 +593,10 @@ mod tests {
         ] {
             assert!(fields.remove(field).is_some());
         }
+        json["patterns"][0]["automation"][1]["byte_word"] = serde_json::json!(0x70);
+        for row in json["patterns"][0]["automation"].as_array_mut().unwrap() {
+            row.as_object_mut().unwrap().remove("byte_override");
+        }
         let pattern = json["patterns"][0].as_object_mut().unwrap();
         pattern.remove("swing");
         for lane in pattern.get_mut("lanes").unwrap().as_array_mut().unwrap() {
@@ -605,6 +614,8 @@ mod tests {
         assert_eq!(old.sample_regions, [SampleRegion::default(); NUM_BANKS]);
         assert_eq!(old.patterns[0].swing, 0.5);
         assert_eq!(old.patterns[0].lanes[0][0], NoteCell::default());
+        assert_eq!(old.patterns[0].automation[0].fixed_byte(), None);
+        assert_eq!(old.patterns[0].automation[1].fixed_byte(), Some(0x70));
         json["patterns"][0]["swing"] = serde_json::json!(0.8);
         assert!(project_error(&json).contains("swing"));
         json["patterns"][0]["swing"] = serde_json::json!(0.5);

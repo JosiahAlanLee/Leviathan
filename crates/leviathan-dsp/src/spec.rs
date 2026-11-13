@@ -261,6 +261,23 @@ pub const MACHINE_SPECS: [MachineSpec; MACHINE_COUNT] = [
             ParamSpec::new("LoopMode", 0.50),
         ],
     },
+    MachineSpec {
+        kind: MachineKind::ByteBusR2r,
+        id: 13,
+        slug: "bbus",
+        badge: "BBUS",
+        name: "ByteBus FIR / R-2R",
+        params: [
+            ParamSpec::new("Decay", 0.38),
+            ParamSpec::new("BusMask", 0.45),
+            ParamSpec::new("FirTilt", 0.30),
+            ParamSpec::new("R2rSkew", 0.20),
+            ParamSpec::new("ClockHold", 0.15),
+            ParamSpec::new("Cutoff", 0.60),
+            ParamSpec::new("SlewGlitch", 0.30),
+            ParamSpec::new("SubBit", 0.35),
+        ],
+    },
 ];
 
 #[inline]

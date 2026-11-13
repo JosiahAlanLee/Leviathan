@@ -587,13 +587,13 @@ mod tests {
     use leviathan_core::PlaybackRate;
 
     #[test]
-    fn wav_master_matches_live_playback_and_stems_include_delay_and_bend() {
+    fn wav_master_matches_live_playback_with_bbus_delay_and_bend() {
         let (tx, rx) = rtrb::RingBuffer::new(8);
         let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(32);
         let mut audio = AudioControl::new(tx);
         let mut worker = RtAudioWorker::new(Pattern::default(), 48_000.0, rx, tel_tx, None);
         let mut pattern = Pattern {
-            length: 1,
+            length: 2,
             rate: PlaybackRate::EightX,
             ..Pattern::default()
         };
@@ -607,6 +607,16 @@ mod tests {
             },
             ..NoteCell::default()
         };
+        pattern.lanes[0][0] = NoteCell {
+            active: true,
+            gate_fraction: 1.0,
+            ..NoteCell::default()
+        };
+        pattern.lanes[0][1] = pattern.lanes[0][0];
+        pattern.automation[0].byte_word = 0xa4;
+        pattern.automation[1].byte_override = true;
+        let mut lane_patches = leviathan_dsp::default_lane_patches();
+        lane_patches[0] = LanePatch::for_machine(leviathan_dsp::MachineKind::ByteBusR2r);
         let mut lane_mix = crate::lane_mix::LaneMix::default();
         lane_mix.channels[4].0 = LaneChannel {
             level: 1.0,
@@ -633,7 +643,7 @@ mod tests {
                 freeze,
                 ..bender_params
             },
-            lane_patches: leviathan_dsp::default_lane_patches(),
+            lane_patches,
             lane_mix,
             patterns: vec![pattern.clone()],
             selected_pattern: 0,
@@ -681,6 +691,7 @@ mod tests {
         let master = std::fs::read(destination.join("wet/master.wav")).unwrap();
         assert_eq!(std::fs::read(destination.join("wet.wav")).unwrap(), master);
         let stem = std::fs::read(destination.join("wet/4-smpl.wav")).unwrap();
+        let bbus = std::fs::read(destination.join("wet/0-bbus.wav")).unwrap();
         let bend = std::fs::read(destination.join("wet/bend.wav")).unwrap();
         let frozen_master = std::fs::read(destination.join("frozen/master.wav")).unwrap();
         let frozen_bend = std::fs::read(destination.join("frozen/bend.wav")).unwrap();
@@ -690,9 +701,9 @@ mod tests {
             stem
         );
         std::fs::remove_dir_all(destination).unwrap();
-        let frames = 750 + 3360;
+        let frames = 1500 + 3360;
         let data_offset = master.len() - frames * 8;
-        for bytes in [&master, &stem, &bend, &frozen_bend] {
+        for bytes in [&master, &stem, &bbus, &bend, &frozen_bend] {
             assert_eq!(bytes.len(), master.len());
             assert_eq!(&bytes[data_offset - 8..data_offset - 4], b"data");
             let data_len = u32::from_le_bytes(bytes[data_offset - 4..data_offset].try_into().unwrap());
@@ -703,9 +714,9 @@ mod tests {
             let offset = data_offset + 8 * frame + 4 * channel;
             f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
         };
-        let mut energy = [0.0; 3];
+        let mut energy = [0.0; 4];
         for frame in 0..frames {
-            if frame == 750 {
+            if frame == 1500 {
                 audio.send(AudioCommand::SetPlaying {
                     playing: false,
                     request: 2,
@@ -723,6 +734,7 @@ mod tests {
                 energy[1] += stem_right.abs();
             }
             energy[2] += read_channel(&bend, frame, 0).abs() + read_channel(&bend, frame, 1).abs();
+            energy[3] += read_channel(&bbus, frame, 0).abs();
         }
         assert!(energy.iter().all(|&sum| sum > 0.1), "{energy:?}");
     }
@@ -996,6 +1008,7 @@ mod tests {
                 roll: -0.5,
                 feedback: 0.6,
                 byte_word: 0b0000_0101,
+                byte_override: false,
             },
         });
         audio.send(AudioCommand::SetPlaying {
@@ -1070,6 +1083,10 @@ mod tests {
         let mut audio = AudioControl::new(tx);
         let mut worker = RtAudioWorker::new(Pattern::default(), 8_000.0, rx, tel_tx, Some(receiver));
         let lane = 5;
+        audio.send(AudioCommand::SetLanePatch {
+            lane,
+            patch: LanePatch::for_machine(leviathan_dsp::MachineKind::ByteBusR2r),
+        });
         let key = MidiKey {
             channel: 0,
             note: 72,
