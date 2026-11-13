@@ -892,16 +892,6 @@ mod tests {
             sample_regions,
             custom_shader: None,
         };
-        audio.send(AudioCommand::ReplaceProject(Arc::new(
-            AudioProject::prepare(&project(false), 1),
-        )));
-        audio.send(AudioCommand::SetPlaying {
-            playing: true,
-            request: 1,
-        });
-        worker.drain_commands();
-        assert_eq!(worker.synth.sample_bank.regions[0], sample_regions[0]);
-
         let destination =
             std::env::temp_dir().join(format!("leviathan-mixer-parity-{}", std::process::id()));
         let settings = ExportSettings {
@@ -950,23 +940,46 @@ mod tests {
             let data_len = u32::from_le_bytes(bytes[data_offset - 4..data_offset].try_into().unwrap());
             assert_eq!(data_len as usize, frames * 8);
         }
-        assert!(frozen_bend[data_offset..].iter().all(|&byte| byte == 0));
         let read_channel = |bytes: &[u8], frame: usize, channel: usize| {
             let offset = data_offset + 8 * frame + 4 * channel;
             f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
         };
+        for (generation, (freeze, expected)) in [(false, &master), (true, &frozen_master)]
+            .into_iter()
+            .enumerate()
+        {
+            let generation = generation as u64 + 1;
+            audio.send(AudioCommand::ReplaceProject(Arc::new(AudioProject::prepare(
+                &project(freeze),
+                generation,
+            ))));
+            audio.send(AudioCommand::SetPlaying {
+                playing: true,
+                request: generation * 2,
+            });
+            worker.drain_commands();
+            assert_eq!(worker.synth.sample_bank.regions[0], sample_regions[0]);
+            for frame in 0..frames {
+                if frame == 1500 {
+                    audio.send(AudioCommand::SetPlaying {
+                        playing: false,
+                        request: generation * 2 + 1,
+                    });
+                    worker.drain_commands();
+                }
+                let (left, right) = worker.next_stereo();
+                assert_eq!(read_channel(expected, frame, 0), left);
+                assert_eq!(read_channel(expected, frame, 1), right);
+            }
+        }
+
+        let frozen_tail_peak = (1500..frames)
+            .map(|frame| read_channel(&frozen_bend, frame, 0).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(frozen_tail_peak > 0.001, "{frozen_tail_peak}");
+
         let mut energy = [0.0; 5];
         for frame in 0..frames {
-            if frame == 1500 {
-                audio.send(AudioCommand::SetPlaying {
-                    playing: false,
-                    request: 2,
-                });
-                worker.drain_commands();
-            }
-            let (left, right) = worker.next_stereo();
-            assert_eq!(read_channel(&master, frame, 0), left);
-            assert_eq!(read_channel(&master, frame, 1), right);
             let stem_right = read_channel(&stem, frame, 1);
             if frame < 1008 {
                 assert_eq!(stem_right, 0.0);

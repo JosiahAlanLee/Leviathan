@@ -288,20 +288,22 @@ impl SpoonBenderBus {
             diffuser.clear();
         }
         self.tank.clear();
-        self.snap_controls();
         self.quiet_frames = u32::MAX;
+        self.snap_controls();
     }
 
     fn snap_controls(&mut self) {
         self.shift = self.shift_target;
         self.feedback = self.feedback_target;
         self.damping = self.damping_target;
-        self.freeze = f32::from(u8::from(self.freeze_target));
+        // An empty tank lets the first send start the freeze ramp.
+        self.freeze = 0.0;
     }
 
     #[inline]
     pub(crate) fn process(&mut self, input: [f32; 2]) -> [f32; 2] {
-        if self.quiet_frames == u32::MAX && (input == [0.0; 2] || self.freeze == 1.0) {
+        let excitation = input.map(|v| if v.is_finite() { v } else { 0.0 });
+        if self.quiet_frames == u32::MAX && excitation == [0.0; 2] {
             return [0.0; 2];
         }
         self.shift = crate::slew(self.shift, self.shift_target, self.control_step);
@@ -313,7 +315,6 @@ impl SpoonBenderBus {
         } else {
             (self.freeze - self.freeze_step).max(0.0)
         };
-        let excitation = input.map(|v| if v.is_finite() { v } else { 0.0 });
         let shifted = self.shifter.step(excitation, self.shift, self.rate);
         let diffused = core::array::from_fn(|i| self.diffusers[i].step(shifted[i]));
         let output = self
@@ -428,5 +429,44 @@ mod tests {
             bus.process([0.0; 2]);
         }
         assert!(energy(&bus) < initial * 0.001);
+    }
+
+    #[test]
+    fn pre_armed_freeze_waits_for_input_and_sustains_the_capture() {
+        let rate = 48_000.0;
+        let mut bus = SpoonBenderBus::new(rate);
+        bus.set_params(BenderParams {
+            feedback: 0.85,
+            decay: 0.9,
+            freeze: true,
+            ..BenderParams::default()
+        });
+        for _ in 0..2_400 {
+            assert_eq!(bus.process([0.0; 2]), [0.0; 2]);
+        }
+        assert_eq!(bus.freeze, 0.0);
+
+        for i in 0..2_400 {
+            let env = 1.0 - i as f32 / 2_400.0;
+            let hit = 0.35 * env * sine(i as f32 * 185.0 / rate);
+            bus.process([hit; 2]);
+        }
+        assert_eq!(bus.freeze, 1.0);
+        let energy = |bus: &SpoonBenderBus| {
+            bus.tank
+                .memory
+                .iter()
+                .map(|&sample| f64::from(sample).powi(2))
+                .sum::<f64>()
+        };
+        let captured = energy(&bus);
+        assert!(captured > 0.002, "{captured}");
+        let mut peak = 0.0_f32;
+        for _ in 0..96_000 {
+            let [left, right] = bus.process([0.0; 2]);
+            peak = peak.max(left.abs()).max(right.abs());
+        }
+        assert!(peak > 0.005, "{peak}");
+        assert!((0.998..1.002).contains(&(energy(&bus) / captured)));
     }
 }
