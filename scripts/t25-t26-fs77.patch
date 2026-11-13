@@ -202,21 +202,6 @@ index f76b03721b9b2a604a7e6c526cd717ed970a0492..53fd52713aa495ad6defd4a98121c717
      #[test]
      fn wav_master_matches_live_playback_with_bbus_otis_twin_delay_and_bend() {
          let (tx, rx) = rtrb::RingBuffer::new(8);
-diff --git a/crates/leviathan-app/src/gpu_view.rs b/crates/leviathan-app/src/gpu_view.rs
-index ed51eb75077d933f750cfc3dbe61096fb031604a..1b39830ae87b1b709e9391391fed87e0612ddc00 100644
---- a/crates/leviathan-app/src/gpu_view.rs
-+++ b/crates/leviathan-app/src/gpu_view.rs
-@@ -407,7 +407,9 @@ impl GpuPingPong {
-                 ..Default::default()
-             });
-             pass.set_pipeline(&self.pipeline);
--            pass.set_bind_group(0, &self.bind_groups[src], &[]);
-+            // bind_groups[i] samples views[1 - i], so the group that reads the
-+        // front texture (views[src]) while we render into views[dst] is [dst].
-+        pass.set_bind_group(0, &self.bind_groups[dst], &[]);
-             pass.set_bind_group(1, &self.audio_bind_group, &[]);
-             pass.draw(0..3, 0..1);
-         }
 diff --git a/crates/leviathan-dsp/src/dac.rs b/crates/leviathan-dsp/src/dac.rs
 index e0e15d4c38489b82f3a597d366979b5d3082e1a3..f84af999bcd1e5f685a1fe303399067657d7582a 100644
 --- a/crates/leviathan-dsp/src/dac.rs
