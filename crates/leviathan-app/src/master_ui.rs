@@ -22,7 +22,7 @@ pub fn draw_bender(ui: &mut egui::Ui, params: &mut BenderParams) -> bool {
         ui.add(egui::Slider::new(&mut params.feedback, 0.0..=1.0).text("Feedback"));
         ui.add(egui::Slider::new(&mut params.decay, 0.0..=1.0).text("Tank Decay"));
         ui.checkbox(&mut params.freeze, "Freeze")
-            .on_hover_text("Hold the current tank. WAV export starts with an empty tank.");
+            .on_hover_text("Hold the current tail, or capture the start of the next send if the tank is empty.");
     });
     *params != before
 }
