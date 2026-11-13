@@ -142,7 +142,7 @@ impl ExportJob {
         let worker = thread::Builder::new()
             .name("leviathan-wav-export".into())
             .spawn(move || {
-                (&project, fill, plan, &request.destination, &progress)?;
+                write_outputs(&project, fill, plan, &request.destination, &progress)?;
                 Ok(request.destination)
             })?;
         Ok(Self {
@@ -351,7 +351,7 @@ mod tests {
         Project {
             bpm: 120.0,
             master_send: 0.3,
-        lane_patches: default_lane_patches(),
+            lane_patches: default_lane_patches(),
             lane_mix: LaneMix::default(),
             patterns: vec![pattern, second],
             selected_pattern: 0,
@@ -469,8 +469,9 @@ mod tests {
     }
     #[test]
     fn stem_export_respects_dynamic_lane_patches_and_slug_names() {
-        let temp = tempfile::tempdir().unwrap();
-        let stems = temp.path().join("stems");
+        let temp =
+            StagingDirectory::new(&std::env::temp_dir().join("leviathan-test-patches")).unwrap();
+        let stems = temp.path.join("stems");
         let mut snapshot = project();
         snapshot.lane_patches[0].machine = MachineKind::FourOpFm;
         snapshot.lane_patches[0].params[1] = 0.05;

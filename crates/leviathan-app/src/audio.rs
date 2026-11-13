@@ -616,6 +616,7 @@ mod tests {
         let project = Project {
             bpm: 120.0,
             master_send: 0.0,
+            lane_patches: leviathan_dsp::default_lane_patches(),
             lane_mix,
             patterns: vec![pattern],
             selected_pattern: 0,
@@ -756,6 +757,7 @@ mod tests {
         let project = Project {
             bpm: 120.0,
             master_send: 0.4,
+            lane_patches: leviathan_dsp::default_lane_patches(),
             lane_mix: Default::default(),
             patterns: vec![first, second],
             selected_pattern: 1,
@@ -813,6 +815,7 @@ mod tests {
         let oversized = Project {
             bpm: 120.0,
             master_send: 0.0,
+            lane_patches: leviathan_dsp::default_lane_patches(),
             lane_mix: Default::default(),
             patterns: vec![Pattern::default(); PATTERN_BANK_CAPACITY + 4],
             selected_pattern: PATTERN_BANK_CAPACITY + 2,
@@ -1062,6 +1065,7 @@ mod tests {
         let project = Project {
             bpm: 120.0,
             master_send: 0.0,
+            lane_patches: leviathan_dsp::default_lane_patches(),
             lane_mix: LaneMix {
                 mute_mask: 1,
                 solo_mask: 0b11, ..LaneMix::default()
