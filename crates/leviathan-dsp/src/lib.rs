@@ -14,6 +14,7 @@ mod pvx;
 pub mod sampler;
 pub mod spec;
 mod vast;
+mod vast_k26;
 mod voice;
 mod west;
 
@@ -31,7 +32,7 @@ pub use spec::{
     DEFAULT_LANE_PATCHES, MACHINE_SPECS,
 };
 
-pub const MACHINE_COUNT: usize = 16;
+pub const MACHINE_COUNT: usize = 17;
 pub const ALL_LANES_AUDIBLE: u8 = (1 << NUM_LANES) - 1;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -119,6 +120,7 @@ pub enum MachineKind {
     ByteBusR2r = 13,
     OtisTwin = 14,
     Fs77FormantFm = 15,
+    VastTriple = 16,
 }
 
 impl MachineKind {
@@ -151,6 +153,7 @@ impl MachineKind {
         Self::ByteBusR2r,
         Self::OtisTwin,
         Self::Fs77FormantFm,
+        Self::VastTriple,
     ];
 
     pub const fn from_id(id: usize) -> Self {
@@ -177,6 +180,7 @@ impl MachineKind {
                 | Self::ByteBusR2r
                 | Self::OtisTwin
                 | Self::Fs77FormantFm
+                | Self::VastTriple
         )
     }
 
@@ -338,6 +342,7 @@ struct VoiceState {
     cz: cz::Voice,
     pvx: pvx::Voice,
     vast: vast::Voice,
+    vast_k26: vast_k26::Voice,
     perc: perc::Voice,
     west: west::Voice,
     otis: otis::Voice,
@@ -366,6 +371,7 @@ impl Default for VoiceState {
             cz: cz::Voice::default(),
             pvx: pvx::Voice::default(),
             vast: vast::Voice::default(),
+            vast_k26: vast_k26::Voice::default(),
             perc: perc::Voice::default(),
             west: west::Voice::default(),
             otis: otis::Voice::default(),
@@ -391,6 +397,7 @@ impl VoiceState {
         self.cz = cz::Voice::default();
         self.pvx = pvx::Voice::default();
         self.vast.reset();
+        self.vast_k26.reset();
         self.perc = perc::Voice::default();
         self.west = west::Voice::default();
         self.otis = otis::Voice::default();
@@ -455,6 +462,7 @@ impl VoiceState {
                         .step(hz, sample_rate, trigger, &params, &mut self.rng)
                 }
                 MachineKind::VastFunSynth => self.vast.step(hz, sample_rate, trigger, &params),
+                MachineKind::VastTriple => self.vast_k26.step(hz, sample_rate, gate, trigger, &params),
                 MachineKind::ElectroPerc => {
                     self.perc.step(hz, sample_rate, trigger, &params, &mut self.rng)
                 }
@@ -999,12 +1007,14 @@ mod tests {
             assert!(LanePatch::for_machine(kind).is_valid());
         }
         for (kind, id, slug, badge) in [
+            (MachineKind::VastFunSynth, 9, "vast", "VAST"),
             (MachineKind::ElectroPerc, 10, "perc", "PERC"),
             (MachineKind::WestCoastLpg, 11, "west", "WEST"),
             (MachineKind::OtisTranswave, 12, "otis", "OTIS"),
             (MachineKind::ByteBusR2r, 13, "bbus", "BBUS"),
             (MachineKind::OtisTwin, 14, "otis2", "OT2"),
             (MachineKind::Fs77FormantFm, 15, "fs77", "FS77"),
+            (MachineKind::VastTriple, 16, "k26", "K26"),
         ] {
             assert_eq!((kind.spec().id, kind.slug(), kind.short_name()), (id, slug, badge));
         }

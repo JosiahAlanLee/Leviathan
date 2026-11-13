@@ -312,6 +312,23 @@ pub const MACHINE_SPECS: [MachineSpec; MACHINE_COUNT] = [
             ParamSpec::new("ResoDac", 0.32),
         ],
     },
+    MachineSpec {
+        kind: MachineKind::VastTriple,
+        id: 16,
+        slug: "k26",
+        badge: "K26",
+        name: "K26 Triple VAST",
+        params: [
+            ParamSpec::new("Decay", 0.48),
+            ParamSpec::new("SourceKey", 0.25),
+            ParamSpec::new("PreTilt", 0.52),
+            ParamSpec::new("TripleAlg", 0.30),
+            ParamSpec::new("FunEq", 0.35),
+            ParamSpec::new("FunDepth", 0.46),
+            ParamSpec::new("PostCut", 0.64),
+            ParamSpec::new("PostReso", 0.36),
+        ],
+    },
 ];
 
 #[inline]

@@ -661,7 +661,7 @@ mod tests {
         };
         // Four rows at 8× and 120 BPM are 3,000 frames at 48 kHz.
         let music_frames = 3_000;
-        let live = fs77_live_frames(&project, music_frames, music_frames + 480);
+        let live = render_test_project_live(&project, music_frames, music_frames + 480);
         ExportJob::start(
             project,
             false,
@@ -690,7 +690,114 @@ mod tests {
         }
     }
 
-    fn fs77_live_frames(project: &Project, music_frames: usize, frames: usize) -> Vec<(f32, f32)> {
+    #[test]
+    fn saved_k26_lane_and_step_locks_match_live_and_wav() {
+        use leviathan_dsp::{default_lane_patches, MachineKind};
+
+        let directory =
+            std::env::temp_dir().join(format!("leviathan-k26-parity-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("k26.leviathan.json");
+        let destination = directory.join("stems");
+        let mut pattern = Pattern {
+            length: 4,
+            rate: PlaybackRate::EightX,
+            ..Pattern::default()
+        };
+        let mut patches = default_lane_patches();
+        patches[0] = LanePatch::for_machine(MachineKind::VastTriple);
+        patches[0].params[1] = 0.85;
+        patches[1] = LanePatch::for_machine(MachineKind::VastFunSynth);
+        let note = NoteCell {
+            active: true,
+            midi: 48,
+            velocity: 115,
+            gate_fraction: 1.0,
+            ..NoteCell::default()
+        };
+        pattern.lanes[0][0] = note;
+        let mut lock = SoundLock {
+            machine: 16,
+            mask: (1 << 1) | (1 << 3) | (1 << 4) | (1 << 7),
+            values: LanePatch::for_machine(MachineKind::VastTriple).params,
+        };
+        lock.values[1] = 0.65;
+        lock.values[3] = 0.20;
+        let first_lock = lock;
+        pattern.lanes[1][1] = NoteCell { lock, ..note };
+        lock.values[3] = 0.92;
+        lock.values[4] = 0.70;
+        lock.values[7] = 0.90;
+        pattern.lanes[1][2] = NoteCell { lock, ..note };
+        crate::project::save(
+            &path,
+            Project {
+                bpm: 120.0,
+                master_send: 0.0,
+                bender_params: Default::default(),
+                lane_mix: LaneMix::default(),
+                lane_patches: patches,
+                patterns: vec![pattern],
+                selected_pattern: 0,
+                chain: PatternChain::default(),
+                samples: Default::default(),
+                sample_regions: Default::default(),
+                custom_shader: None,
+            },
+        )
+        .unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains(r#""machine":"k26""#));
+        assert!(saved.contains(r#""machine":16"#));
+        let project = crate::project::load(&path).unwrap();
+        assert_eq!(project.lane_patches, patches);
+        assert_eq!(project.patterns[0].lanes[1][1].lock, first_lock);
+        assert_eq!(project.patterns[0].lanes[1][2].lock, lock);
+        let music_frames = 3_000;
+        let live = render_test_project_live(&project, music_frames, music_frames + 480);
+        ExportJob::start(
+            project,
+            false,
+            ExportRequest {
+                destination: destination.clone(),
+                settings: ExportSettings {
+                    encoding: WavEncoding::Float32,
+                    stems: true,
+                    tail_seconds: 0.01,
+                    ..ExportSettings::default()
+                },
+            },
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+        let master = std::fs::read(destination.join("master.wav")).unwrap();
+        let lane = std::fs::read(destination.join("0-k26.wav")).unwrap();
+        let locked_lane = std::fs::read(destination.join("1-vast.wav")).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        let data_start = master.len() - live.len() * 8;
+        assert_eq!(&master[data_start - 8..data_start - 4], b"data");
+        let read = |bytes: &[u8]| f32::from_le_bytes(bytes.try_into().unwrap());
+        assert_eq!(lane.len(), master.len());
+        assert_eq!(locked_lane.len(), master.len());
+        for (stem, first, last) in [
+            (&lane, 0, 750),
+            (&locked_lane, 750, 1_500),
+            (&locked_lane, 1_500, 2_250),
+        ] {
+            let samples = &stem[data_start + first * 8..data_start + last * 8];
+            assert!(samples.chunks_exact(4).any(|s| read(s).abs() > 0.01));
+        }
+        for (n, frame) in master[data_start..].chunks_exact(8).enumerate() {
+            assert_eq!(live[n], (read(&frame[..4]), read(&frame[4..])), "frame {n}");
+        }
+    }
+
+    fn render_test_project_live(
+        project: &Project,
+        music_frames: usize,
+        frames: usize,
+    ) -> Vec<(f32, f32)> {
         let (tx, rx) = rtrb::RingBuffer::new(8);
         let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(16);
         let mut audio = AudioControl::new(tx);
