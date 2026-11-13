@@ -42,8 +42,7 @@ pub(super) fn noise(state: &mut u32) -> f32 {
 }
 
 #[inline]
-pub(super) fn sine(phase: f32) -> f32 {
-    let phase = wrap_turns(phase);
+pub(super) const fn sine_cycle(phase: f32) -> f32 {
     let turns = if phase <= 0.25 {
         phase
     } else if phase <= 0.75 {
@@ -54,6 +53,11 @@ pub(super) fn sine(phase: f32) -> f32 {
     let x = turns * (2.0 * PI);
     let x2 = x * x;
     x * (1.0 + x2 * (-1.0 / 6.0 + x2 * (1.0 / 120.0 - x2 / 5040.0)))
+}
+
+#[inline]
+pub(super) fn sine(phase: f32) -> f32 {
+    sine_cycle(wrap_turns(phase))
 }
 
 #[inline]

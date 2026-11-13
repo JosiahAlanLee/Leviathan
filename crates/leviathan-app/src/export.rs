@@ -6,12 +6,14 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use leviathan_core::{EngineConfig, LaunchTarget, SongPlayer, NUM_LANES};
-use leviathan_dsp::{StereoDelay,  LanePatch,  SynthRack};
+use leviathan_dsp::{LanePatch, StereoDelay, SynthRack};
 
 use crate::project::Project;
 use crate::wav::{StereoWav, WavEncoding};
 
 pub const SAMPLE_RATES: [u32; 3] = [44_100, 48_000, 96_000];
+const BENDER_STEM_NAME: &str = "bend.wav";
+
 fn stem_filename(lane: usize, patch: &LanePatch) -> String {
     format!("{lane}-{}.wav", patch.machine.slug())
 }
@@ -172,7 +174,7 @@ fn render(
     fill: bool,
     plan: RenderPlan,
     progress: &AtomicU32,
-    mut write: impl FnMut([f32; 2], &[[f32; 2]; NUM_LANES]) -> io::Result<()>,
+    mut write: impl FnMut([f32; 2], &[[f32; 2]; NUM_LANES], [f32; 2]) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut player = SongPlayer::new(EngineConfig {
         bpm: project.bpm,
@@ -190,6 +192,7 @@ fn render(
     rack.set_lane_channels(project.lane_mix.dsp_channels());
     rack.set_lane_patches(project.lane_patches);
     rack.reset_voices();
+    rack.set_bender_params(project.bender_params);
     rack.reset_master(project.master_send);
 
     let mut stems = [[0.0; 2]; NUM_LANES];
@@ -210,12 +213,12 @@ fn render(
         if retrigger {
             rack.retrigger_gates();
         }
-        let (left, right) = if let Some(delays) = &mut stem_delays {
-            rack.render_stereo_with_wet_stems(&cv, &mut stems, delays)
+        let ((left, right), wet) = if let Some(delays) = &mut stem_delays {
+            rack.render_stereo_with_fx_stems(&cv, &mut stems, delays)
         } else {
-            rack.render_stereo(&cv)
+            (rack.render_stereo(&cv), [0.0; 2])
         };
-        write([left, right], &stems)?;
+        write([left, right], &stems, wet)?;
         if frame & 1023 == 1023 {
             progress.store(frame + 1, Ordering::Relaxed);
         }
@@ -235,34 +238,37 @@ fn write_outputs(
         require_new_folder(destination)?;
     }
     let stage = StagingDirectory::new(destination)?;
-    let lane_patches = &project.lane_patches;
-    let stem_names: [String; NUM_LANES] = core::array::from_fn(|lane| stem_filename(lane, &lane_patches[lane]));
-    let stem_file_refs: Vec<&str> = stem_names.iter().map(String::as_str).collect();
-    let names = if plan.settings.stems {
-        &stem_file_refs[..]
-    } else {
-        &[]
+    let create_writer = |name: &str| {
+        let file = File::create(stage.path.join(name))?;
+        StereoWav::new(
+            BufWriter::new(file),
+            plan.settings.encoding,
+            plan.settings.sample_rate,
+            plan.frames,
+        )
     };
-    let mut writers = std::iter::once("master.wav")
-        .chain(names.iter().copied())
-        .map(|name| {
-            let file = File::create(stage.path.join(name))?;
-            StereoWav::new(
-                BufWriter::new(file),
-                plan.settings.encoding,
-                plan.settings.sample_rate,
-                plan.frames,
-            )
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    render(project, fill, plan, progress, |master, stems| {
-        writers[0].write_frame(master)?;
-        for (writer, &stem) in writers[1..].iter_mut().zip(stems) {
+    let mut master_writer = create_writer("master.wav")?;
+    let mut lane_writers = Vec::new();
+    let mut bender_writer = None;
+    if plan.settings.stems {
+        for (lane, patch) in project.lane_patches.iter().enumerate() {
+            lane_writers.push(create_writer(&stem_filename(lane, patch))?);
+        }
+        if project.lane_mix.channels.iter().any(|channel| channel.0.fx_send > 0.0) {
+            bender_writer = Some(create_writer(BENDER_STEM_NAME)?);
+        }
+    }
+    render(project, fill, plan, progress, |master, stems, wet| {
+        master_writer.write_frame(master)?;
+        for (writer, &stem) in lane_writers.iter_mut().zip(stems) {
             writer.write_frame(stem)?;
+        }
+        if let Some(writer) = &mut bender_writer {
+            writer.write_frame(wet)?;
         }
         Ok(())
     })?;
-    for writer in writers {
+    for writer in std::iter::once(master_writer).chain(lane_writers).chain(bender_writer) {
         writer.finish()?.get_ref().sync_all()?;
     }
     if plan.settings.stems {
@@ -351,6 +357,7 @@ mod tests {
         Project {
             bpm: 120.0,
             master_send: 0.3,
+            bender_params: Default::default(),
             lane_patches: default_lane_patches(),
             lane_mix: LaneMix::default(),
             patterns: vec![pattern, second],
@@ -381,7 +388,7 @@ mod tests {
             assert_eq!(plan.frames, expected_frames);
             let mut wav = StereoWav::new(Vec::new(), encoding, sample_rate, plan.frames).unwrap();
             let written = AtomicU32::new(0);
-            render(&project, false, plan, &written, |master, _| {
+            render(&project, false, plan, &written, |master, _, _| {
                 wav.write_frame(master)
             })
             .unwrap();
@@ -507,6 +514,9 @@ mod tests {
             MachineKind::CzPhaseDist,
             MachineKind::PolivoksSub,
             MachineKind::VastFunSynth,
+            MachineKind::ElectroPerc,
+            MachineKind::WestCoastLpg,
+            MachineKind::OtisTranswave,
         ];
         for (lane, engine) in engines.into_iter().enumerate() {
             snapshot.lane_patches[lane] = LanePatch::for_machine(engine);

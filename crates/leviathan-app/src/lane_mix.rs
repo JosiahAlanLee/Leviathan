@@ -9,6 +9,8 @@ struct LaneChannelDef {
     level: f32,
     pan: f32,
     delay_send: f32,
+    #[serde(default)]
+    fx_send: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

@@ -10,3 +10,7 @@ Leviathan is authored under the `BSD-3-Clause` license using a clean-room bounda
 2. **Excluded Source Material:**
    - Zero source files, functions, or expressions are copied or translated from `AGPL-3.0-or-later` (`hydrapy`) or `GPL-3.0` (`VCV Rack` / `vcv/adapter`) repositories.
    - All Rust synthesis voices (`leviathan-dsp`), shader sources (`leviathan-gpu`), and native UI/audio shells (`leviathan-app`) are original clean-room implementations.
+
+3. **Wave 5 DSP Provenance**
+   - PERC and WEST use the roadmap's behavioral descriptions, original oscillator and envelope equations, and Leviathan's existing DSP primitives. OTIS generates its own single-cycle tables from Fourier coefficients at compile time.
+   - BEND uses the published [allpass quadrature topology](https://www.mikrocontroller.net/attachment/33904/hilbert_Olli_Niemitalo.pdf) with independently fitted coefficients and a [normalized orthogonal feedback network](https://www.di.univr.it/documenti/ArticoloRivista/allegato/allegato574545.pdf). The source inputs for Wave 5 were the roadmap, mathematical descriptions, and Leviathan's existing Rust code.

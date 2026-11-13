@@ -8,7 +8,7 @@ use leviathan_core::{
 };
 use leviathan_dsp::{
     sampler::{SampleBank, SampleRegion},
-    LaneChannel, LanePatch, MasterPeaks, SynthRack,
+    BenderParams, LaneChannel, LanePatch, MasterPeaks, SynthRack,
 };
 use leviathan_gpu::{AudioScopeSnapshot, AudioScopeTap};
 
@@ -23,6 +23,7 @@ pub enum AudioCommand {
     SetFill(bool),
     SetBpm(f64),
     SetMasterSend(f32),
+    SetBenderParams(BenderParams),
     SetLaneAudibleMask(u8),
     SetLaneChannels([LaneChannel; NUM_LANES]),
     SetLanePatch { lane: usize, patch: LanePatch },
@@ -83,9 +84,10 @@ pub struct AudioProject {
     generation: u64,
     bpm: f64,
     master_send: f32,
+    bender_params: BenderParams,
     audible_mask: u8,
     lane_channels: [LaneChannel; NUM_LANES],
-lane_patches: [LanePatch; NUM_LANES],
+    lane_patches: [LanePatch; NUM_LANES],
     patterns: Vec<Pattern>,
     selected_pattern: usize,
     chain: PatternChain,
@@ -98,9 +100,10 @@ impl AudioProject {
             generation,
             bpm: project.bpm,
             master_send: project.master_send,
+            bender_params: project.bender_params,
             audible_mask: project.lane_mix.audible_mask(),
             lane_channels: project.lane_mix.dsp_channels(),
-lane_patches: project.lane_patches,
+            lane_patches: project.lane_patches,
             patterns: project.patterns.clone(),
             selected_pattern: project.selected_pattern,
             chain: project.chain,
@@ -219,7 +222,7 @@ struct RtAudioWorker {
     patterns: Box<[Pattern]>,
     pattern_count: usize,
     player: SongPlayer,
-    synth: SynthRack,
+    synth: Box<SynthRack>,
     scope_tap: AudioScopeTap,
     cmd_rx: rtrb::Consumer<AudioCommand>,
     tel_tx: rtrb::Producer<AudioTelemetry>,
@@ -251,7 +254,8 @@ impl RtAudioWorker {
                 sample_rate,
                 ..EngineConfig::default()
             }),
-            synth: SynthRack::new(sample_rate as f32),
+            // Allocate once during setup, before the worker reaches the callback.
+            synth: Box::new(SynthRack::new(sample_rate as f32)),
             scope_tap: AudioScopeTap::new(sample_rate as f32),
             cmd_rx,
             tel_tx,
@@ -273,9 +277,10 @@ impl RtAudioWorker {
             command.apply_transport(&mut self.player, self.pattern_count);
             match command {
                 AudioCommand::SetMasterSend(send) => self.synth.set_master_send(send),
+                AudioCommand::SetBenderParams(params) => self.synth.set_bender_params(params),
                 AudioCommand::SetLaneAudibleMask(mask) => self.synth.set_lane_audible_mask(mask),
                 AudioCommand::SetLaneChannels(channels) => self.synth.set_lane_channels(channels),
-AudioCommand::SetLanePatch { lane, patch } => self.synth.set_lane_patch(lane, patch),
+                AudioCommand::SetLanePatch { lane, patch } => self.synth.set_lane_patch(lane, patch),
                 AudioCommand::SetCell {
                     pattern,
                     lane,
@@ -309,8 +314,9 @@ AudioCommand::SetLanePatch { lane, patch } => self.synth.set_lane_patch(lane, pa
                     self.synth.sample_bank.clone_from(&project.sample_bank);
                     self.synth.set_lane_audible_mask(project.audible_mask);
                     self.synth.set_lane_channels(project.lane_channels);
-            self.synth.set_lane_patches(project.lane_patches);
+                    self.synth.set_lane_patches(project.lane_patches);
                     self.synth.reset_voices();
+                    self.synth.set_bender_params(project.bender_params);
                     self.synth.reset_master(project.master_send);
                     self.generation = project.generation;
                     self.tel_divider = 255;
@@ -488,13 +494,13 @@ pub fn try_start_audio(
     let sample_rate = config.sample_rate as f64;
     let channels = (config.channels as usize).max(1);
 
-    let mut worker = Box::new(RtAudioWorker::new(
+    let mut worker = RtAudioWorker::new(
         initial_pattern,
         sample_rate,
         cmd_rx,
         tel_tx,
         Some(midi_events),
-    ));
+    );
 
     let err_fn = |err| eprintln!("leviathan audio stream error: {err}");
 
@@ -581,7 +587,7 @@ mod tests {
     use leviathan_core::PlaybackRate;
 
     #[test]
-    fn wav_master_matches_the_live_mix_and_stems_include_the_lane_echo() {
+    fn wav_master_matches_live_playback_and_stems_include_delay_and_bend() {
         let (tx, rx) = rtrb::RingBuffer::new(8);
         let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(32);
         let mut audio = AudioControl::new(tx);
@@ -606,6 +612,7 @@ mod tests {
             level: 1.0,
             pan: -1.0,
             delay_send: 0.75,
+            fx_send: 0.8,
         };
         let mut sample_regions = [SampleRegion::default(); leviathan_dsp::sampler::NUM_BANKS];
         sample_regions[0] = SampleRegion {
@@ -613,12 +620,22 @@ mod tests {
             trim_end: 0.2,
             loop_enabled: true,
         };
-        let project = Project {
+        let bender_params = BenderParams {
+            shift_norm: 0.27,
+            feedback: 0.62,
+            decay: 0.7,
+            freeze: false,
+        };
+        let project = |freeze| Project {
             bpm: 120.0,
             master_send: 0.0,
+            bender_params: BenderParams {
+                freeze,
+                ..bender_params
+            },
             lane_patches: leviathan_dsp::default_lane_patches(),
             lane_mix,
-            patterns: vec![pattern],
+            patterns: vec![pattern.clone()],
             selected_pattern: 0,
             chain: PatternChain::default(),
             samples: Default::default(),
@@ -626,7 +643,7 @@ mod tests {
             custom_shader: None,
         };
         audio.send(AudioCommand::ReplaceProject(Arc::new(
-            AudioProject::prepare(&project, 1),
+            AudioProject::prepare(&project(false), 1),
         )));
         audio.send(AudioCommand::SetPlaying {
             playing: true,
@@ -637,36 +654,56 @@ mod tests {
 
         let destination =
             std::env::temp_dir().join(format!("leviathan-mixer-parity-{}", std::process::id()));
-        let request = ExportRequest {
-            destination: destination.clone(),
-            settings: ExportSettings {
-                encoding: WavEncoding::Float32,
-                stems: true,
-                tail_seconds: 0.04,
-                ..ExportSettings::default()
-            },
+        let settings = ExportSettings {
+            encoding: WavEncoding::Float32,
+            stems: true,
+            tail_seconds: 0.07,
+            ..ExportSettings::default()
         };
-        ExportJob::start(project, false, request)
+        let bounce = |name, stems, freeze| {
+            ExportJob::start(
+                project(freeze),
+                false,
+                ExportRequest {
+                    settings: ExportSettings { stems, ..settings },
+                    destination: destination.join(name),
+                },
+            )
             .unwrap()
             .finish()
             .unwrap();
-        let master = std::fs::read(destination.join("master.wav")).unwrap();
-        let stem = std::fs::read(destination.join("4-smpl.wav")).unwrap();
+        };
+        std::fs::create_dir(&destination).unwrap();
+        bounce("wet", true, false);
+        bounce("wet.wav", false, false);
+        bounce("frozen", true, true);
+
+        let master = std::fs::read(destination.join("wet/master.wav")).unwrap();
+        assert_eq!(std::fs::read(destination.join("wet.wav")).unwrap(), master);
+        let stem = std::fs::read(destination.join("wet/4-smpl.wav")).unwrap();
+        let bend = std::fs::read(destination.join("wet/bend.wav")).unwrap();
+        let frozen_master = std::fs::read(destination.join("frozen/master.wav")).unwrap();
+        let frozen_bend = std::fs::read(destination.join("frozen/bend.wav")).unwrap();
+        assert_ne!(frozen_master, master);
+        assert_eq!(
+            std::fs::read(destination.join("frozen/4-smpl.wav")).unwrap(),
+            stem
+        );
         std::fs::remove_dir_all(destination).unwrap();
-        let frames = 750 + 1920;
-        assert_eq!(stem.len(), master.len());
+        let frames = 750 + 3360;
         let data_offset = master.len() - frames * 8;
-        for bytes in [&master, &stem] {
+        for bytes in [&master, &stem, &bend, &frozen_bend] {
+            assert_eq!(bytes.len(), master.len());
             assert_eq!(&bytes[data_offset - 8..data_offset - 4], b"data");
             let data_len = u32::from_le_bytes(bytes[data_offset - 4..data_offset].try_into().unwrap());
             assert_eq!(data_len as usize, frames * 8);
         }
+        assert!(frozen_bend[data_offset..].iter().all(|&byte| byte == 0));
         let read_channel = |bytes: &[u8], frame: usize, channel: usize| {
             let offset = data_offset + 8 * frame + 4 * channel;
             f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
         };
-        let mut dry_energy = 0.0;
-        let mut wet_energy = 0.0;
+        let mut energy = [0.0; 3];
         for frame in 0..frames {
             if frame == 750 {
                 audio.send(AudioCommand::SetPlaying {
@@ -680,14 +717,60 @@ mod tests {
             assert_eq!(read_channel(&master, frame, 1), right);
             let stem_right = read_channel(&stem, frame, 1);
             if frame < 1008 {
-                assert_eq!(right, 0.0);
                 assert_eq!(stem_right, 0.0);
-                dry_energy += read_channel(&stem, frame, 0).abs();
+                energy[0] += read_channel(&stem, frame, 0).abs();
             } else {
-                wet_energy += stem_right.abs();
+                energy[1] += stem_right.abs();
             }
+            energy[2] += read_channel(&bend, frame, 0).abs() + read_channel(&bend, frame, 1).abs();
         }
-        assert!(dry_energy > 0.1 && wet_energy > 0.1);
+        assert!(energy.iter().all(|&sum| sum > 0.1), "{energy:?}");
+    }
+
+    #[test]
+    fn freeze_command_holds_audition_tail_through_lane_mute_and_releases_it() {
+        let (mut midi, receiver) = MidiControls::new();
+        let (tx, rx) = rtrb::RingBuffer::new(8);
+        let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(16);
+        let mut audio = AudioControl::new(tx);
+        let mut worker = RtAudioWorker::new(Pattern::default(), 8_000.0, rx, tel_tx, Some(receiver));
+        let mut channels = leviathan_dsp::DEFAULT_LANE_CHANNELS;
+        channels[1].fx_send = 1.0;
+        audio.send(AudioCommand::SetLaneChannels(channels));
+        audio.send(AudioCommand::SetMidiTarget(MidiTarget {
+            lane: 1,
+            ..MidiTarget::default()
+        }));
+        midi.inject(MidiEvent::NoteOn {
+            key: MidiKey {
+                channel: 0,
+                note: 57,
+            },
+            velocity: 110,
+        });
+        worker.drain_commands();
+        let energy = |worker: &mut RtAudioWorker, frames| {
+            (0..frames)
+                .map(|_| {
+                    let (l, r) = worker.next_stereo();
+                    l * l + r * r
+                })
+                .sum::<f32>()
+        };
+        assert!(energy(&mut worker, 1000) > 0.1);
+        audio.send(AudioCommand::SetBenderParams(BenderParams {
+            freeze: true,
+            ..BenderParams::default()
+        }));
+        audio.send(AudioCommand::SetLaneAudibleMask(0));
+        worker.drain_commands();
+        energy(&mut worker, 8_000);
+        assert!(energy(&mut worker, 4_000) > 1e-4);
+        audio.send(AudioCommand::SetBenderParams(BenderParams::default()));
+        worker.drain_commands();
+        energy(&mut worker, 8_000);
+        assert!(energy(&mut worker, 4_000) < 1e-8);
+        assert!(worker.midi_preview[1].unwrap().key.is_some());
     }
 
     #[test]
@@ -757,6 +840,7 @@ mod tests {
         let project = Project {
             bpm: 120.0,
             master_send: 0.4,
+            bender_params: BenderParams::default(),
             lane_patches: leviathan_dsp::default_lane_patches(),
             lane_mix: Default::default(),
             patterns: vec![first, second],
@@ -815,6 +899,7 @@ mod tests {
         let oversized = Project {
             bpm: 120.0,
             master_send: 0.0,
+            bender_params: BenderParams::default(),
             lane_patches: leviathan_dsp::default_lane_patches(),
             lane_mix: Default::default(),
             patterns: vec![Pattern::default(); PATTERN_BANK_CAPACITY + 4],
@@ -1065,6 +1150,7 @@ mod tests {
         let project = Project {
             bpm: 120.0,
             master_send: 0.0,
+            bender_params: BenderParams::default(),
             lane_patches: leviathan_dsp::default_lane_patches(),
             lane_mix: LaneMix {
                 mute_mask: 1,

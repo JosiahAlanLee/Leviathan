@@ -1,8 +1,31 @@
 use eframe::egui;
-use leviathan_dsp::MasterPeaks;
+use leviathan_dsp::{BenderParams, MasterPeaks, BENDER_MAX_SHIFT_HZ};
 
 const LEVEL_FLOOR: f32 = 0.001;
 const CLIP_HOLD_SECONDS: f64 = 1.0;
+
+pub fn draw_bender(ui: &mut egui::Ui, params: &mut BenderParams) -> bool {
+    let before = *params;
+    egui::CollapsingHeader::new("BEND").show(ui, |ui| {
+        let mut shift_hz = params.shift_hz();
+        if ui
+            .add(
+                egui::Slider::new(&mut shift_hz, -BENDER_MAX_SHIFT_HZ..=BENDER_MAX_SHIFT_HZ)
+                    .step_by(1.0)
+                    .suffix(" Hz")
+                    .text("Shift"),
+            )
+            .changed()
+        {
+            params.shift_norm = 0.5 * (shift_hz / BENDER_MAX_SHIFT_HZ + 1.0);
+        }
+        ui.add(egui::Slider::new(&mut params.feedback, 0.0..=1.0).text("Feedback"));
+        ui.add(egui::Slider::new(&mut params.decay, 0.0..=1.0).text("Tank Decay"));
+        ui.checkbox(&mut params.freeze, "Freeze")
+            .on_hover_text("Hold the current tank. WAV export starts with an empty tank.");
+    });
+    *params != before
+}
 
 #[derive(Default)]
 pub struct MasterMeters {

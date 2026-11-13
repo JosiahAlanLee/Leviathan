@@ -7,7 +7,7 @@ use crate::lane_mix::LaneMix;
 pub fn draw(ui: &mut egui::Ui, mix: &mut LaneMix, patches: &[LanePatch; NUM_LANES]) {
     egui::CollapsingHeader::new("Lane Mixer").show(ui, |ui| {
         egui::Grid::new("lane_mixer").striped(true).show(ui, |ui| {
-            for label in ["Lane", "Level", "Pan", "Delay Send"] {
+            for label in ["Lane", "Level", "Pan", "Delay Send", "BEND Send"] {
                 ui.strong(label);
             }
             ui.end_row();
@@ -27,7 +27,12 @@ pub fn draw(ui: &mut egui::Ui, mix: &mut LaneMix, patches: &[LanePatch; NUM_LANE
                 );
                 ui.add(
                     egui::DragValue::new(&mut channel.delay_send)
-                        .range(0.0..=1.25)
+                        .range(0.0..=1.0)
+                        .speed(0.005),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut channel.fx_send)
+                        .range(0.0..=1.0)
                         .speed(0.005),
                 );
                 ui.end_row();

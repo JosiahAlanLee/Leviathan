@@ -1,13 +1,17 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
+mod bender;
 mod cz;
 pub mod fm;
 mod master;
+mod otis;
+mod perc;
 mod pvx;
 pub mod sampler;
 pub mod spec;
 mod vast;
 mod voice;
+mod west;
 
 use core::f32::consts::{FRAC_1_PI, FRAC_1_SQRT_2, FRAC_2_PI, PI, TAU};
 use fm::FourOpFmVoice;
@@ -15,13 +19,14 @@ use leviathan_core::{CvFrame, SoundLock, NUM_LANES};
 use master::{MasterBus, MAX_SEND};
 use sampler::{SampleBank, VarClockSamplerVoice};
 
+pub use bender::{BenderParams, BENDER_MAX_SHIFT_HZ};
 pub use master::{MasterPeaks, StereoDelay};
 pub use spec::{
     default_lane_patches, machine_spec, LanePatch, MachineSpec, ParamSpec, DEFAULT_LANE_MACHINES,
     DEFAULT_LANE_PATCHES, MACHINE_SPECS,
 };
 
-pub const MACHINE_COUNT: usize = 10;
+pub const MACHINE_COUNT: usize = 13;
 pub const ALL_LANES_AUDIBLE: u8 = (1 << NUM_LANES) - 1;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -29,6 +34,7 @@ pub struct LaneChannel {
     pub level: f32,
     pub pan: f32,
     pub delay_send: f32,
+    pub fx_send: f32,
 }
 
 impl LaneChannel {
@@ -37,6 +43,7 @@ impl LaneChannel {
             level,
             pan,
             delay_send: 0.0,
+            fx_send: 0.0,
         }
     }
 
@@ -45,12 +52,14 @@ impl LaneChannel {
         (0.0..=1.25).contains(&self.level)
             && (-1.0..=1.0).contains(&self.pan)
             && (0.0..=1.0).contains(&self.delay_send)
+            && (0.0..=1.0).contains(&self.fx_send)
     }
 
     fn slew(&mut self, target: Self, coefficient: f32) {
         self.level = slew(self.level, target.level, coefficient);
         self.pan = slew(self.pan, target.pan, coefficient);
         self.delay_send = slew(self.delay_send, target.delay_send, coefficient);
+        self.fx_send = slew(self.fx_send, target.fx_send, coefficient);
     }
 }
 
@@ -99,6 +108,9 @@ pub enum MachineKind {
     CzPhaseDist = 7,
     PolivoksSub = 8,
     VastFunSynth = 9,
+    ElectroPerc = 10,
+    WestCoastLpg = 11,
+    OtisTranswave = 12,
 }
 
 impl MachineKind {
@@ -125,6 +137,9 @@ impl MachineKind {
         Self::CzPhaseDist,
         Self::PolivoksSub,
         Self::VastFunSynth,
+        Self::ElectroPerc,
+        Self::WestCoastLpg,
+        Self::OtisTranswave,
     ];
 
     pub const fn from_id(id: usize) -> Self {
@@ -142,7 +157,12 @@ impl MachineKind {
     const fn is_expansion(self) -> bool {
         matches!(
             self,
-            Self::CzPhaseDist | Self::PolivoksSub | Self::VastFunSynth
+            Self::CzPhaseDist
+                | Self::PolivoksSub
+                | Self::VastFunSynth
+                | Self::ElectroPerc
+                | Self::WestCoastLpg
+                | Self::OtisTranswave
         )
     }
 
@@ -304,6 +324,9 @@ struct VoiceState {
     cz: cz::Voice,
     pvx: pvx::Voice,
     vast: vast::Voice,
+    perc: perc::Voice,
+    west: west::Voice,
+    otis: otis::Voice,
     active_machine: Option<MachineKind>,
     note_pitch: f32,
     note_lock: SoundLock,
@@ -326,6 +349,9 @@ impl Default for VoiceState {
             cz: cz::Voice::default(),
             pvx: pvx::Voice::default(),
             vast: vast::Voice::default(),
+            perc: perc::Voice::default(),
+            west: west::Voice::default(),
+            otis: otis::Voice::default(),
             active_machine: None,
             note_pitch: 0.0,
             note_lock: SoundLock::default(),
@@ -345,6 +371,9 @@ impl VoiceState {
         self.cz = cz::Voice::default();
         self.pvx = pvx::Voice::default();
         self.vast.reset();
+        self.perc = perc::Voice::default();
+        self.west = west::Voice::default();
+        self.otis = otis::Voice::default();
         self.active_machine = None;
     }
 
@@ -402,6 +431,11 @@ impl VoiceState {
                         .step(hz, sample_rate, trigger, &params, &mut self.rng)
                 }
                 MachineKind::VastFunSynth => self.vast.step(hz, sample_rate, trigger, &params),
+                MachineKind::ElectroPerc => {
+                    self.perc.step(hz, sample_rate, trigger, &params, &mut self.rng)
+                }
+                MachineKind::WestCoastLpg => self.west.step(hz, sample_rate, gate, trigger, &params),
+                MachineKind::OtisTranswave => self.otis.step(hz, sample_rate, trigger, &params),
                 _ => 0.0,
             };
         }
@@ -591,6 +625,10 @@ impl SynthRack {
         self.master.set_send(send);
     }
 
+    pub fn set_bender_params(&mut self, params: BenderParams) {
+        self.master.set_bender_params(params);
+    }
+
     pub fn reset_master(&mut self, send: f32) {
         self.master.reset(send);
     }
@@ -617,7 +655,7 @@ impl SynthRack {
 
     #[inline]
     pub fn render_stereo(&mut self, cv: &CvFrame) -> (f32, f32) {
-        self.render_mix(cv, None, None)
+        self.render_mix(cv, None, None).0
     }
 
     /// Renders the master and taps each lane after gain and pan, before the master bus.
@@ -627,7 +665,7 @@ impl SynthRack {
         cv: &CvFrame,
         stems: &mut [[f32; 2]; NUM_LANES],
     ) -> (f32, f32) {
-        self.render_mix(cv, Some(stems), None)
+        self.render_mix(cv, Some(stems), None).0
     }
 
     /// Includes each lane's own contribution to the delay in its stem.
@@ -637,6 +675,17 @@ impl SynthRack {
         stems: &mut [[f32; 2]; NUM_LANES],
         delays: &mut [StereoDelay; NUM_LANES],
     ) -> (f32, f32) {
+        self.render_stereo_with_fx_stems(cv, stems, delays).0
+    }
+
+    /// Renders the master, each lane's own delay contribution, and the shared
+    /// BEND return as a separate stereo stem tapped before the master limiter.
+    pub fn render_stereo_with_fx_stems(
+        &mut self,
+        cv: &CvFrame,
+        stems: &mut [[f32; 2]; NUM_LANES],
+        delays: &mut [StereoDelay; NUM_LANES],
+    ) -> ((f32, f32), [f32; 2]) {
         self.render_mix(cv, Some(stems), Some(delays))
     }
 
@@ -646,10 +695,11 @@ impl SynthRack {
         cv: &CvFrame,
         mut stems: Option<&mut [[f32; 2]; NUM_LANES]>,
         mut stem_delays: Option<&mut [StereoDelay; NUM_LANES]>,
-    ) -> (f32, f32) {
+    ) -> ((f32, f32), [f32; 2]) {
         let _bus_step = self.counter.step(cv.bytebus_v[8] > 5.0, cv.reset_v > 5.0);
         let mut dry_mix = [0.0_f32; 2];
         let mut delay_mix = [0.0_f32; 2];
+        let mut fx_mix = [0.0_f32; 2];
         let master_send = self.master.next_send();
 
         for (lane, v) in self.voices.iter_mut().enumerate() {
@@ -674,9 +724,12 @@ impl SynthRack {
             // send uses the remaining range so the total stays bounded.
             let send_gain = master_send + v.channel.delay_send * (MAX_SEND - master_send);
             let send = dry.map(|sample| sample * send_gain);
+            // Leave headroom for several lanes exciting the shared tank.
+            let fx_gain = v.channel.fx_send * 0.5;
             for channel in 0..2 {
                 dry_mix[channel] += dry[channel];
                 delay_mix[channel] += send[channel];
+                fx_mix[channel] += dry[channel] * fx_gain;
             }
             if let Some(stems) = &mut stems {
                 stems[lane] = if let Some(delays) = &mut stem_delays {
@@ -687,8 +740,8 @@ impl SynthRack {
             }
         }
 
-        let [left, right] = self.master.process(dry_mix, delay_mix);
-        (left, right)
+        let ([left, right], wet) = self.master.process(dry_mix, delay_mix, fx_mix);
+        ((left, right), wet)
     }
 }
 
@@ -720,6 +773,7 @@ mod tests {
             assert!((actual[0] - (1.0 - old)).abs() < 2e-7);
             assert!((actual[1] - old).abs() < 2e-7);
             assert_eq!(channel.delay_send, 0.0);
+            assert_eq!(channel.fx_send, 0.0);
         }
     }
 
@@ -731,6 +785,7 @@ mod tests {
             level: 0.0,
             pan: 1.0,
             delay_send: 1.0,
+            fx_send: 1.0,
         };
         rack.set_lane_channels(target);
         rack.render_stereo(&CvFrame::default());
@@ -739,6 +794,7 @@ mod tests {
         assert!((DEFAULT_LANE_CHANNELS[0].pan..-0.65).contains(&actual.pan));
         assert!((0.0..0.01).contains(&actual.delay_send));
         assert!(actual.delay_send > 0.0);
+        assert_eq!(actual.fx_send, actual.delay_send);
         for _ in 0..4096 {
             rack.render_stereo(&CvFrame::default());
         }
@@ -903,6 +959,13 @@ mod tests {
             assert_eq!(kind.short_name(), kind.spec().badge);
             assert!(LanePatch::for_machine(kind).is_valid());
         }
+        for (kind, id, slug, badge) in [
+            (MachineKind::ElectroPerc, 10, "perc", "PERC"),
+            (MachineKind::WestCoastLpg, 11, "west", "WEST"),
+            (MachineKind::OtisTranswave, 12, "otis", "OTIS"),
+        ] {
+            assert_eq!((kind.spec().id, kind.slug(), kind.short_name()), (id, slug, badge));
+        }
         let mut patch = LanePatch::for_machine(MachineKind::ChordStab);
         patch.params[0] = 0.90;
         patch.params[2] = 0.80;
@@ -935,6 +998,9 @@ mod tests {
             MachineKind::CzPhaseDist,
             MachineKind::PolivoksSub,
             MachineKind::VastFunSynth,
+            MachineKind::ElectroPerc,
+            MachineKind::WestCoastLpg,
+            MachineKind::OtisTranswave,
         ];
         for (lane, engine) in engines.into_iter().enumerate() {
             rack.set_lane_patch(lane, LanePatch::for_machine(engine));
@@ -948,7 +1014,7 @@ mod tests {
             cv.gate_v[lane] = 10.0;
             cv.velocity_v[lane] = 10.0;
         }
-        let mut energy = [0.0_f32; 3];
+        let mut energy = [0.0_f32; NUM_LANES];
         for _ in 0..1024 {
             rack.render_stereo_with_stems(&cv, &mut stems);
             for (sum, stem) in energy.iter_mut().zip(stems) {
@@ -993,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn cz_renders_every_tracker_ratchet() {
+    fn cz_and_electro_perc_render_every_tracker_ratchet() {
         let mut pattern = Pattern::default();
         pattern.lanes[0][0] = NoteCell {
             active: true,
@@ -1012,19 +1078,25 @@ mod tests {
         let mut patch = LanePatch::for_machine(MachineKind::CzPhaseDist);
         patch.params[3] = 0.0;
         rack.set_lane_patch(0, patch);
-        let mut peaks = [0.0_f32; 4];
+        pattern.lanes[1][0] = pattern.lanes[0][0];
+        rack.set_lane_patch(1, LanePatch::for_machine(MachineKind::ElectroPerc));
+        let mut peaks = [[0.0_f32; 2]; 4];
+        let mut stems = [[0.0; 2]; NUM_LANES];
         let mut attacks = 0;
         for _ in 0..6000 {
             let cv = evaluator.step_sample(&pattern);
             if cv.retrigger_mask & 1 != 0 {
                 attacks += 1;
             }
-            let (left, right) = rack.render_stereo(&cv);
+            assert_eq!(cv.retrigger_mask & 1, (cv.retrigger_mask >> 1) & 1);
+            rack.render_stereo_with_stems(&cv, &mut stems);
             if attacks > 0 {
-                peaks[attacks - 1] = peaks[attacks - 1].max(left.abs()).max(right.abs());
+                for (peak, [left, right]) in peaks[attacks - 1].iter_mut().zip(stems) {
+                    *peak = peak.max(left.abs()).max(right.abs());
+                }
             }
         }
         assert_eq!(attacks, 4);
-        assert!(peaks.iter().all(|&peak| peak > 0.04));
+        assert!(peaks.into_iter().flatten().all(|peak| peak > 0.04), "{peaks:?}");
     }
 }
