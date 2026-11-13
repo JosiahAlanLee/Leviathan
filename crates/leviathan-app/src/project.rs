@@ -358,6 +358,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("leviathan-round-trip-{}.json", std::process::id()));
         let mut patterns: Vec<_> = std::iter::repeat_with(Pattern::default).take(2).collect();
+        patterns[0].lanes[1][0].lock.machine = MachineKind::OtisTwin as i16;
         patterns[1].rate = PlaybackRate::Half;
         patterns[1].swing = 0.625;
         patterns[1].lanes[4][63] = NoteCell {
@@ -409,11 +410,13 @@ mod tests {
             decay: 0.7,
             freeze: true,
         };
+        let mut lane_patches = default_lane_patches();
+        lane_patches[0] = LanePatch::for_machine(MachineKind::OtisTwin);
         let snapshot = |bpm, master_send, selected_pattern, lane_mix| Project {
             bpm,
             master_send,
             bender_params,
-            lane_patches: default_lane_patches(),
+            lane_patches,
             lane_mix,
             selected_pattern,
             chain,
@@ -435,11 +438,15 @@ mod tests {
         mix.channels[4].0.delay_send = 0.75;
         mix.channels[4].0.fx_send = 0.61;
         save(&path, snapshot(bpm, send, 1, mix)).unwrap();
+        let stored = fs::read_to_string(&path).unwrap();
+        assert!(stored.contains(r#""machine":"otis2""#));
+        assert!(stored.contains(r#""machine":14"#));
         let project = load(&path).unwrap();
         fs::remove_file(path).unwrap();
         assert_eq!(project.bpm.to_bits(), bpm.to_bits());
         assert_eq!(project.master_send.to_bits(), send.to_bits());
         assert_eq!(project.bender_params, bender_params);
+        assert_eq!(project.lane_patches, lane_patches);
         assert_eq!(project.lane_mix, mix);
         assert_eq!(project.sample_regions, sample_regions);
         assert_eq!(project.sample_bank().regions, sample_regions);

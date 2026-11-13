@@ -278,6 +278,23 @@ pub const MACHINE_SPECS: [MachineSpec; MACHINE_COUNT] = [
             ParamSpec::new("SubBit", 0.35),
         ],
     },
+    MachineSpec {
+        kind: MachineKind::OtisTwin,
+        id: 14,
+        slug: "otis2",
+        badge: "OT2",
+        name: "OTIS Twin / Series",
+        params: [
+            ParamSpec::new("Decay", 0.48),
+            ParamSpec::new("TableSel", 0.00),
+            ParamSpec::new("FramePos", 0.20),
+            ParamSpec::new("ScanDepth", 0.55),
+            ParamSpec::new("FilterF1", 0.68),
+            ParamSpec::new("FilterF2", 0.35),
+            ParamSpec::new("TwinSpread", 0.42),
+            ParamSpec::new("ModeGrit", 0.45),
+        ],
+    },
 ];
 
 #[inline]
