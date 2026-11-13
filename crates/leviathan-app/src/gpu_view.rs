@@ -407,7 +407,9 @@ impl GpuPingPong {
                 ..Default::default()
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_groups[src], &[]);
+            // bind_groups[i] samples views[1 - i], so the group that reads the
+        // front texture (views[src]) while we render into views[dst] is [dst].
+        pass.set_bind_group(0, &self.bind_groups[dst], &[]);
             pass.set_bind_group(1, &self.audio_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
