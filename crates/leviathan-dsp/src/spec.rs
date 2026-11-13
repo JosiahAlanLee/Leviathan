@@ -351,6 +351,20 @@ impl LanePatch {
         }
     }
 
+    pub const fn for_machine_with_calibration(machine: MachineKind) -> Self {
+        let mut patch = Self::for_machine(machine);
+        match machine {
+            MachineKind::VarSampler => {
+                patch.params[3] = 0.35;
+                patch.params[5] = 1.0;
+            }
+            MachineKind::CzPhaseDist => patch.params[7] = 0.5,
+            MachineKind::PolivoksSub => patch.params[1] = 0.5,
+            _ => {}
+        }
+        patch
+    }
+
     #[inline]
     pub fn is_valid(&self) -> bool {
         let mut i = 0;

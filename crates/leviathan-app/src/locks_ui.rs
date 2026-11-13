@@ -2,7 +2,19 @@ use eframe::egui;
 use leviathan_core::SOUND_PARAMS;
 use leviathan_dsp::{LanePatch, MACHINE_SPECS};
 
-pub fn draw_lane_patch_inspector(ui: &mut egui::Ui, lane: usize, patch: &mut LanePatch) -> bool {
+pub fn draw_lane_patch_inspector(
+    ui: &mut egui::Ui,
+    lane: usize,
+    patch: &mut LanePatch,
+    calibrated: bool,
+) -> bool {
+    let defaults = |machine| {
+        if calibrated {
+            LanePatch::for_machine_with_calibration(machine)
+        } else {
+            LanePatch::for_machine(machine)
+        }
+    };
     let mut dirty = false;
     egui::CollapsingHeader::new(format!("Lane {} Patch ({})", lane + 1, patch.machine.display_name()))
         .default_open(true)
@@ -15,7 +27,7 @@ pub fn draw_lane_patch_inspector(ui: &mut egui::Ui, lane: usize, patch: &mut Lan
                         .clicked()
                         && patch.machine != spec.kind
                     {
-                        *patch = LanePatch::for_machine(spec.kind);
+                        *patch = defaults(spec.kind);
                         dirty = true;
                     }
                 }
@@ -24,7 +36,7 @@ pub fn draw_lane_patch_inspector(ui: &mut egui::Ui, lane: usize, patch: &mut Lan
                     .on_hover_text("Restore default macro knobs for this machine")
                     .clicked()
                 {
-                    *patch = LanePatch::for_machine(patch.machine);
+                    *patch = defaults(patch.machine);
                     dirty = true;
                 }
             });

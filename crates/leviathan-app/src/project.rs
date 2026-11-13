@@ -36,6 +36,7 @@ pub struct Project {
     pub samples: [Option<DecodedWav>; NUM_BANKS],
     pub sample_regions: [SampleRegion; NUM_BANKS],
     pub custom_shader: Option<CustomShader>,
+    pub voice_calibration: bool,
 }
 
 impl Project {
@@ -74,6 +75,8 @@ struct ProjectFile {
     sample_regions: [StoredSampleRegion; NUM_BANKS],
     #[serde(default)]
     custom_shader: Option<CustomShader>,
+    #[serde(default)]
+    voice_calibration: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -253,6 +256,7 @@ impl ProjectFile {
             samples,
             sample_regions,
             custom_shader: self.custom_shader,
+            voice_calibration: self.voice_calibration,
         })
     }
 }
@@ -326,6 +330,7 @@ pub fn save(path: &Path, project: Project) -> Result<(), String> {
         }),
         sample_regions: project.sample_regions.map(StoredSampleRegion),
         custom_shader: project.custom_shader,
+        voice_calibration: project.voice_calibration,
     };
     let mut bytes = serde_json::to_vec(&project).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
@@ -437,6 +442,7 @@ mod tests {
             samples: samples.clone(),
             sample_regions,
             custom_shader: None,
+            voice_calibration: true,
         };
         save(&path, snapshot(120.0, 0.0, 0, LaneMix::default())).unwrap();
         let bpm = f64::from_bits(120.0_f64.to_bits() + 1);
@@ -455,11 +461,18 @@ mod tests {
         assert!(stored.contains(r#""machine":"otis2""#));
         assert!(stored.contains(r#""machine":14"#));
         let project = load(&path).unwrap();
+        let mut legacy_json: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        legacy_json.as_object_mut().unwrap().remove("voice_calibration");
+        fs::write(&path, serde_json::to_vec(&legacy_json).unwrap()).unwrap();
+        let legacy = load(&path).unwrap();
+        assert!(!legacy.voice_calibration);
+        assert_eq!(legacy.lane_patches, lane_patches);
         fs::remove_file(path).unwrap();
         assert_eq!(project.bpm.to_bits(), bpm.to_bits());
         assert_eq!(project.master_send.to_bits(), send.to_bits());
         assert_eq!(project.delay_mode, DelayMode::LongPingPong);
         assert_eq!(project.bender_params, bender_params);
+        assert!(project.voice_calibration);
         assert_eq!(project.lane_patches, lane_patches);
         assert_eq!(project.lane_mix, mix);
         assert_eq!(project.sample_regions, sample_regions);
@@ -502,6 +515,7 @@ mod tests {
             sample_banks: core::array::from_fn(|_| None),
             sample_regions: Default::default(),
             custom_shader: None,
+            voice_calibration: false,
         };
         let mut json = serde_json::to_value(&project).unwrap();
         assert!(project_error(&json).contains("version"));
@@ -533,6 +547,7 @@ mod tests {
             sample_banks: core::array::from_fn(|_| None),
             sample_regions: Default::default(),
             custom_shader: None,
+            voice_calibration: false,
         };
         let json = serde_json::to_value(&project).unwrap();
         assert!(project_error(&json).contains("Invalid sound lock"));
@@ -574,6 +589,7 @@ mod tests {
                 samples: core::array::from_fn(|_| None),
                 sample_regions: Default::default(),
                 custom_shader: None,
+                voice_calibration: false,
             },
         )
         .unwrap();
@@ -605,6 +621,7 @@ mod tests {
             sample_banks: core::array::from_fn(|_| None),
             sample_regions: Default::default(),
             custom_shader: None,
+            voice_calibration: false,
         };
         let mut json = serde_json::to_value(project).unwrap();
         let fields = json.as_object_mut().unwrap();
@@ -720,6 +737,7 @@ mod tests {
                 samples,
                 sample_regions: Default::default(),
                 custom_shader: Some(shader.clone()),
+                voice_calibration: false,
             },
         )
         .unwrap();

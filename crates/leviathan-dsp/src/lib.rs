@@ -425,6 +425,7 @@ impl VoiceState {
         sample_rate: f32,
         sample_bank: &SampleBank,
         bus_word: Option<u8>,
+        calibrated: bool,
     ) -> f32 {
         let gate = cv.gate_v[lane] > 2.5;
         let velocity = cv.velocity_v[lane];
@@ -462,10 +463,9 @@ impl VoiceState {
                 }
             });
             return match active {
-                MachineKind::CzPhaseDist => {
-                    self.cz
-                        .step(hz, sample_rate, gate, trigger, &params, &mut self.rng)
-                }
+                MachineKind::CzPhaseDist => self.cz.step(
+                    hz, sample_rate, gate, trigger, &params, &mut self.rng, calibrated,
+                ),
                 MachineKind::PolivoksSub => {
                     self.pvx
                         .step(hz, sample_rate, trigger, &params, &mut self.rng)
@@ -476,8 +476,12 @@ impl VoiceState {
                     self.perc.step(hz, sample_rate, trigger, &params, &mut self.rng)
                 }
                 MachineKind::WestCoastLpg => self.west.step(hz, sample_rate, gate, trigger, &params),
-                MachineKind::OtisTranswave => self.otis.step(hz, sample_rate, trigger, &params),
-                MachineKind::OtisTwin => self.otis_twin.step(hz, sample_rate, gate, trigger, &params),
+                MachineKind::OtisTranswave => {
+                    self.otis.step(hz, sample_rate, trigger, &params, calibrated)
+                }
+                MachineKind::OtisTwin => {
+                    self.otis_twin.step(hz, sample_rate, gate, trigger, &params, calibrated)
+                }
                 MachineKind::ByteBusR2r => {
                     self.bbus.step(hz, sample_rate, gate, trigger, bus_word, &params)
                 }
@@ -529,7 +533,13 @@ impl VoiceState {
                 let drive = 1.8 + 2.2 * lock_param(&lock, 1, 0.35).clamp(0.0, 1.0);
                 fast_tanh(drive * fast_sin_turns(self.phase) * self.env)
             }
-            MachineKind::FourOpFm => self.fm.step_sample(base_hz, sample_rate, self.env, &lock),
+            MachineKind::FourOpFm => {
+                if calibrated {
+                    self.fm.step_calibrated(base_hz, sample_rate, self.env, &lock)
+                } else {
+                    self.fm.step_sample(base_hz, sample_rate, self.env, &lock)
+                }
+            }
             MachineKind::SubBass => {
                 let saw = 2.0 * self.phase - 1.0;
                 let drive = 1.6 + (lock.values[1] - 0.5) * 2.0;
@@ -583,7 +593,19 @@ impl VoiceState {
         let v2 = self.ic2eq + a2 * self.ic1eq + a3 * v3;
         self.ic1eq = 2.0 * v1 - self.ic1eq;
         self.ic2eq = 2.0 * v2 - self.ic2eq;
-        v2
+        if calibrated {
+            v2 * match machine {
+                MachineKind::FourOpFm => 1.58,
+                MachineKind::SubBass => 1.26,
+                MachineKind::NoiseWash => 1.42,
+                MachineKind::VarSampler => 0.85,
+                MachineKind::AcidLead => 0.56,
+                MachineKind::ChordStab => 1.68,
+                _ => 1.0,
+            }
+        } else {
+            v2
+        }
     }
 }
 
@@ -597,6 +619,7 @@ pub struct SynthRack {
     pub sample_bank: SampleBank,
     pub counter: ByteBusCounter,
     lane_patches: [LanePatch; NUM_LANES],
+    voice_calibration: bool,
 }
 
 // Leave stack headroom for worker initialization and Windows test threads.
@@ -615,6 +638,7 @@ impl SynthRack {
             sample_bank: SampleBank::new(),
             counter: ByteBusCounter::default(),
             lane_patches: DEFAULT_LANE_PATCHES,
+            voice_calibration: false,
         }
     }
     pub fn lane_patches(&self) -> &[LanePatch; NUM_LANES] {
@@ -657,6 +681,13 @@ impl SynthRack {
     pub fn reset_voices(&mut self) {
         self.voices = Self::fresh_voices(self.audible_mask, self.channels);
         self.counter = ByteBusCounter::default();
+    }
+
+    pub fn set_voice_calibration(&mut self, enabled: bool) {
+        if self.voice_calibration != enabled {
+            self.voice_calibration = enabled;
+            self.reset_voices();
+        }
     }
 
     pub fn set_lane_audible_mask(&mut self, mask: u8) {
@@ -769,6 +800,7 @@ impl SynthRack {
                 self.sample_rate,
                 &self.sample_bank,
                 bus_word,
+                self.voice_calibration,
             );
 
             // Keep the voice running under the mute so it resumes at the same phase.
@@ -960,6 +992,51 @@ mod tests {
         let peaks = rack.master_peaks();
         assert_eq!(peaks.clipped, [true, true], "{peaks:?}");
         assert!(peaks.output.iter().all(|peak| *peak > 0.9));
+    }
+
+    #[test]
+    fn calibration_narrows_factory_peak_spread() {
+        let render_peaks = |enabled: bool| {
+            let mut lows = f32::INFINITY;
+            let mut highs = 0.0_f32;
+            let mut rack = SynthRack::new(48_000.0);
+            rack.set_lane_channels([LaneChannel::dry(0.8, 0.0); NUM_LANES]);
+            rack.set_lane_audible_mask(1);
+            rack.set_voice_calibration(enabled);
+            for machine in MachineKind::ALL {
+                let patch = if enabled {
+                    LanePatch::for_machine_with_calibration(machine)
+                } else {
+                    LanePatch::for_machine(machine)
+                };
+                rack.set_lane_patch(0, patch);
+                rack.reset_voices();
+                rack.reset_master(0.0);
+                let mut cv = CvFrame {
+                    run_v: 10.0,
+                    bytebus_v: leviathan_core::encode_bytebus_frame(1, false),
+                    ..CvFrame::default()
+                };
+                cv.gate_v[0] = 10.0;
+                cv.velocity_v[0] = 10.0;
+                let mut peak = 0.0_f32;
+                for i in 0..12_000 {
+                    if i == 6_000 {
+                        cv.gate_v[0] = 0.0;
+                    }
+                    let (left, right) = rack.render_stereo(&cv);
+                    assert!(left.is_finite() && right.is_finite());
+                    peak = peak.max(left.abs()).max(right.abs());
+                }
+                assert!(peak > 0.01, "{machine:?} {peak}");
+                lows = lows.min(peak);
+                highs = highs.max(peak);
+            }
+            highs / lows
+        };
+        let legacy = render_peaks(false);
+        let calibrated = render_peaks(true);
+        assert!(calibrated < 0.65 * legacy, "{legacy} -> {calibrated}");
     }
 
     #[test]
