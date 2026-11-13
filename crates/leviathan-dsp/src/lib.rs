@@ -251,7 +251,16 @@ pub fn v_oct_to_hz(v_oct: f32) -> f32 {
         (clamped - 0.999_999) as i32
     };
     let frac = clamped - whole as f32;
-    let poly = 1.0 + frac * (0.693_147_2 + frac * (0.240_226_5 + frac * 0.055_504_1));
+    // Sixth-order series for 2^frac: within 0.02 cents over the octave. The
+    // old cubic reached only 1.989 at the top, seven cents flat at the seventh.
+    let poly = 1.0
+        + frac
+            * (0.693_147_2
+                + frac
+                    * (0.240_226_5
+                        + frac
+                            * (0.055_504_1
+                                + frac * (0.009_618_13 + frac * (0.001_333_36 + frac * 0.000_154_04)))));
     let scale = if whole >= 0 {
         (1u32 << (whole as u32)) as f32
     } else {
@@ -1175,5 +1184,15 @@ mod tests {
         }
         assert_eq!(attacks, 4);
         assert!(peaks.into_iter().flatten().all(|peak| peak > 0.04), "{peaks:?}");
+    }
+
+    #[test]
+    fn pitch_conversion_stays_within_a_tenth_of_a_cent() {
+        for semitone in -60..=60 {
+            let volts = semitone as f32 / 12.0;
+            let want = 261.625_58_f64 * 2f64.powf(f64::from(semitone) / 12.0);
+            let cents = 1200.0 * (f64::from(v_oct_to_hz(volts)) / want).log2();
+            assert!(cents.abs() < 0.1, "semitone {semitone}: {cents:.3} cents");
+        }
     }
 }
