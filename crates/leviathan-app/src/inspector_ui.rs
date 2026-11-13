@@ -3,6 +3,274 @@ use leviathan_core::{
     AutomationRow, FillCondition, NoteCell, PlaybackRate, SoundLock, MAX_NUDGE, MAX_RETRIG,
     NUM_LANES, ROWS_PER_PATTERN,
 };
+use leviathan_dsp::{LanePatch, MachineKind};
+
+const ALL_RATES: [(PlaybackRate, &str); 6] = [
+    (PlaybackRate::Quarter, "1/4x"),
+    (PlaybackRate::Half, "1/2x"),
+    (PlaybackRate::OneX, "1x"),
+    (PlaybackRate::TwoX, "2x"),
+    (PlaybackRate::FourX, "4x"),
+    (PlaybackRate::EightX, "8x"),
+];
+
+const ALL_FILLS: [(FillCondition, &str, &str); 3] = [
+    (
+        FillCondition::Always,
+        "Always",
+        "Trigger regardless of FILL state",
+    ),
+    (
+        FillCondition::WhenFill,
+        "FILL",
+        "Trigger only while FILL is active",
+    ),
+    (
+        FillCondition::NotFill,
+        "!FILL",
+        "Trigger only while FILL is inactive",
+    ),
+];
+
+/// Tracked inspector mutations for a single row target.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct InspectorEdits {
+    pub cell: Option<NoteCell>,
+    pub auto: Option<AutomationRow>,
+    pub length: Option<usize>,
+    pub rate: Option<PlaybackRate>,
+}
+
+/// Returns `*` for sound-locked steps, `?` for conditional (`Prob` < 100 or `FILL`) steps, or ` `.
+#[inline]
+pub fn step_marker(cell: &NoteCell) -> char {
+    if cell.lock.is_active() {
+        '*'
+    } else if cell.prob < 100 || cell.fill != FillCondition::Always {
+        '?'
+    } else {
+        ' '
+    }
+}
+
+pub fn draw(
+    ui: &mut egui::Ui,
+    lane: usize,
+    row: usize,
+    current_cell: NoteCell,
+    current_auto: AutomationRow,
+    current_length: usize,
+    current_rate: PlaybackRate,
+    lane_patch: &LanePatch,
+) -> InspectorEdits {
+    let mut edits = InspectorEdits::default();
+    let safe_lane = lane.min(NUM_LANES - 1);
+    let safe_row = row.min(ROWS_PER_PATTERN - 1);
+
+    let mut edit_cell = current_cell;
+    let mut cell_dirty = false;
+    let eff_machine = MachineKind::from_patch_and_lock(lane_patch, &edit_cell.lock);
+
+    ui.heading(format!(
+        "Step Lock -- {} Row {:02X} ({})",
+        format!("{safe_lane} {}", lane_patch.machine.short_name()),
+        safe_row,
+        eff_machine.short_name()
+    ));
+
+    ui.separator();
+
+    ui.collapsing("Trigger & Timing", |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Retrig:");
+            if ui
+                .add(egui::Slider::new(&mut edit_cell.retrig, 0..=MAX_RETRIG))
+                .changed()
+            {
+                cell_dirty = true;
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Nudge:");
+            if ui
+                .add(egui::Slider::new(&mut edit_cell.nudge, 0..=MAX_NUDGE))
+                .changed()
+            {
+                cell_dirty = true;
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Prob %:");
+            if ui
+                .add(egui::Slider::new(&mut edit_cell.prob, 0..=100))
+                .changed()
+            {
+                cell_dirty = true;
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Condition:");
+            for (cond, short, tip) in ALL_FILLS {
+                if ui
+                    .selectable_label(edit_cell.fill == cond, short)
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    edit_cell.fill = cond;
+                    cell_dirty = true;
+                }
+            }
+        });
+    });
+
+    ui.collapsing("Row Setup", |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Pattern Length:");
+            let mut len = edits.length.unwrap_or(current_length);
+            if ui
+                .add(egui::Slider::new(&mut len, 1..=ROWS_PER_PATTERN))
+                .changed()
+            {
+                edits.length = Some(len);
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Playback Rate:");
+            let cur_rate = edits.rate.unwrap_or(current_rate);
+            for (rate, label) in ALL_RATES {
+                if ui
+                    .selectable_label(cur_rate == rate, label)
+                    .clicked()
+                {
+                    edits.rate = Some(rate);
+                }
+            }
+        });
+    });
+
+    ui.collapsing("Machine Route", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .selectable_label(
+                    edit_cell.lock.machine < 0,
+                    format!("Lane ({})", lane_patch.machine.short_name()),
+                )
+                .clicked()
+                && edit_cell.lock.machine != -1
+            {
+                edit_cell.lock.machine = -1;
+                cell_dirty = true;
+            }
+            for m in MachineKind::ALL {
+                if ui
+                    .selectable_label(
+                        edit_cell.lock.machine == m as i8,
+                        m.short_name(),
+                    )
+                    .clicked()
+                    && edit_cell.lock.machine != m as i8
+                {
+                    edit_cell.lock.machine = m as i8;
+                    cell_dirty = true;
+                }
+            }
+        });
+    });
+
+    ui.collapsing("Sound Locks", |ui| {
+        for slot in 0..8 {
+            let name = eff_machine.spec().params[slot].name;
+            ui.horizontal(|ui| {
+                let mut locked = ((edit_cell.lock.mask >> slot) & 1) != 0;
+                if ui.checkbox(&mut locked, "").changed() {
+                    if locked {
+                        edit_cell.lock.mask |= 1 << slot;
+                        if edit_cell.lock.values[slot] == 0.0 {
+                            edit_cell.lock.values[slot] = lane_patch.params[slot];
+                        }
+                    } else {
+                        edit_cell.lock.mask &= !(1 << slot);
+                    }
+                    cell_dirty = true;
+                }
+                if ui
+                    .add(egui::Slider::new(&mut edit_cell.lock.values[slot], 0.0..=1.0).text(name))
+                    .changed()
+                {
+                    edit_cell.lock.mask |= 1 << slot;
+                    cell_dirty = true;
+                }
+            });
+        }
+    });
+
+    ui.collapsing("Automation Lock", |ui| {
+        let mut auto = edits.auto.clone().unwrap_or(current_auto);
+        let mut auto_dirty = false;
+
+        ui.horizontal(|ui| {
+            let mut enabled = auto.lock_value.is_some();
+            if ui.checkbox(&mut enabled, "Lock Value").changed() {
+                if enabled {
+                    auto.lock_value = Some(0.5);
+                } else {
+                    auto.lock_value = None;
+                }
+                auto_dirty = true;
+            }
+        });
+
+        if let Some(ref mut val) = auto.lock_value {
+            if ui
+                .add(egui::Slider::new(val, 0.0..=1.0).text("Value"))
+                .changed()
+            {
+                auto_dirty = true;
+            }
+        }
+
+        if auto_dirty {
+            edits.auto = Some(auto);
+        }
+    });
+
+    if cell_dirty {
+        edits.cell = Some(edit_cell);
+    }
+
+    edits
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inspector_renders_headlessly_without_spurious_edits() {
+        let ctx = egui::Context::default();
+        let mut captured = InspectorEdits::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                captured = draw(
+                    ui,
+                    1,
+                    4,
+                    NoteCell::default(),
+                    AutomationRow::default(),
+                    64,
+                    PlaybackRate::OneX,
+                    &LanePatch::default(),
+                );
+            });
+        });
+        assert_eq!(captured, InspectorEdits::default());
+    }
+},
+};
 use leviathan_dsp::MachineKind;
 
 pub const LANE_NAMES: [&str; NUM_LANES] = ["0 KICK", "1 FM4", "2 SUB", "3 AIR", "4 SMPL", "5 ACID"];
