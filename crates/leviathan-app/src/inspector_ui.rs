@@ -3,17 +3,7 @@ use leviathan_core::{
     AutomationRow, FillCondition, NoteCell, PlaybackRate, SoundLock, MAX_NUDGE, MAX_RETRIG,
     NUM_LANES, ROWS_PER_PATTERN,
 };
-use leviathan_dsp::{LanePatch, MachineKind};
-
-const ALL_MACHINES: [MachineKind; 7] = [
-    MachineKind::KickDrum,
-    MachineKind::FourOpFm,
-    MachineKind::SubBass,
-    MachineKind::NoiseWash,
-    MachineKind::VarSampler,
-    MachineKind::AcidLead,
-    MachineKind::ChordStab,
-];
+use leviathan_dsp::{LanePatch, MachineKind, MACHINE_SPECS};
 
 const ALL_RATES: [(PlaybackRate, &str); 6] = [
     (PlaybackRate::Quarter, "1/4x"),
@@ -41,41 +31,6 @@ const ALL_FILLS: [(FillCondition, &str, &str); 3] = [
         "Mute step while FILL is active",
     ),
 ];
-
-fn param_labels(machine: MachineKind) -> [&'static str; 8] {
-    match machine {
-        MachineKind::VarSampler => [
-            "P0 Decay",
-            "P1 ChipClk",
-            "P2 Cutoff",
-            "P3 WaveBank",
-            "P4 LpStart",
-            "P5 LpWindow",
-            "P6 LpScan",
-            "P7 Mode/Bit",
-        ],
-        MachineKind::FourOpFm => [
-            "P0 Decay",
-            "P1 FmIndex",
-            "P2 Cutoff",
-            "P3 Alg(0-3)",
-            "P4 C:M Ratio",
-            "P5 ModDecay",
-            "P6 Op4 Fbk",
-            "P7 Detune",
-        ],
-        _ => [
-            "P0 Decay",
-            "P1 Drive",
-            "P2 Cutoff",
-            "P3 Aux3",
-            "P4 Aux4",
-            "P5 Aux5",
-            "P6 Aux6",
-            "P7 Aux7",
-        ],
-    }
-}
 
 /// Returns `*` for sound-locked steps, `?` for conditional (`Prob` < 100 or `FILL`) steps, or `' '`.
 #[inline]
@@ -240,10 +195,11 @@ pub fn draw(
             edit_cell.lock.machine = -1;
             cell_dirty = true;
         }
-        for m in ALL_MACHINES {
-            let code = m as i16;
+        for spec in &MACHINE_SPECS {
+            let code = i16::from(spec.id);
             if ui
-                .selectable_label(edit_cell.lock.machine == code, m.short_name())
+                .selectable_label(edit_cell.lock.machine == code, spec.badge)
+                .on_hover_text(spec.name)
                 .clicked()
                 && edit_cell.lock.machine != code
             {
@@ -253,8 +209,8 @@ pub fn draw(
         }
     });
 
-    let labels = param_labels(eff_machine);
-    for (slot, &name) in labels.iter().enumerate() {
+    let spec = MachineKind::from_patch_and_lock(lane_patch, &edit_cell.lock).spec();
+    for (slot, param) in spec.params.iter().enumerate() {
         ui.horizontal(|ui| {
             let mut locked = ((edit_cell.lock.mask >> slot) & 1) != 0;
             if ui.checkbox(&mut locked, "").changed() {
@@ -266,7 +222,10 @@ pub fn draw(
                 cell_dirty = true;
             }
             if ui
-                .add(egui::Slider::new(&mut edit_cell.lock.values[slot], 0.0..=1.0).text(name))
+                .add(
+                    egui::Slider::new(&mut edit_cell.lock.values[slot], 0.0..=1.0)
+                        .text(format!("P{slot} {}", param.name)),
+                )
                 .changed()
             {
                 edit_cell.lock.mask |= 1 << slot;

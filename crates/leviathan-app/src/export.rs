@@ -496,4 +496,49 @@ mod tests {
         assert!(stems.join("1-fm4.wav").exists());
         assert!(stems.join("2-chrd.wav").exists());
     }
+
+    #[test]
+    fn expansion_voices_export_audible_independent_stems() {
+        let temp =
+            StagingDirectory::new(&std::env::temp_dir().join("leviathan-test-expansion")).unwrap();
+        let stems = temp.path.join("stems");
+        let mut snapshot = project();
+        let engines = [
+            MachineKind::CzPhaseDist,
+            MachineKind::PolivoksSub,
+            MachineKind::VastFunSynth,
+        ];
+        for (lane, engine) in engines.into_iter().enumerate() {
+            snapshot.lane_patches[lane] = LanePatch::for_machine(engine);
+            snapshot.patterns[0].lanes[lane][0] = NoteCell {
+                active: true,
+                midi: 53 + lane as u8 * 7,
+                velocity: 127,
+                gate_fraction: 0.95,
+                ..NoteCell::default()
+            };
+        }
+        let settings = ExportSettings {
+            stems: true,
+            tail_seconds: 0.01,
+            ..ExportSettings::default()
+        };
+        ExportJob::start(
+            snapshot,
+            false,
+            ExportRequest {
+                settings,
+                destination: stems.clone(),
+            },
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+        for (lane, engine) in engines.into_iter().enumerate() {
+            let name = stem_filename(lane, &LanePatch::for_machine(engine));
+            let decoded = decode_wav_bytes(&name, &fs::read(stems.join(&name)).unwrap()).unwrap();
+            assert_eq!(decoded.original_frames, 1230);
+            assert!(decoded.peaks.iter().any(|&peak| peak > 0.015), "{name}");
+        }
+    }
 }
