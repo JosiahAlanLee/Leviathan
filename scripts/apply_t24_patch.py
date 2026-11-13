@@ -7,18 +7,20 @@ both the working tree and Git index so the result can be reviewed with
 git diff --cached.
 """
 
+from __future__ import annotations
+
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 
-def git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+def git(repo: Path, *args: str, stdin: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         ["git", "-C", str(repo), *args],
+        input=stdin,
         capture_output=True,
-        encoding="utf-8",
-        errors="replace",
         check=False,
     )
 
@@ -33,16 +35,20 @@ def main() -> int:
         parser.error(f"Missing bundled patch {patch}")
 
     try:
+        # Git may check the bundled text patch out with CRLF. Pass the
+        # canonical bytes through stdin to avoid platform newline conversion.
+        diff = patch.read_bytes().replace(b"\r\n", b"\n")
         root = git(args.repo.resolve(), "rev-parse", "--show-toplevel")
         if root.returncode:
-            print(root.stderr.rstrip(), file=sys.stderr)
+            print(root.stderr.decode(errors="replace").rstrip(), file=sys.stderr)
             return 1
-        repo = Path(root.stdout.rstrip("\r\n"))
-        check = git(repo, "apply", "--index", "--check", "--", str(patch))
+        repo = Path(os.fsdecode(root.stdout.rstrip(b"\r\n")))
+        check = git(repo, "apply", "--index", "--check", "-", stdin=diff)
         if check.returncode:
-            reverse = git(repo, "apply", "--index", "--check", "--reverse", "--", str(patch))
+            reverse = git(repo, "apply", "--index", "--check", "--reverse", "-", stdin=diff)
             if reverse.returncode:
-                print(f"T24 patch could not be applied.\n{check.stderr.rstrip()}", file=sys.stderr)
+                print("T24 patch could not be applied.", file=sys.stderr)
+                print(check.stderr.decode(errors="replace").rstrip(), file=sys.stderr)
                 return 1
             print("T24 patch is already applied.")
             return 0
@@ -50,9 +56,9 @@ def main() -> int:
             print("T24 patch applies cleanly.")
             return 0
 
-        applied = git(repo, "apply", "--index", "--", str(patch))
+        applied = git(repo, "apply", "--index", "-", stdin=diff)
         if applied.returncode:
-            print(applied.stderr.rstrip(), file=sys.stderr)
+            print(applied.stderr.decode(errors="replace").rstrip(), file=sys.stderr)
             return 1
     except OSError as error:
         print(error, file=sys.stderr)
