@@ -5,6 +5,7 @@ mod bender;
 mod cz;
 pub mod dac;
 pub mod fm;
+mod fs77;
 mod master;
 mod otis;
 mod otis_twin;
@@ -30,7 +31,7 @@ pub use spec::{
     DEFAULT_LANE_PATCHES, MACHINE_SPECS,
 };
 
-pub const MACHINE_COUNT: usize = 15;
+pub const MACHINE_COUNT: usize = 16;
 pub const ALL_LANES_AUDIBLE: u8 = (1 << NUM_LANES) - 1;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -117,6 +118,7 @@ pub enum MachineKind {
     OtisTranswave = 12,
     ByteBusR2r = 13,
     OtisTwin = 14,
+    Fs77FormantFm = 15,
 }
 
 impl MachineKind {
@@ -148,6 +150,7 @@ impl MachineKind {
         Self::OtisTranswave,
         Self::ByteBusR2r,
         Self::OtisTwin,
+        Self::Fs77FormantFm,
     ];
 
     pub const fn from_id(id: usize) -> Self {
@@ -173,6 +176,7 @@ impl MachineKind {
                 | Self::OtisTranswave
                 | Self::ByteBusR2r
                 | Self::OtisTwin
+                | Self::Fs77FormantFm
         )
     }
 
@@ -339,6 +343,7 @@ struct VoiceState {
     otis: otis::Voice,
     otis_twin: otis_twin::TwinVoice,
     bbus: bbus::Voice,
+    fs77: fs77::Voice,
     active_machine: Option<MachineKind>,
     note_pitch: f32,
     note_lock: SoundLock,
@@ -366,6 +371,7 @@ impl Default for VoiceState {
             otis: otis::Voice::default(),
             otis_twin: otis_twin::TwinVoice::default(),
             bbus: bbus::Voice::default(),
+            fs77: fs77::Voice::default(),
             active_machine: None,
             note_pitch: 0.0,
             note_lock: SoundLock::default(),
@@ -390,6 +396,7 @@ impl VoiceState {
         self.otis = otis::Voice::default();
         self.otis_twin = otis_twin::TwinVoice::default();
         self.bbus = bbus::Voice::default();
+        self.fs77 = fs77::Voice::default();
         self.active_machine = None;
     }
 
@@ -456,6 +463,9 @@ impl VoiceState {
                 MachineKind::OtisTwin => self.otis_twin.step(hz, sample_rate, gate, trigger, &params),
                 MachineKind::ByteBusR2r => {
                     self.bbus.step(hz, sample_rate, gate, trigger, bus_word, &params)
+                }
+                MachineKind::Fs77FormantFm => {
+                    self.fs77.step(hz, sample_rate, gate, trigger, &params, &mut self.rng)
                 }
                 _ => 0.0,
             };
@@ -994,6 +1004,7 @@ mod tests {
             (MachineKind::OtisTranswave, 12, "otis", "OTIS"),
             (MachineKind::ByteBusR2r, 13, "bbus", "BBUS"),
             (MachineKind::OtisTwin, 14, "otis2", "OT2"),
+            (MachineKind::Fs77FormantFm, 15, "fs77", "FS77"),
         ] {
             assert_eq!((kind.spec().id, kind.slug(), kind.short_name()), (id, slug, badge));
         }

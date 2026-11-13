@@ -295,6 +295,23 @@ pub const MACHINE_SPECS: [MachineSpec; MACHINE_COUNT] = [
             ParamSpec::new("ModeGrit", 0.45),
         ],
     },
+    MachineSpec {
+        kind: MachineKind::Fs77FormantFm,
+        id: 15,
+        slug: "fs77",
+        badge: "FS77",
+        name: "FS77 Formant FM",
+        params: [
+            ParamSpec::new("Decay", 0.45),
+            ParamSpec::new("FmIndex", 0.38),
+            ParamSpec::new("WaveRcm", 0.25),
+            ParamSpec::new("FormantHz", 0.42),
+            ParamSpec::new("SkirtUnv", 0.30),
+            ParamSpec::new("AlgRatio", 0.35),
+            ParamSpec::new("FilterCut", 0.68),
+            ParamSpec::new("ResoDac", 0.32),
+        ],
+    },
 ];
 
 #[inline]

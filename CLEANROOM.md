@@ -19,3 +19,4 @@ Leviathan is authored under the `BSD-3-Clause` license using a clean-room bounda
 
 4. **Wave 6 DSP Provenance**
    - T25 uses the supplied Rust prototype and the converter behavior described in the roadmap. Yamaha's datasheet supplies the YM3012 serial fields. The CZ transfer is a provisional mathematical model.
+   - T26 uses the supplied FS77 Rust prototype, Yamaha's SY77 and FS1R behavioral descriptions, and Leviathan DSP primitives. The waveform modulator reads Leviathan's generated OTIS table.

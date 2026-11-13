@@ -587,6 +587,137 @@ mod tests {
     use leviathan_core::PlaybackRate;
 
     #[test]
+    fn saved_fs77_lane_and_step_lock_match_live_and_wav() {
+        use leviathan_dsp::{default_lane_patches, MachineKind};
+
+        let directory =
+            std::env::temp_dir().join(format!("leviathan-fs77-parity-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("formants.leviathan.json");
+        let destination = directory.join("stems");
+        let mut pattern = Pattern {
+            length: 4,
+            rate: PlaybackRate::EightX,
+            ..Pattern::default()
+        };
+        let mut patches = default_lane_patches();
+        patches[0] = LanePatch::for_machine(MachineKind::Fs77FormantFm);
+        patches[0].params[3] = 0.0;
+        patches[0].params[7] = 0.12;
+        let note = NoteCell {
+            active: true,
+            midi: 48,
+            velocity: 115,
+            gate_fraction: 1.0,
+            ..NoteCell::default()
+        };
+        pattern.lanes[0][0] = note;
+        let mut lock = SoundLock {
+            machine: 15,
+            mask: (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 7),
+            values: patches[0].params,
+        };
+        lock.values[2] = 0.85;
+        lock.values[3] = 1.0;
+        lock.values[4] = 0.75;
+        lock.values[5] = 0.85;
+        lock.values[7] = 0.85;
+        let first_lock = lock;
+        pattern.lanes[1][1] = NoteCell { lock, ..note };
+        // A second vowel and DAC region on the same voice exercises the crossfade.
+        lock.values[3] = 0.5;
+        lock.values[7] = 0.15;
+        pattern.lanes[1][2] = NoteCell { lock, ..note };
+        crate::project::save(
+            &path,
+            Project {
+                bpm: 120.0,
+                master_send: 0.0,
+                bender_params: Default::default(),
+                lane_mix: LaneMix::default(),
+                lane_patches: patches,
+                patterns: vec![pattern],
+                selected_pattern: 0,
+                chain: PatternChain::default(),
+                samples: Default::default(),
+                sample_regions: Default::default(),
+                custom_shader: None,
+            },
+        )
+        .unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains(r#""machine":"fs77""#));
+        assert!(saved.contains(r#""machine":15"#));
+        let project = crate::project::load(&path).unwrap();
+        assert_eq!(project.lane_patches, patches);
+        assert_eq!(project.patterns[0].lanes[1][1].lock, first_lock);
+        assert_eq!(project.patterns[0].lanes[1][2].lock, lock);
+
+        let settings = ExportSettings {
+            encoding: WavEncoding::Float32,
+            stems: true,
+            tail_seconds: 0.01,
+            ..ExportSettings::default()
+        };
+        // Four rows at 8× and 120 BPM are 3,000 frames at 48 kHz.
+        let music_frames = 3_000;
+        let live = fs77_live_frames(&project, music_frames, music_frames + 480);
+        ExportJob::start(
+            project,
+            false,
+            ExportRequest {
+                destination: destination.clone(),
+                settings,
+            },
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+        let master = std::fs::read(destination.join("master.wav")).unwrap();
+        let lane = std::fs::read(destination.join("0-fs77.wav")).unwrap();
+        let locked_lane =
+            std::fs::read(destination.join(format!("1-{}.wav", patches[1].machine.slug()))).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        let data_start = master.len() - live.len() * 8;
+        assert_eq!(&master[data_start - 8..data_start - 4], b"data");
+        let read = |bytes: &[u8]| f32::from_le_bytes(bytes.try_into().unwrap());
+        for stem in [&lane, &locked_lane] {
+            assert_eq!(stem.len(), master.len());
+            assert!(stem[data_start..].chunks_exact(4).any(|s| read(s).abs() > 0.01));
+        }
+        for (n, frame) in master[data_start..].chunks_exact(8).enumerate() {
+            assert_eq!(live[n], (read(&frame[..4]), read(&frame[4..])), "frame {n}");
+        }
+    }
+
+    fn fs77_live_frames(project: &Project, music_frames: usize, frames: usize) -> Vec<(f32, f32)> {
+        let (tx, rx) = rtrb::RingBuffer::new(8);
+        let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(16);
+        let mut audio = AudioControl::new(tx);
+        let mut worker = RtAudioWorker::new(Pattern::default(), 48_000.0, rx, tel_tx, None);
+        audio.send(AudioCommand::ReplaceProject(Arc::new(AudioProject::prepare(
+            project, 1,
+        ))));
+        audio.send(AudioCommand::SetPlaying {
+            playing: true,
+            request: 1,
+        });
+        worker.drain_commands();
+        let mut rendered = Vec::with_capacity(frames);
+        for n in 0..frames {
+            if n == music_frames {
+                audio.send(AudioCommand::SetPlaying {
+                    playing: false,
+                    request: 2,
+                });
+                worker.drain_commands();
+            }
+            rendered.push(worker.next_stereo());
+        }
+        rendered
+    }
+
+    #[test]
     fn wav_master_matches_live_playback_with_bbus_otis_twin_delay_and_bend() {
         let (tx, rx) = rtrb::RingBuffer::new(8);
         let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(32);
