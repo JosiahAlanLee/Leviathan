@@ -182,6 +182,7 @@ struct LeviathanApp {
     export_ui: ExportUi,
     gen_ui: GenUi,
     project_generation: u64,
+    voice_calibration: bool,
     inspector_drag_recorded: bool,
     playing: bool,
     fill_active: bool,
@@ -257,6 +258,7 @@ impl LeviathanApp {
             export_ui: ExportUi::default(),
             gen_ui: GenUi::default(),
             project_generation: 0,
+            voice_calibration: false,
             inspector_drag_recorded: false,
             playing: false,
             fill_active: false,
@@ -626,6 +628,7 @@ impl LeviathanApp {
             samples: self.sampler_ui.samples.clone(),
             sample_regions: self.sampler_ui.regions,
             custom_shader: self.viewport.custom_shader().cloned(),
+            voice_calibration: self.voice_calibration,
         }
     }
 
@@ -651,6 +654,7 @@ impl LeviathanApp {
         self.bender_params = project.bender_params;
         self.lane_mix = project.lane_mix;
         self.lane_patches = project.lane_patches;
+        self.voice_calibration = project.voice_calibration;
         self.master_meters = MasterMeters::default();
         self.histories = (0..project.patterns.len())
             .map(|_| EditHistory::default())
@@ -894,7 +898,21 @@ impl eframe::App for LeviathanApp {
                         self.send_audio(AudioCommand::SetBenderParams(self.bender_params));
                     }
                     let safe_lane = sel_lane.min(NUM_LANES - 1);
-                    if draw_lane_patch_inspector(ui, safe_lane, &mut self.lane_patches[safe_lane]) {
+                    if ui
+                        .checkbox(&mut self.voice_calibration, "Voice calibration")
+                        .on_hover_text(
+                            "Use calibrated voice levels and tuning. Switching restarts active voices. Reset a lane patch to load its calibrated defaults.",
+                        )
+                        .changed()
+                    {
+                        self.send_audio(AudioCommand::SetVoiceCalibration(self.voice_calibration));
+                    }
+                    if draw_lane_patch_inspector(
+                        ui,
+                        safe_lane,
+                        &mut self.lane_patches[safe_lane],
+                        self.voice_calibration,
+                    ) {
                         self.send_audio(AudioCommand::SetLanePatch {
                             lane: safe_lane,
                             patch: self.lane_patches[safe_lane],

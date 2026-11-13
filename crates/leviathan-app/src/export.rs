@@ -191,6 +191,7 @@ fn render(
     rack.set_lane_audible_mask(project.lane_mix.audible_mask());
     rack.set_lane_channels(project.lane_mix.dsp_channels());
     rack.set_lane_patches(project.lane_patches);
+    rack.set_voice_calibration(project.voice_calibration);
     rack.reset_voices();
     rack.set_bender_params(project.bender_params);
     rack.set_delay_mode(project.delay_mode);
@@ -372,6 +373,7 @@ mod tests {
             samples: core::array::from_fn(|_| None),
             sample_regions: Default::default(),
             custom_shader: None,
+            voice_calibration: false,
         }
     }
 

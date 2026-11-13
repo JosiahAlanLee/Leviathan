@@ -54,6 +54,27 @@ impl FourOpFmVoice {
     }
 
     pub fn step_sample(&mut self, base_hz: f32, host_sr: f32, amp_env: f32, lock: &SoundLock) -> f32 {
+        self.render(base_hz, host_sr, amp_env, lock, false)
+    }
+
+    pub(super) fn step_calibrated(
+        &mut self,
+        base_hz: f32,
+        host_sr: f32,
+        amp_env: f32,
+        lock: &SoundLock,
+    ) -> f32 {
+        self.render(base_hz, host_sr, amp_env, lock, true)
+    }
+
+    fn render(
+        &mut self,
+        base_hz: f32,
+        host_sr: f32,
+        amp_env: f32,
+        lock: &SoundLock,
+        calibrated: bool,
+    ) -> f32 {
         let dt = 1.0 / host_sr.max(8_000.0);
 
         let mod_idx = lock_param(lock, 1, 0.35).clamp(0.0, 1.0) * 1.65;
@@ -68,14 +89,7 @@ impl FourOpFmVoice {
         self.mod_env *= 1.0 - (dt / mod_decay);
 
         let fb = lock_param(lock, 6, 0.18).clamp(0.0, 1.0) * 0.38;
-        let detune = lock_param(lock, 7, 0.12).clamp(0.0, 1.0) * 0.018;
-
-        let ratios = [
-            1.0,
-            mod_ratio * (1.0 + detune),
-            (mod_ratio * 2.0).min(12.0) * (1.0 - detune),
-            (mod_ratio * 1.5).min(12.0) * (1.0 + 1.5 * detune),
-        ];
+        let ratios = operator_ratios(mod_ratio, lock, calibrated);
 
         for (phase, &r) in self.phases.iter_mut().zip(ratios.iter()) {
             let f = (base_hz * r).clamp(16.0, host_sr * 0.44);
@@ -118,9 +132,47 @@ impl FourOpFmVoice {
     }
 }
 
+fn operator_ratios(mod_ratio: f32, lock: &SoundLock, calibrated: bool) -> [f32; 4] {
+    let high_ratio = (mod_ratio * 2.0).min(12.0);
+    let top_ratio = (mod_ratio * 1.5).min(12.0);
+    if calibrated {
+        let detune = 2.0 * lock_param(lock, 7, 0.5).clamp(0.0, 1.0) - 1.0;
+        // Modulators are reciprocal around the center. The base carrier stays at the played pitch.
+        let spread = 1.0 + 0.015 * detune.abs();
+        let up = if detune >= 0.0 { spread } else { 1.0 / spread };
+        return [1.0, mod_ratio * up, high_ratio / up, top_ratio * up];
+    }
+    let detune = lock_param(lock, 7, 0.12).clamp(0.0, 1.0) * 0.018;
+    [
+        1.0,
+        mod_ratio * (1.0 + detune),
+        high_ratio * (1.0 - detune),
+        top_ratio * (1.0 + 1.5 * detune),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calibrated_detune_keeps_the_carrier_at_the_played_pitch() {
+        let mut lock = SoundLock {
+            mask: 1 << 7,
+            ..SoundLock::default()
+        };
+        lock.values[7] = 0.5;
+        assert_eq!(operator_ratios(2.0, &lock, true), [1.0, 2.0, 4.0, 3.0]);
+        lock.values[7] = 0.0;
+        let flat = operator_ratios(2.0, &lock, true);
+        lock.values[7] = 1.0;
+        let sharp = operator_ratios(2.0, &lock, true);
+        assert_eq!(flat[0], 1.0);
+        assert_eq!(sharp[0], 1.0);
+        for (index, nominal) in [2.0, 4.0, 3.0].into_iter().enumerate() {
+            assert!((flat[index + 1] * sharp[index + 1] - nominal * nominal).abs() < 1e-6);
+        }
+    }
 
     #[test]
     fn all_four_fm_algorithms_produce_finite_distinct_waveforms() {

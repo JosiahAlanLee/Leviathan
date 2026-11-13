@@ -115,6 +115,7 @@ impl Voice {
         sample_rate: f32,
         trigger: Option<f32>,
         params: &[f32; SOUND_PARAMS],
+        calibrated: bool,
     ) -> f32 {
         let [decay, table, position, depth, k1, k2, grit, loop_mode] = *params;
         if let Some(velocity) = trigger {
@@ -164,7 +165,12 @@ impl Voice {
         let second = 0.04 + 0.68 * k1;
         self.filtered[0] += first * (input - self.filtered[0]);
         self.filtered[1] += second * (self.filtered[0] - self.filtered[1]);
-        (self.filtered[1] * self.amp).clamp(-1.0, 1.0)
+        let sample = if calibrated {
+            crate::fast_tanh(self.filtered[1] * (2.35 + 0.50 * k2))
+        } else {
+            self.filtered[1]
+        };
+        (sample * self.amp).clamp(-1.0, 1.0)
     }
 }
 
@@ -248,7 +254,7 @@ mod tests {
             let mut voice = Voice::default();
             let mut energy = 0.0;
             for i in 0..48_000 {
-                let sample = voice.step(440.0, 48_000.0, (i == 0).then_some(1.0), &params);
+                let sample = voice.step(440.0, 48_000.0, (i == 0).then_some(1.0), &params, false);
                 assert!((-1.0..=1.0).contains(&sample));
                 energy += sample * sample;
             }

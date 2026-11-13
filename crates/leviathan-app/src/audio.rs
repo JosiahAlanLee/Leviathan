@@ -28,6 +28,7 @@ pub enum AudioCommand {
     SetLaneAudibleMask(u8),
     SetLaneChannels([LaneChannel; NUM_LANES]),
     SetLanePatch { lane: usize, patch: LanePatch },
+    SetVoiceCalibration(bool),
     Reset,
     
     Launch(LaunchTarget),
@@ -94,6 +95,7 @@ pub struct AudioProject {
     selected_pattern: usize,
     chain: PatternChain,
     sample_bank: SampleBank,
+    voice_calibration: bool,
 }
 
 impl AudioProject {
@@ -111,6 +113,7 @@ impl AudioProject {
             selected_pattern: project.selected_pattern,
             chain: project.chain,
             sample_bank: project.sample_bank(),
+            voice_calibration: project.voice_calibration,
         }
     }
 
@@ -285,6 +288,9 @@ impl RtAudioWorker {
                 AudioCommand::SetLaneAudibleMask(mask) => self.synth.set_lane_audible_mask(mask),
                 AudioCommand::SetLaneChannels(channels) => self.synth.set_lane_channels(channels),
                 AudioCommand::SetLanePatch { lane, patch } => self.synth.set_lane_patch(lane, patch),
+                AudioCommand::SetVoiceCalibration(enabled) => {
+                    self.synth.set_voice_calibration(enabled);
+                }
                 AudioCommand::SetCell {
                     pattern,
                     lane,
@@ -319,6 +325,7 @@ impl RtAudioWorker {
                     self.synth.set_lane_audible_mask(project.audible_mask);
                     self.synth.set_lane_channels(project.lane_channels);
                     self.synth.set_lane_patches(project.lane_patches);
+                    self.synth.set_voice_calibration(project.voice_calibration);
                     self.synth.reset_voices();
                     self.synth.set_delay_mode(project.delay_mode);
                     self.synth.set_bender_params(project.bender_params);
@@ -648,6 +655,7 @@ mod tests {
                 samples: Default::default(),
                 sample_regions: Default::default(),
                 custom_shader: None,
+                voice_calibration: false,
             },
         )
         .unwrap();
@@ -750,6 +758,7 @@ mod tests {
                 samples: Default::default(),
                 sample_regions: Default::default(),
                 custom_shader: None,
+                voice_calibration: false,
             },
         )
         .unwrap();
@@ -832,6 +841,88 @@ mod tests {
     }
 
     #[test]
+    fn calibrated_project_defaults_and_locks_match_live_and_wav() {
+        use leviathan_dsp::{default_lane_patches, MachineKind};
+
+        let mut pattern = Pattern {
+            length: 2,
+            rate: PlaybackRate::EightX,
+            ..Pattern::default()
+        };
+        pattern.lanes[0][0] = NoteCell {
+            active: true,
+            midi: 60,
+            velocity: 118,
+            ..NoteCell::default()
+        };
+        pattern.lanes[0][1] = NoteCell {
+            lock: SoundLock {
+                mask: 1 << 7,
+                values: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.72],
+                ..SoundLock::default()
+            },
+            ..pattern.lanes[0][0]
+        };
+        let mut lane_patches = default_lane_patches();
+        lane_patches[0] = LanePatch::for_machine_with_calibration(MachineKind::FourOpFm);
+        let mut project = Project {
+            bpm: 120.0,
+            master_send: 0.0,
+            delay_mode: Default::default(),
+            bender_params: Default::default(),
+            lane_mix: LaneMix::default(),
+            lane_patches,
+            patterns: vec![pattern],
+            selected_pattern: 0,
+            chain: PatternChain::default(),
+            samples: Default::default(),
+            sample_regions: Default::default(),
+            custom_shader: None,
+            voice_calibration: false,
+        };
+        let legacy = render_test_project_live(&project, 1_500, 1_980);
+
+        let dir = std::env::temp_dir().join(format!("leviathan-calibration-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.leviathan.json");
+        project.voice_calibration = true;
+        crate::project::save(&path, project).unwrap();
+        let project = crate::project::load(&path).unwrap();
+        assert!(project.voice_calibration);
+        assert_eq!(project.lane_patches, lane_patches);
+        assert_eq!(project.patterns[0].lanes[0][1].lock.values[7], 0.72);
+        let live = render_test_project_live(&project, 1_500, 1_980);
+        assert_ne!(live, legacy);
+
+        let destination = dir.join("calibrated.wav");
+        ExportJob::start(
+            project,
+            false,
+            ExportRequest {
+                destination: destination.clone(),
+                settings: ExportSettings {
+                    encoding: WavEncoding::Float32,
+                    tail_seconds: 0.01,
+                    ..ExportSettings::default()
+                },
+            },
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+        let master = std::fs::read(destination).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+
+        let data_start = master.len() - live.len() * 8;
+        assert_eq!(&master[data_start - 8..data_start - 4], b"data");
+        for (n, frame) in master[data_start..].chunks_exact(8).enumerate() {
+            let left = f32::from_le_bytes(frame[..4].try_into().unwrap());
+            let right = f32::from_le_bytes(frame[4..].try_into().unwrap());
+            assert_eq!(live[n], (left, right), "frame {n}");
+        }
+    }
+
+    #[test]
     fn wav_master_matches_live_playback_with_bbus_otis_twin_delay_and_bend() {
         let (tx, rx) = rtrb::RingBuffer::new(8);
         let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(32);
@@ -899,6 +990,7 @@ mod tests {
             samples: Default::default(),
             sample_regions,
             custom_shader: None,
+            voice_calibration: false,
         };
         let destination =
             std::env::temp_dir().join(format!("leviathan-mixer-parity-{}", std::process::id()));
@@ -1029,6 +1121,7 @@ mod tests {
             samples: Default::default(),
             sample_regions: Default::default(),
             custom_shader: None,
+            voice_calibration: false,
         };
         let (tx, rx) = rtrb::RingBuffer::new(8);
         let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(32);
@@ -1211,6 +1304,7 @@ mod tests {
             samples,
             sample_regions: Default::default(),
             custom_shader: None,
+            voice_calibration: false,
         };
         audio.send(AudioCommand::SetPlaying {
             playing: true,
@@ -1271,6 +1365,7 @@ mod tests {
             samples: core::array::from_fn(|_| None),
             sample_regions: Default::default(),
             custom_shader: None,
+            voice_calibration: false,
         };
         audio.send(AudioCommand::ReplaceProject(Arc::new(
             AudioProject::prepare(&oversized, 2),
@@ -1532,6 +1627,7 @@ mod tests {
               _| None),
             sample_regions: Default::default(),
           custom_shader: None,
+          voice_calibration: false,
         };
         let snapshot = Arc::new(AudioProject::prepare(&project, 1));
         let retained = Arc::downgrade(&snapshot);

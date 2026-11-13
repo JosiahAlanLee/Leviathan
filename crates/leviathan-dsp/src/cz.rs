@@ -49,6 +49,7 @@ impl Voice {
         trigger: Option<f32>,
         params: &[f32; SOUND_PARAMS],
         rng: &mut u32,
+        calibrated: bool,
     ) -> f32 {
         let [wave_a, wave_b_mix, depth, dcw_decay, amp_attack, amp_release, mod_mode, detune] =
             *params;
@@ -80,9 +81,19 @@ impl Voice {
         let wave_b = choice((2.0 * wave_b_mix - 1.0).max(0.0), WAVE_COUNT);
         let blend = wave_b_mix.min(0.5);
         // Reduce the warp as the fundamental approaches the Nyquist limit.
-        let step_a = phase_step(base_hz, sample_rate);
         let detune = detune * 2.0 - 1.0;
-        let step_b = phase_step(base_hz * (1.0 + 0.06 * detune), sample_rate);
+        let (hz_a, hz_b) = if calibrated {
+            let spread = 1.0 + 0.03 * detune.abs();
+            if detune >= 0.0 {
+                (base_hz / spread, base_hz * spread)
+            } else {
+                (base_hz * spread, base_hz / spread)
+            }
+        } else {
+            (base_hz, base_hz * (1.0 + 0.06 * detune))
+        };
+        let step_a = phase_step(hz_a, sample_rate);
+        let step_b = phase_step(hz_b, sample_rate);
         let shape = depth * (0.2 + 0.8 * self.dcw);
         self.phase[0] = wrap_turns(self.phase[0] + step_a);
         self.phase[1] = wrap_turns(self.phase[1] + step_b);
@@ -99,7 +110,8 @@ impl Voice {
         } else {
             a * b + (2.0 * mod_mode - 1.0) * (a * noise(rng) - a * b)
         };
-        output * self.amp
+        let gain = if calibrated { 0.76 } else { 1.0 };
+        output * self.amp * gain
     }
 }
 
@@ -183,6 +195,7 @@ mod tests {
                             (i % 128 == 0).then_some(1.0),
                             &params,
                             &mut rng,
+                            false,
                         );
                         assert!(
                             (-1.001..=1.001).contains(&sample),
@@ -216,17 +229,17 @@ mod tests {
         let mut params = MachineKind::CzPhaseDist.spec().default_params();
         params[3] = 0.0;
         let mut rng = 123;
-        voice.step(220.0, 48_000.0, true, Some(0.8), &params, &mut rng);
+        voice.step(220.0, 48_000.0, true, Some(0.8), &params, &mut rng, false);
         for _ in 0..4096 {
-            voice.step(220.0, 48_000.0, true, None, &params, &mut rng);
+            voice.step(220.0, 48_000.0, true, None, &params, &mut rng, false);
         }
         assert!(voice.dcw < 0.01);
         let previous_amp = voice.amp;
-        voice.step(220.0, 48_000.0, true, Some(0.8), &params, &mut rng);
+        voice.step(220.0, 48_000.0, true, Some(0.8), &params, &mut rng, false);
         assert!(voice.dcw > 0.99);
         assert!((voice.amp - previous_amp).abs() < 0.001);
         for _ in 0..96_000 {
-            voice.step(220.0, 48_000.0, false, None, &params, &mut rng);
+            voice.step(220.0, 48_000.0, false, None, &params, &mut rng, false);
         }
         assert_eq!(voice.amp, 0.0);
     }
@@ -249,5 +262,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn calibrated_lines_center_and_exchange_detune() {
+        let mut center = Voice::default();
+        let mut down = center.clone();
+        let mut up = center.clone();
+        let params = crate::LanePatch::for_machine_with_calibration(MachineKind::CzPhaseDist).params;
+        let mut down_params = params;
+        down_params[7] = 0.25;
+        let mut up_params = params;
+        up_params[7] = 0.75;
+        let mut rng = 123;
+        for i in 0..512 {
+            let trigger = (i == 0).then_some(0.8);
+            center.step(220.0, 48_000.0, true, trigger, &params, &mut rng, true);
+            down.step(220.0, 48_000.0, true, trigger, &down_params, &mut rng, true);
+            up.step(220.0, 48_000.0, true, trigger, &up_params, &mut rng, true);
+        }
+        assert_eq!(center.phase[0], center.phase[1]);
+        assert_eq!(down.phase, [up.phase[1], up.phase[0]]);
     }
 }
