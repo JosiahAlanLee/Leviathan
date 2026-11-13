@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use leviathan_core::{EngineConfig, LaunchTarget, SongPlayer, NUM_LANES};
-use leviathan_dsp::{StereoDelay,default_lane_patches, LanePatch,  SynthRack};
+use leviathan_dsp::{StereoDelay,  LanePatch,  SynthRack};
 
 use crate::project::Project;
 use crate::wav::{StereoWav, WavEncoding};
@@ -325,7 +325,7 @@ mod tests {
     use crate::lane_mix::LaneMix;
     use crate::wav::decode_wav_bytes;
     use leviathan_core::{NoteCell, Pattern, PatternChain, PlaybackRate};
-    use leviathan_dsp::MachineKind;
+    use leviathan_dsp::{default_lane_patches, MachineKind};
 
     fn project() -> Project {
         let mut pattern = Pattern {
