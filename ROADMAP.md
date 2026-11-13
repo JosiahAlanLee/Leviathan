@@ -112,7 +112,7 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
 > **Coordination & Sequencing Note**: Land **`T15` first** so `MachineSpec` and per-lane `LanePatch` routing are in place on `main`. Once `T15` merges, **`T16` (`cz.rs`), `T17` (`pvx.rs`), and `T18` (`vast.rs`)** live in separate `#![no_std]` submodules under `crates/leviathan-dsp/src/` and can be picked up in parallel by GPT and Gemini without UI file conflicts. Strictly uphold `CLEANROOM.md` (`BSD-3-Clause`): implement DSP from mathematical/behavioral specifications only — never copy or translate GPL-3.0 VCV Rack / community plugin code or AGPL wrapper modules (`Machinemodule` / `Monomodule`).
 
 ### `T15` – Dynamic Per-Lane Instrument Assignment (`LanePatch`) & `#![no_std]` `MachineSpec` Registry
-  - **Status**: `OPEN`
+  - **Status**: `DONE` (`17daad7`, `0b04362`, `16e5383`, `83fc175`, `0dfbc12`, `86ea8d0`, `8c45040`, `fb83cca`, `c424aed`). `#![no_std]` `MachineSpec` registry, per-lane `LanePatch` `.leviathan.json` persistence, lock-free `AudioCommand::SetLanePatch`, table-driven UI patch inspector & tracker badges, and dynamic `{lane}-{slug}.wav` stem export.
   - **Owned Files**: `crates/leviathan-core/src/lib.rs`, new `crates/leviathan-dsp/src/spec.rs`, `crates/leviathan-dsp/src/lib.rs`, `crates/leviathan-app/src/project.rs`, `crates/leviathan-app/src/audio.rs`, `crates/leviathan-app/src/locks_ui.rs`, `crates/leviathan-app/src/mixer_ui.rs`, `crates/leviathan-app/src/export.rs`, `crates/leviathan-app/src/main.rs`
   - **Goal**: Decouple the 6 tracker lanes (`NUM_LANES = 6`) from fixed default machines (`0..5`) so any lane can host any `MachineKind` in the synth pool with its own lane-level base patch (`LanePatch`), while per-step `SoundLock`s layer masked parameter locks or step-level machine swaps on top.
   - **Scope & Constraints**:
@@ -124,7 +124,7 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
     - Unit tests verifying two lanes assigned to the same `MachineKind` (e.g. dual `FourOpFm` or `ChordStab`) render independent voice states and distinct base patches in both real-time `SynthRack` and offline `export.rs`, masked step `SoundLock` overrides preserve unlocked base knobs, pre-`T15` `.leviathan.json` files deserialize cleanly, `#![no_std]` checks pass on `leviathan-core` and `leviathan-dsp`, and workspace builds with `0` compiler warnings.
 
 ### `T16` – Clean-Room `CzPhaseDist` Synth Voice (`CZishLab` Phase-Distortion Archetype)
-  - **Status**: `OPEN` *(depends on `T15`)*
+  - **Status**: `OPEN` *(unblocked — `T15` merged)*
   - **Owned Files**: new `crates/leviathan-dsp/src/cz.rs`, plus enum/table registration in `crates/leviathan-dsp/src/spec.rs` & `crates/leviathan-dsp/src/lib.rs`
   - **Goal**: Expand the assignable instrument pool with `MachineKind::CzPhaseDist` (`"CZPD"`), a `#![no_std]` Casio CZ / `uPD933`-style dual-line phase-distortion voice inspired by the clean-room `CZishLab` specification.
   - **Scope & Constraints**:
@@ -135,7 +135,7 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
     - Unit tests in `cz.rs` verifying bounded finite output across all waveform indices and MIDI pitches `0..=127`, harmonic enrichment as `DCW Depth` sweeps `0.0 -> 1.0`, clean behavior under `T11` `retrig` ratchets, `MachineSpec` registration, `--no-default-features` `#![no_std]` compilation, and `0` compiler warnings.
 
 ### `T17` – Clean-Room `PolivoksSub` Synth Voice (`PVXLab` Duophonic / Filter-Drive Archetype)
-  - **Status**: `OPEN` *(depends on `T15`)*
+  - **Status**: `OPEN` *(unblocked — `T15` merged)*
   - **Owned Files**: new `crates/leviathan-dsp/src/pvx.rs`, plus enum/table registration in `crates/leviathan-dsp/src/spec.rs` & `crates/leviathan-dsp/src/lib.rs`
   - **Goal**: Add `MachineKind::PolivoksSub` (`"PVX2"`), a `#![no_std]` dual-oscillator subtractive/cross-FM voice with switchable aggressive lowpass/bandpass op-amp filter saturation inspired by the clean-room `PVXLab` specification.
   - **Scope & Constraints**:
@@ -146,7 +146,7 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
     - Unit tests in `pvx.rs` verifying unconditional `is_finite()` stability at maximum resonance + cross-FM across MIDI notes `12..=120`, measurable spectral shift between LP and BP modes, `MachineSpec` registration, `--no-default-features` `#![no_std]` compilation, and `0` compiler warnings.
 
 ### `T18` – Clean-Room `VastFunSynth` Voice (`Vastish` 3-Block Pipeline & `FUN` Combinator Archetype)
-  - **Status**: `OPEN` *(depends on `T15`)*
+  - **Status**: `OPEN` *(unblocked — `T15` merged)*
   - **Owned Files**: new `crates/leviathan-dsp/src/vast.rs`, plus enum/table registration in `crates/leviathan-dsp/src/spec.rs` & `crates/leviathan-dsp/src/lib.rs`
   - **Goal**: Add `MachineKind::VastFunSynth` (`"VAST"`), a `#![no_std]` Kurzweil VAST-inspired 3-block algorithm voice with selectable 2-input `FUN(a, b)` nonlinear modulation combinators drawn from the clean-room `Vastish` behavioral model.
   - **Scope & Constraints**:

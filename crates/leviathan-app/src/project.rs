@@ -5,9 +5,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use leviathan_core::{
-    Pattern, PatternChain, MAX_CHAIN_ENTRIES, MAX_NUDGE, MAX_RETRIG, MAX_SWING, ROWS_PER_PATTERN,
+    Pattern, PatternChain, MAX_CHAIN_ENTRIES, MAX_NUDGE, MAX_RETRIG, MAX_SWING, NUM_LANES,
+    ROWS_PER_PATTERN, SOUND_PARAMS,
 };
 use leviathan_dsp::sampler::{SampleBank, SampleRegion, MAX_WAVE_LEN, NUM_BANKS};
+use leviathan_dsp::{default_lane_patches, LanePatch, MachineKind};
 use serde::{Deserialize, Serialize};
 
 use crate::lane_mix::LaneMix;
@@ -25,6 +27,7 @@ pub struct Project {
     pub bpm: f64,
     pub master_send: f32,
     pub lane_mix: LaneMix,
+    pub lane_patches: [LanePatch; NUM_LANES],
     pub patterns: Vec<Pattern>,
     pub selected_pattern: usize,
     pub chain: PatternChain,
@@ -54,6 +57,9 @@ struct ProjectFile {
     master_send: f32,
     #[serde(flatten)]
     lane_mix: LaneMix,
+    /// Per-lane instrument patches; absent in projects saved before `T15`.
+    #[serde(default)]
+    lane_patches: Option<[StoredLanePatch; NUM_LANES]>,
     patterns: Vec<Pattern>,
     selected_pattern: usize,
     chain: Vec<u8>,
@@ -62,6 +68,37 @@ struct ProjectFile {
     sample_regions: [StoredSampleRegion; NUM_BANKS],
     #[serde(default)]
     custom_shader: Option<CustomShader>,
+}
+
+/// On-disk form of a `LanePatch`: the machine is stored by its stable slug.
+#[derive(Serialize, Deserialize)]
+struct StoredLanePatch {
+    machine: String,
+    params: [f32; SOUND_PARAMS],
+}
+
+impl From<&LanePatch> for StoredLanePatch {
+    fn from(patch: &LanePatch) -> Self {
+        Self {
+            machine: patch.machine.slug().to_string(),
+            params: patch.params,
+        }
+    }
+}
+
+impl StoredLanePatch {
+    fn decode(&self) -> Result<LanePatch, String> {
+        let machine = MachineKind::from_slug(&self.machine)
+            .ok_or_else(|| format!("Unknown lane machine '{}'", self.machine))?;
+        let patch = LanePatch {
+            machine,
+            params: self.params,
+        };
+        if !patch.is_valid() {
+            return Err("Lane patch parameters must be between 0 and 1".to_string());
+        }
+        Ok(patch)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -133,6 +170,12 @@ impl ProjectFile {
         if !self.lane_mix.is_valid() {
             return Err("Invalid lane mute or solo mask or mixer settings".to_string());
         }
+        let mut lane_patches = default_lane_patches();
+        if let Some(stored) = &self.lane_patches {
+            for (patch, stored) in lane_patches.iter_mut().zip(stored) {
+                *patch = stored.decode()?;
+            }
+        }
         if !(1..=PATTERN_BANK_CAPACITY).contains(&self.patterns.len())
             || self.selected_pattern >= self.patterns.len()
         {
@@ -176,6 +219,7 @@ impl ProjectFile {
             bpm: self.bpm,
             master_send: self.master_send,
             lane_mix: self.lane_mix,
+            lane_patches,
             patterns: self.patterns,
             selected_pattern: self.selected_pattern,
             chain,
@@ -242,6 +286,9 @@ pub fn save(path: &Path, project: Project) -> Result<(), String> {
         bpm: project.bpm,
         master_send: project.master_send,
         lane_mix: project.lane_mix,
+        lane_patches: Some(core::array::from_fn(|lane| {
+            StoredLanePatch::from(&project.lane_patches[lane])
+        })),
         patterns: project.patterns,
         selected_pattern: project.selected_pattern,
         chain: project.chain.as_slice().to_vec(),
@@ -340,6 +387,7 @@ mod tests {
         let snapshot = |bpm, master_send, selected_pattern, lane_mix| Project {
             bpm,
             master_send,
+            lane_patches: default_lane_patches(),
             lane_mix,
             selected_pattern,
             chain,
@@ -394,6 +442,7 @@ mod tests {
             version: PROJECT_VERSION + 1,
             bpm: 120.0,
             master_send: 0.0,
+            lane_patches: None,
             lane_mix: LaneMix::default(),
             patterns: vec![Pattern::default()],
             selected_pattern: 0,
@@ -422,6 +471,7 @@ mod tests {
             version: PROJECT_VERSION,
             bpm: 120.0,
             master_send: 0.0,
+            lane_patches: None,
             lane_mix: LaneMix::default(),
             patterns: vec![pat],
             selected_pattern: 0,
@@ -440,6 +490,7 @@ mod tests {
             version: PROJECT_VERSION,
             bpm: 120.0,
             master_send: 0.5,
+            lane_patches: None,
             lane_mix: LaneMix {
                 mute_mask: 1,
                 solo_mask: 2,
@@ -531,6 +582,7 @@ mod tests {
             Project {
                 bpm: 120.0,
                 master_send: 0.25,
+                lane_patches: default_lane_patches(),
                 lane_mix,
                 patterns: patterns.to_vec(),
                 selected_pattern: 0,

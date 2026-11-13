@@ -6,6 +6,7 @@ mod gpu_view;
 mod inspector_ui;
 mod lane_mix;
 mod link;
+mod locks_ui;
 mod master_ui;
 mod midi;
 mod mixer_ui;
@@ -23,7 +24,7 @@ use eframe::egui;
 use export_ui::ExportUi;
 use gen_ui::{GenUi, MidiDestination, MidiFileAction};
 use gpu_view::FeedbackViewport;
-use inspector_ui::{InspectorEdits, LANE_NAMES};
+use inspector_ui::InspectorEdits;
 use lane_mix::LaneMix;
 use leviathan_core::{
     CvFrame, EngineConfig, FillCondition, LaunchTarget, NoteCell, Pattern, PatternChain,
@@ -31,6 +32,7 @@ use leviathan_core::{
 };
 use leviathan_dsp::{default_lane_patches, LanePatch, MachineKind, MasterPeaks};
 use link::SoundLinkBridge;
+use locks_ui::draw_lane_patch_inspector;
 use master_ui::MasterMeters;
 use midi::{MidiControls, MidiEvent, MidiReceiver, MidiTarget};
 
@@ -186,6 +188,7 @@ struct LeviathanApp {
     bpm: f64,
     master_send: f32,
     lane_mix: LaneMix,
+    lane_patches: [LanePatch; NUM_LANES],
     master_meters: MasterMeters,
     sound_link: SoundLinkBridge,
     midi: MidiControls,
@@ -258,6 +261,7 @@ impl LeviathanApp {
             bpm: 132.0,
             master_send: 0.0,
             lane_mix: LaneMix::default(),
+            lane_patches: default_lane_patches(),
             master_meters: MasterMeters::default(),
             sound_link: SoundLinkBridge::default(),
             midi,
@@ -609,6 +613,7 @@ impl LeviathanApp {
             bpm: self.bpm,
             master_send: self.master_send,
             lane_mix: self.lane_mix,
+            lane_patches: self.lane_patches,
             patterns: self.patterns.clone(),
             selected_pattern: self.selected_pattern,
             chain: self.chain,
@@ -637,6 +642,7 @@ impl LeviathanApp {
         self.bpm = project.bpm;
         self.master_send = project.master_send;
         self.lane_mix = project.lane_mix;
+        self.lane_patches = project.lane_patches;
         self.master_meters = MasterMeters::default();
         self.histories = (0..project.patterns.len())
             .map(|_| EditHistory::default())
@@ -872,13 +878,27 @@ impl eframe::App for LeviathanApp {
 
                     ui.separator();
                     self.viewport.draw_shader_controls(ui, hovering_wgsl);
-                    mixer_ui::draw(ui, &mut self.lane_mix);
+                    mixer_ui::draw(ui, &mut self.lane_mix, &self.lane_patches);
+                    let safe_lane = sel_lane.min(NUM_LANES - 1);
+                    if draw_lane_patch_inspector(ui, safe_lane, &mut self.lane_patches[safe_lane]) {
+                        self.send_audio(AudioCommand::SetLanePatch {
+                            lane: safe_lane,
+                            patch: self.lane_patches[safe_lane],
+                        });
+                    }
                     bank_actions.extend(self.sampler_ui.draw(ui, hovering_wav));
 
                     ui.separator();
                     inspector_edits = inspector_ui::draw(
-                        ui, sel_lane, sel_row, cur_cell, cur_auto, cur_len, cur_rate,
-                    );
+                ui,
+                sel_lane,
+                sel_row,
+                cur_cell,
+                cur_auto,
+                cur_len,
+                cur_rate,
+                &self.lane_patches[sel_lane.min(NUM_LANES - 1)],
+            );
                 });
             });
 
@@ -1001,8 +1021,9 @@ impl eframe::App for LeviathanApp {
                     .min_col_width(82.0)
                     .show(ui, |ui| {
                         ui.monospace("ROW");
-                        for (lane, name) in LANE_NAMES.into_iter().enumerate() {
-                            self.lane_mix.header(ui, name, lane);
+                        for (lane, patch) in self.lane_patches.iter().enumerate() {
+                            let name = format!("{lane} {}", patch.machine.short_name());
+                            self.lane_mix.header(ui, &name, lane);
                         }
                         ui.end_row();
 
@@ -1186,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn midi_step_record_preserves__and_uses_the_tracker_edit_step() {
+    fn midi_step_record_preserves_locks_and_uses_the_tracker_edit_step() {
         use midi::MidiKey;
 
         let ctx = egui::Context::default();
