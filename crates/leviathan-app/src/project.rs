@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use leviathan_core::rack_routing::RackRouting;
 use leviathan_core::{
     Pattern, PatternChain, MAX_CHAIN_ENTRIES, MAX_NUDGE, MAX_RETRIG, MAX_SWING, NUM_LANES,
     ROWS_PER_PATTERN, SOUND_PARAMS,
@@ -12,6 +13,7 @@ use leviathan_dsp::sampler::{SampleBank, SampleRegion, MAX_WAVE_LEN, NUM_BANKS};
 use leviathan_dsp::{default_lane_patches, BenderParams, DelayMode, LanePatch, MachineKind};
 use serde::{Deserialize, Serialize};
 
+use crate::capture::Take;
 use crate::lane_mix::LaneMix;
 use crate::wav::{sample_peaks, DecodedWav};
 
@@ -37,6 +39,13 @@ pub struct Project {
     pub sample_regions: [SampleRegion; NUM_BANKS],
     pub custom_shader: Option<CustomShader>,
     pub voice_calibration: bool,
+    pub instruments: InstrumentSettings,
+}
+
+#[derive(Clone, Default)]
+pub struct InstrumentSettings {
+    pub routing: RackRouting,
+    pub take: Option<Arc<Take>>,
 }
 
 impl Project {
@@ -77,6 +86,27 @@ struct ProjectFile {
     custom_shader: Option<CustomShader>,
     #[serde(default)]
     voice_calibration: bool,
+    #[serde(default, skip_serializing_if = "InstrumentFile::is_default")]
+    instruments: InstrumentFile,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct InstrumentFile {
+    routing: RackRouting,
+    take: Option<CaptureFile>,
+}
+
+impl InstrumentFile {
+    fn is_default(&self) -> bool {
+        self.routing == RackRouting::default() && self.take.is_none()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct CaptureFile {
+    rate: u32,
+    frames: Vec<[i16; 2]>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -198,6 +228,18 @@ impl ProjectFile {
         if !self.lane_mix.is_valid() {
             return Err("Invalid lane mute or solo mask or mixer settings".to_string());
         }
+        let routing = self.instruments.routing;
+        if routing.render_order().is_none() {
+            return Err("Invalid or cyclic instrument routing".to_string());
+        }
+        let take = self
+            .instruments
+            .take
+            .map(|file| {
+                Take::new(file.rate, file.frames)
+                    .ok_or_else(|| "Invalid capture sample".to_string())
+            })
+            .transpose()?;
         let mut lane_patches = default_lane_patches();
         if let Some(stored) = &self.lane_patches {
             for (patch, stored) in lane_patches.iter_mut().zip(stored) {
@@ -257,6 +299,7 @@ impl ProjectFile {
             sample_regions,
             custom_shader: self.custom_shader,
             voice_calibration: self.voice_calibration,
+            instruments: InstrumentSettings { routing, take },
         })
     }
 }
@@ -312,6 +355,9 @@ pub fn load(path: &Path) -> Result<Project, String> {
 }
 
 pub fn save(path: &Path, project: Project) -> Result<(), String> {
+    if project.instruments.routing.render_order().is_none() {
+        return Err("Invalid or cyclic instrument routing".to_string());
+    }
     let project = ProjectFile {
         version: PROJECT_VERSION,
         bpm: project.bpm,
@@ -331,6 +377,13 @@ pub fn save(path: &Path, project: Project) -> Result<(), String> {
         sample_regions: project.sample_regions.map(StoredSampleRegion),
         custom_shader: project.custom_shader,
         voice_calibration: project.voice_calibration,
+        instruments: InstrumentFile {
+            routing: project.instruments.routing,
+            take: project.instruments.take.as_deref().map(|take| CaptureFile {
+                rate: take.rate,
+                frames: take.frames.clone(),
+            }),
+        },
     };
     let mut bytes = serde_json::to_vec(&project).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
@@ -443,6 +496,7 @@ mod tests {
             sample_regions,
             custom_shader: None,
             voice_calibration: true,
+            instruments: Default::default(),
         };
         save(&path, snapshot(120.0, 0.0, 0, LaneMix::default())).unwrap();
         let bpm = f64::from_bits(120.0_f64.to_bits() + 1);
@@ -516,6 +570,7 @@ mod tests {
             sample_regions: Default::default(),
             custom_shader: None,
             voice_calibration: false,
+            instruments: Default::default(),
         };
         let mut json = serde_json::to_value(&project).unwrap();
         assert!(project_error(&json).contains("version"));
@@ -548,6 +603,7 @@ mod tests {
             sample_regions: Default::default(),
             custom_shader: None,
             voice_calibration: false,
+            instruments: Default::default(),
         };
         let json = serde_json::to_value(&project).unwrap();
         assert!(project_error(&json).contains("Invalid sound lock"));
@@ -590,6 +646,7 @@ mod tests {
                 sample_regions: Default::default(),
                 custom_shader: None,
                 voice_calibration: false,
+                instruments: Default::default(),
             },
         )
         .unwrap();
@@ -622,6 +679,7 @@ mod tests {
             sample_regions: Default::default(),
             custom_shader: None,
             voice_calibration: false,
+            instruments: Default::default(),
         };
         let mut json = serde_json::to_value(project).unwrap();
         let fields = json.as_object_mut().unwrap();
@@ -738,6 +796,7 @@ mod tests {
                 sample_regions: Default::default(),
                 custom_shader: Some(shader.clone()),
                 voice_calibration: false,
+                instruments: Default::default(),
             },
         )
         .unwrap();

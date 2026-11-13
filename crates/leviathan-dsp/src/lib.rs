@@ -1,7 +1,12 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
+#[cfg(all(test, not(feature = "std")))]
+extern crate std;
+
 mod bbus;
 mod bender;
+mod byte_route;
+mod captured;
 mod cz;
 pub mod dac;
 pub mod fm;
@@ -20,12 +25,14 @@ mod west;
 
 use core::f32::consts::{FRAC_1_PI, FRAC_1_SQRT_2, FRAC_2_PI, PI, TAU};
 use fm::FourOpFmVoice;
+use leviathan_core::rack_routing::{LaneInput, RackRouting};
 use leviathan_core::{CvFrame, SoundLock, NUM_LANES};
 use master::{MasterBus, MAX_SEND};
 use sampler::{SampleBank, VarClockSamplerVoice};
 
 pub use bbus::{ByteBusReceiver, ByteBusSource};
 pub use bender::{BenderParams, BENDER_MAX_SHIFT_HZ};
+pub use captured::{CaptureSample, CaptureSamples, CaptureTap};
 pub use master::{DelayMode, MasterPeaks, StereoDelay};
 pub use spec::{
     default_lane_patches, machine_spec, LanePatch, MachineSpec, ParamSpec, DEFAULT_LANE_MACHINES,
@@ -348,6 +355,8 @@ struct VoiceState {
     rng: u32,
     fm: FourOpFmVoice,
     sampler: VarClockSamplerVoice,
+    capture: captured::Playback,
+    capture_gain: f32,
     cz: cz::Voice,
     pvx: pvx::Voice,
     vast: vast::Voice,
@@ -377,6 +386,8 @@ impl Default for VoiceState {
             rng: 0x9e37_79b9,
             fm: FourOpFmVoice::default(),
             sampler: VarClockSamplerVoice::default(),
+            capture: captured::Playback::default(),
+            capture_gain: 0.0,
             cz: cz::Voice::default(),
             pvx: pvx::Voice::default(),
             vast: vast::Voice::default(),
@@ -403,6 +414,8 @@ impl VoiceState {
         self.ic2eq = 0.0;
         self.fm = FourOpFmVoice::default();
         self.sampler = VarClockSamplerVoice::default();
+        self.capture = captured::Playback::default();
+        self.capture_gain = 0.0;
         self.cz = cz::Voice::default();
         self.pvx = pvx::Voice::default();
         self.vast.reset();
@@ -477,10 +490,12 @@ impl VoiceState {
                 }
                 MachineKind::WestCoastLpg => self.west.step(hz, sample_rate, gate, trigger, &params),
                 MachineKind::OtisTranswave => {
-                    self.otis.step(hz, sample_rate, trigger, &params, calibrated)
+                    self.otis
+                        .step(hz, sample_rate, trigger, &params, calibrated, None)
                 }
                 MachineKind::OtisTwin => {
-                    self.otis_twin.step(hz, sample_rate, gate, trigger, &params, calibrated)
+                    self.otis_twin
+                        .step(hz, sample_rate, gate, trigger, &params, calibrated, None)
                 }
                 MachineKind::ByteBusR2r => {
                     self.bbus.step(hz, sample_rate, gate, trigger, bus_word, &params)
@@ -607,6 +622,146 @@ impl VoiceState {
             v2
         }
     }
+
+    #[inline]
+    fn render_capture(
+        &mut self,
+        cv: &CvFrame,
+        lane: usize,
+        patch: &LanePatch,
+        rate: f32,
+        sample_bank: &SampleBank,
+        bus_word: Option<u8>,
+        calibrated: bool,
+        samples: &CaptureSamples<'_>,
+        routing: &RackRouting,
+        routed: &[[f32; 2]; NUM_LANES],
+        frame_byte: Option<u8>,
+    ) -> [f32; 2] {
+        let input = routing.inputs[lane];
+        if input == LaneInput::Instrument {
+            return [self.render(cv, lane, patch, rate, sample_bank, bus_word, calibrated); 2];
+        }
+        let gate = cv.gate_v[lane] > 2.5;
+        let requested = MachineKind::from_patch_and_lock(patch, &cv.locks[lane]);
+        let machine = if gate {
+            requested
+        } else {
+            self.active_machine.unwrap_or(patch.machine)
+        };
+        let sampled = matches!(
+            machine,
+            MachineKind::VarSampler
+                | MachineKind::OtisTranswave
+                | MachineKind::OtisTwin
+                | MachineKind::VastFunSynth
+        );
+        let through = match input {
+            LaneInput::Lane(source) if machine == MachineKind::VastFunSynth => {
+                Some(usize::from(source))
+            }
+            _ => None,
+        };
+        let captured = input == LaneInput::Capture && sampled;
+        if !captured && through.is_none() {
+            self.capture.finish();
+            return [self.render(cv, lane, patch, rate, sample_bank, bus_word, calibrated); 2];
+        }
+
+        let switching = self.active_machine != Some(machine);
+        if switching {
+            self.reset_synthesis();
+        }
+        let attack = gate && (!self.prev_gate || cv.retrigger_mask & (1 << lane) != 0);
+        self.prev_gate = gate;
+        self.active_machine = Some(machine);
+        if gate {
+            self.note_pitch = cv.pitch_v[lane];
+            self.note_lock = cv.locks[lane];
+        }
+        let trigger = attack.then(|| {
+            let velocity = cv.velocity_v[lane] / 10.0;
+            if velocity.is_finite() {
+                velocity.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        });
+        let hz = voice::pitch_hz(self.note_pitch);
+        if let Some(velocity) = trigger.filter(|_| captured) {
+            self.capture.trigger(
+                samples.current,
+                routing.region,
+                usize::from(routing.frame_size),
+            );
+            self.capture_gain = velocity;
+        }
+        let take = samples.get(self.capture.generation());
+        if machine == MachineKind::VarSampler {
+            return take.map_or([0.0; 2], |take| {
+                let gain = self.capture_gain * if calibrated { 0.85 } else { 1.0 };
+                self.capture
+                    .step(take, hz / sampler::C4_HZ, rate, gate)
+                    .map(|sample| sample * gain)
+            });
+        }
+        let parameters = voice::controls(
+            patch.resolve_lock(&self.note_lock).values,
+            &machine.spec().params,
+        );
+        let mono = |pair: [f32; 2]| 0.5 * (pair[0] + pair[1]);
+        match machine {
+            MachineKind::VastFunSynth => {
+                let input = if let Some(source) = through {
+                    vast::Input::Through(mono(routed[source]))
+                } else {
+                    let pair = take.map_or([0.0; 2], |take| {
+                        self.capture.step(take, hz / sampler::C4_HZ, rate, gate)
+                    });
+                    vast::Input::Gated(mono(pair))
+                };
+                [self.vast.step_input(hz, rate, trigger, &parameters, input); 2]
+            }
+            MachineKind::OtisTranswave | MachineKind::OtisTwin => {
+                let source = take.map(|take| {
+                    let bus = if routing.frame_bytebus {
+                        frame_byte
+                    } else {
+                        None
+                    };
+                    self.capture.frames(take, bus)
+                });
+                if source.is_none() {
+                    return [0.0; 2];
+                }
+                let signal = if machine == MachineKind::OtisTranswave {
+                    let signal = self
+                        .otis
+                        .step(hz, rate, trigger, &parameters, calibrated, source);
+                    if self.otis.is_silent() {
+                        self.capture.finish();
+                    }
+                    signal
+                } else {
+                    let signal = self.otis_twin.step(
+                        hz,
+                        rate,
+                        gate,
+                        trigger,
+                        &parameters,
+                        calibrated,
+                        source,
+                    );
+                    if self.otis_twin.is_silent() {
+                        self.capture.finish();
+                    }
+                    signal
+                };
+                [signal; 2]
+            }
+            _ => [0.0; 2],
+        }
+    }
 }
 
 pub struct SynthRack {
@@ -620,6 +775,10 @@ pub struct SynthRack {
     pub counter: ByteBusCounter,
     lane_patches: [LanePatch; NUM_LANES],
     voice_calibration: bool,
+    routing: RackRouting,
+    render_order: [usize; NUM_LANES],
+    byte_register: byte_route::Register,
+    routed_byte: Option<u8>,
 }
 
 // Leave stack headroom for worker initialization and Windows test threads.
@@ -639,6 +798,10 @@ impl SynthRack {
             counter: ByteBusCounter::default(),
             lane_patches: DEFAULT_LANE_PATCHES,
             voice_calibration: false,
+            routing: RackRouting::default(),
+            render_order: core::array::from_fn(|lane| lane),
+            byte_register: byte_route::Register::default(),
+            routed_byte: None,
         }
     }
     pub fn lane_patches(&self) -> &[LanePatch; NUM_LANES] {
@@ -681,6 +844,41 @@ impl SynthRack {
     pub fn reset_voices(&mut self) {
         self.voices = Self::fresh_voices(self.audible_mask, self.channels);
         self.counter = ByteBusCounter::default();
+    }
+
+    pub fn set_routing(&mut self, routing: RackRouting) -> bool {
+        let Some(order) = routing.render_order() else {
+            return false;
+        };
+        for (lane, voice) in self.voices.iter_mut().enumerate() {
+            if self.routing.inputs[lane] != routing.inputs[lane] {
+                voice.reset_synthesis();
+            }
+        }
+        let was_clocked = self.routing.bytebus.enabled || self.routing.frame_bytebus;
+        let clocked = routing.bytebus.enabled || routing.frame_bytebus;
+        self.routing = routing;
+        self.render_order = order;
+        if was_clocked != clocked {
+            self.reset_byte_route();
+        }
+        true
+    }
+
+    pub fn reset_byte_route(&mut self) {
+        self.byte_register = byte_route::Register::default();
+        self.byte_register.reset(self.routing.bytebus.reset_word);
+        self.routed_byte = None;
+    }
+
+    pub fn routed_byte(&self) -> Option<u8> {
+        self.routed_byte
+    }
+
+    pub fn capture_generations(&self) -> [Option<u64>; NUM_LANES] {
+        self.voices
+            .each_ref()
+            .map(|voice| voice.capture.generation())
     }
 
     pub fn set_voice_calibration(&mut self, enabled: bool) {
@@ -738,13 +936,22 @@ impl SynthRack {
 
     #[inline]
     pub fn render_stereo(&mut self, cv: &CvFrame) -> (f32, f32) {
-        self.render_mix(cv, None, None, bbus::tracker_word(cv)).0
+        self.render_mix(
+            cv,
+            None,
+            None,
+            bbus::tracker_word(cv),
+            &CaptureSamples::default(),
+            None,
+        )
+        .0
     }
 
     /// Renders with an already decoded external ByteBus word. Use
     /// `ByteBusReceiver` for raw clocked voltages and `None` for standalone.
     pub fn render_stereo_with_bytebus(&mut self, cv: &CvFrame, word: Option<u8>) -> (f32, f32) {
-        self.render_mix(cv, None, None, word).0
+        self.render_mix(cv, None, None, word, &CaptureSamples::default(), None)
+            .0
     }
 
     /// Renders the master and taps each lane after gain and pan, before the master bus.
@@ -754,7 +961,15 @@ impl SynthRack {
         cv: &CvFrame,
         stems: &mut [[f32; 2]; NUM_LANES],
     ) -> (f32, f32) {
-        self.render_mix(cv, Some(stems), None, bbus::tracker_word(cv)).0
+        self.render_mix(
+            cv,
+            Some(stems),
+            None,
+            bbus::tracker_word(cv),
+            &CaptureSamples::default(),
+            None,
+        )
+        .0
     }
 
     /// Includes each lane's own contribution to the delay in its stem.
@@ -775,7 +990,45 @@ impl SynthRack {
         stems: &mut [[f32; 2]; NUM_LANES],
         delays: &mut [StereoDelay; NUM_LANES],
     ) -> ((f32, f32), [f32; 2]) {
-        self.render_mix(cv, Some(stems), Some(delays), bbus::tracker_word(cv))
+        let (master, wet, _) = self.render_mix(
+            cv,
+            Some(stems),
+            Some(delays),
+            bbus::tracker_word(cv),
+            &CaptureSamples::default(),
+            None,
+        );
+        (master, wet)
+    }
+
+    /// Render a live sample with an optional capture tap from the same mixer pass.
+    pub fn render_session(
+        &mut self,
+        cv: &CvFrame,
+        samples: &CaptureSamples<'_>,
+        tap: Option<CaptureTap>,
+    ) -> ((f32, f32), [f32; 2]) {
+        let (master, _, sample) =
+            self.render_mix(cv, None, None, bbus::tracker_word(cv), samples, tap);
+        (master, sample)
+    }
+
+    pub fn render_session_with_stems(
+        &mut self,
+        cv: &CvFrame,
+        samples: &CaptureSamples<'_>,
+        stems: &mut [[f32; 2]; NUM_LANES],
+        delays: &mut [StereoDelay; NUM_LANES],
+    ) -> ((f32, f32), [f32; 2]) {
+        let (master, wet, _) = self.render_mix(
+            cv,
+            Some(stems),
+            Some(delays),
+            bbus::tracker_word(cv),
+            samples,
+            None,
+        );
+        (master, wet)
     }
 
     #[inline]
@@ -785,15 +1038,31 @@ impl SynthRack {
         mut stems: Option<&mut [[f32; 2]; NUM_LANES]>,
         mut stem_delays: Option<&mut [StereoDelay; NUM_LANES]>,
         bus_word: Option<u8>,
-    ) -> ((f32, f32), [f32; 2]) {
+        samples: &CaptureSamples<'_>,
+        tap: Option<CaptureTap>,
+    ) -> ((f32, f32), [f32; 2], [f32; 2]) {
         let _bus_step = self.counter.step(cv.bytebus_v[8] > 5.0, cv.reset_v > 5.0);
+        let byte_routing = self.routing.bytebus.enabled || self.routing.frame_bytebus;
+        let held_byte =
+            byte_routing.then(|| self.byte_register.step(cv, bus_word, self.routing.bytebus));
+        let routed_byte = if cv.run_v > 2.5 { held_byte } else { None };
+        self.routed_byte = routed_byte;
+        let bus_word = if self.routing.bytebus.enabled {
+            routed_byte.or(bus_word)
+        } else {
+            bus_word
+        };
         let mut dry_mix = [0.0_f32; 2];
         let mut delay_mix = [0.0_f32; 2];
         let mut fx_mix = [0.0_f32; 2];
         let master_send = self.master.next_send();
+        let mut lane_dry = [[0.0; 2]; NUM_LANES];
+        let mut lane_send = [[0.0; 2]; NUM_LANES];
+        let mut lane_fx = [0.0; NUM_LANES];
 
-        for (lane, v) in self.voices.iter_mut().enumerate() {
-            let voice = v.render(
+        for lane in self.render_order {
+            let v = &mut self.voices[lane];
+            let voice = v.render_capture(
                 cv,
                 lane,
                 &self.lane_patches[lane],
@@ -801,6 +1070,10 @@ impl SynthRack {
                 &self.sample_bank,
                 bus_word,
                 self.voice_calibration,
+                samples,
+                &self.routing,
+                &lane_dry,
+                held_byte,
             );
 
             // Keep the voice running under the mute so it resumes at the same phase.
@@ -810,18 +1083,27 @@ impl SynthRack {
                 self.lane_slew,
             );
             v.channel.slew(self.channels[lane], self.lane_slew);
-            let signal = voice * v.output_gain * v.channel.level * 0.45;
-            let dry = stereo_pan(v.channel.pan).map(|gain| signal * gain);
+            let [pan_l, pan_r] = stereo_pan(v.channel.pan);
+            let signal = voice.map(|sample| sample * v.output_gain * v.channel.level * 0.45);
+            let dry = [signal[0] * pan_l, signal[1] * pan_r];
             // The master send raises the baseline for every channel. The lane
             // send uses the remaining range so the total stays bounded.
             let send_gain = master_send + v.channel.delay_send * (MAX_SEND - master_send);
             let send = dry.map(|sample| sample * send_gain);
             // Leave headroom for several lanes exciting the shared tank.
             let fx_gain = v.channel.fx_send * 0.5;
+            lane_dry[lane] = dry;
+            lane_send[lane] = send;
+            lane_fx[lane] = fx_gain;
+        }
+        // Sum in lane order even when a source had to be rendered before its destination.
+        for lane in 0..NUM_LANES {
+            let dry = lane_dry[lane];
+            let send = lane_send[lane];
             for channel in 0..2 {
                 dry_mix[channel] += dry[channel];
                 delay_mix[channel] += send[channel];
-                fx_mix[channel] += dry[channel] * fx_gain;
+                fx_mix[channel] += dry[channel] * lane_fx[lane];
             }
             if let Some(stems) = &mut stems {
                 stems[lane] = if let Some(delays) = &mut stem_delays {
@@ -833,7 +1115,14 @@ impl SynthRack {
         }
 
         let ([left, right], wet) = self.master.process(dry_mix, delay_mix, fx_mix);
-        ((left, right), wet)
+        let captured = match tap {
+            Some(CaptureTap::Lane(lane)) => {
+                lane_dry.get(usize::from(lane)).copied().unwrap_or_default()
+            }
+            Some(CaptureTap::Bend) => wet,
+            None => [0.0; 2],
+        };
+        ((left, right), wet, captured)
     }
 }
 
@@ -849,6 +1138,131 @@ fn lane_target(audible_mask: u8, lane: usize) -> f32 {
 mod tests {
     use super::*;
     use leviathan_core::{EngineConfig, NoteCell, Pattern, TrackerEvaluator};
+
+    #[test]
+    fn bend_capture_tap_is_the_wet_stem_before_master_processing() {
+        let mut rack = SynthRack::new(48_000.0);
+        let mut channels = DEFAULT_LANE_CHANNELS;
+        channels[0].fx_send = 0.8;
+        rack.set_lane_channels(channels);
+        rack.reset_voices();
+        let mut cv = CvFrame::default();
+        cv.gate_v[0] = 10.0;
+        cv.velocity_v[0] = 10.0;
+        let inputs = CaptureSamples::default();
+        let captured: std::vec::Vec<[f32; 2]> = (0..12_000)
+            .map(|_| rack.render_session(&cv, &inputs, Some(CaptureTap::Bend)).1)
+            .collect();
+        assert!(captured.iter().any(|frame| frame[0].abs() > 1e-4));
+        assert!(captured.iter().any(|frame| frame[1].abs() > 1e-4));
+        rack.reset_voices();
+        rack.reset_master(0.0);
+        let mut stems = [[0.0; 2]; NUM_LANES];
+        let mut delays: std::boxed::Box<[StereoDelay; NUM_LANES]> =
+            core::iter::repeat_with(|| StereoDelay::new(48_000.0))
+                .take(NUM_LANES)
+                .collect::<std::vec::Vec<_>>()
+                .into_boxed_slice()
+                .try_into()
+                .ok()
+                .unwrap();
+        for expected in captured {
+            let (_, wet) = rack.render_session_with_stems(&cv, &inputs, &mut stems, &mut delays);
+            assert_eq!(wet, expected);
+        }
+    }
+
+    #[test]
+    fn byte_route_bypass_matches_direct_bbus_and_uses_the_latched_word_when_enabled() {
+        let mut rack = SynthRack::new(48_000.0);
+        rack.set_lane_patch(0, LanePatch::for_machine(MachineKind::ByteBusR2r));
+        let mut cv = CvFrame {
+            run_v: 10.0,
+            ..CvFrame::default()
+        };
+        cv.gate_v[0] = 10.0;
+        cv.velocity_v[0] = 10.0;
+        cv.pitch_v[0] = 3.0;
+        let inputs = CaptureSamples::default();
+        let clock = |index: usize| index % 32 == 16;
+        let word = |index: usize| (index as u8).wrapping_mul(31);
+        let before = core::array::from_fn::<_, 512, _>(|index| {
+            rack.render_stereo_with_bytebus(&cv, Some(word(index)))
+        });
+        rack.reset_voices();
+        rack.reset_master(0.0);
+        let after = core::array::from_fn::<_, 512, _>(|index| {
+            cv.bytebus_v = leviathan_core::encode_bytebus_frame(word(index), clock(index));
+            rack.render_session(&cv, &inputs, None).0
+        });
+        assert_eq!(before, after);
+        assert_eq!(rack.routed_byte(), None);
+
+        rack.reset_voices();
+        rack.reset_master(0.0);
+        let mut routing = RackRouting::default();
+        routing.bytebus.enabled = true;
+        routing.bytebus.reset_word = 0x77;
+        assert!(rack.set_routing(routing));
+        let latched = core::array::from_fn::<_, 512, _>(|index| {
+            cv.bytebus_v = leviathan_core::encode_bytebus_frame(word(index), clock(index));
+            rack.render_session(&cv, &inputs, None).0
+        });
+        assert_eq!(rack.routed_byte(), Some(word(496)));
+        rack.reset_voices();
+        rack.reset_master(0.0);
+        assert!(rack.set_routing(RackRouting::default()));
+        let mut held = 0x77;
+        let direct = core::array::from_fn::<_, 512, _>(|index| {
+            if clock(index) {
+                held = word(index);
+            }
+            rack.render_stereo_with_bytebus(&cv, Some(held))
+        });
+        assert_eq!(latched, direct);
+        assert_ne!(latched, before);
+    }
+
+    #[test]
+    fn captured_sampler_keeps_the_current_note_across_slot_replacement() {
+        let old_frames = [[8192, -8192]; 32];
+        let new_frames = [[-8192, 8192]; 32];
+        let old = CaptureSample {
+            generation: 1,
+            rate: 48_000,
+            frames: &old_frames,
+        };
+        let new = CaptureSample {
+            generation: 2,
+            rate: 48_000,
+            frames: &new_frames,
+        };
+        let mut rack = SynthRack::new(48_000.0);
+        rack.set_lane_channels([LaneChannel::dry(1.0, 0.0); NUM_LANES]);
+        rack.set_lane_patch(0, LanePatch::for_machine(MachineKind::VarSampler));
+        let mut routing = RackRouting::default();
+        routing.inputs[0] = LaneInput::Capture;
+        assert!(rack.set_routing(routing));
+        rack.reset_voices();
+        let mut cv = CvFrame::default();
+        cv.gate_v[0] = 10.0;
+        cv.velocity_v[0] = 10.0;
+        let tap = Some(CaptureTap::Lane(0));
+        let mut samples = CaptureSamples {
+            current: Some(old),
+            ..CaptureSamples::default()
+        };
+        let (_, before) = rack.render_session(&cv, &samples, tap);
+        samples.current = Some(new);
+        samples.previous[0] = Some(old);
+        let (_, held) = rack.render_session(&cv, &samples, tap);
+        assert_eq!(rack.capture_generations()[0], Some(1));
+        assert_eq!(before, held);
+        cv.retrigger_mask = 1;
+        let (_, after) = rack.render_session(&cv, &samples, tap);
+        assert_eq!(rack.capture_generations()[0], Some(2));
+        assert_eq!(after, [-before[0], -before[1]]);
+    }
 
     #[test]
     fn pan_is_constant_power_and_defaults_reproduce_the_old_spread() {

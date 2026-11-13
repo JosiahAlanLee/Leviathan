@@ -48,6 +48,13 @@ Leviathan uses a strict hexagonal ("ports and adapters") layout so external GPU,
 - In **VarSampler Banks**, **Start** and **End** mark the active sample region. **Sustain Loop** repeats that region while the lane gate is high and finishes the current pass on release. With sustain looping off, the step's loop and scan locks work within the trim.
 - **Export WAV...** bounces the selected pattern or full chain with the same timing and mixer as live playback. Optional aligned stereo stems include each lane's delay contribution and a shared `bend.wav` return when a lane has a BEND send. These taps precede master DC blocking and limiting. Export starts with an empty tank. With Freeze enabled, the first BEND send starts a 25 ms capture ramp and the tank then holds that sound.
 
+## Capture, Sample Processing & ByteBus
+
+- Open **Capture sample** to record a lane after mute, level and pan, or the BEND return before the master limiter. Choose a duration and click **Arm capture**. Recording starts on a transport beat and fills one stereo project slot of up to 192,000 frames (four seconds at 48 kHz).
+- In **Sample and ByteBus routing**, set the selected lane to **Capture sample**. **SMPL** plays the take at its original pitch and rate on C4. **Start**, **End**, and **Sustain loop** set the playback region. A sounding note retains its take and region when a new capture becomes available.
+- **OTIS** and **OT2** treat the trimmed region as fixed-length frames. Set **samples per frame**, then scan them with **FramePos** or enable **Clock OTIS frames from ByteBus**. **VAST** takes a gated capture sample or a continuous signal from another lane's dry mixer tap. These processors fold stereo input to mono.
+- **Register → Lookup → BBUS** clocks the tracker word through a shared register at ByteBus clock edges. Set the reset seed and choose Identity, Invert, Square or Fold. The clocked output can also select OTIS frames independently of BBUS. Captures and routing save with the project and render in WAV and stem exports.
+
 ## Custom WGSL Shaders & SoundLink UDP
 
 - Drop any `.wgsl` file onto the window (or use **Load .wgsl** in the **Live Feedback Surface** panel) to run custom ping-pong fragment shaders driven by Leviathan's 64-byte `VisualUniforms` and `prev_tex` feedback buffer.

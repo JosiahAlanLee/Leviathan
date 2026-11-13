@@ -21,3 +21,7 @@ Leviathan is authored under the `BSD-3-Clause` license using a clean-room bounda
    - T25 uses the supplied Rust prototype and the converter behavior described in the roadmap. Yamaha's datasheet supplies the YM3012 serial fields. The CZ transfer is a provisional mathematical model.
    - T26 uses the supplied FS77 Rust prototype, Yamaha's SY77 and FS1R behavioral descriptions, and Leviathan DSP primitives. The waveform modulator reads Leviathan's generated OTIS table.
    - T27 uses the supplied K26 Rust prototype, the Kurzweil behavioral references in the roadmap, and Leviathan DSP primitives. The three-stage routing, oscillator and filter voicing, and recursive modulation are Leviathan's implementation. The keymap source reads Leviathan's generated OTIS tables.
+
+5. **Wave 7 DSP Provenance**
+   - T28–T30 use the capture, frame scanning, and audio input behavior linked in the roadmap. They reuse Leviathan's clock, mixer, OTIS voices, and VAST algorithms with a new project sample source.
+   - T31 uses the clock and reset contract in the [ByteBus Register manual](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/bytebus/docs/MANUAL.md) and the identity and inversion anchors in the [Lookup manual](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/bytebus/docs/LOOKUP.md). The tracker routing and maps are original Rust. Carbon's standalone draft informed the scope review.

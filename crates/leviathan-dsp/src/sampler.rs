@@ -27,36 +27,7 @@ impl SampleLoopMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SampleRegion {
-    pub trim_start: f32,
-    pub trim_end: f32,
-    pub loop_enabled: bool,
-}
-
-impl Default for SampleRegion {
-    fn default() -> Self {
-        Self {
-            trim_start: 0.0,
-            trim_end: 1.0,
-            loop_enabled: false,
-        }
-    }
-}
-
-impl SampleRegion {
-    pub fn is_valid(self) -> bool {
-        (0.0..=1.0).contains(&self.trim_start) && (0.0..=1.0).contains(&self.trim_end)
-    }
-
-    /// The half-open trim range always includes at least one source frame.
-    pub fn frames(self, len: usize) -> core::ops::Range<usize> {
-        let len = len.max(1);
-        let start = ((self.trim_start.clamp(0.0, 1.0) * len as f32) as usize).min(len - 1);
-        let end = ((self.trim_end.clamp(0.0, 1.0) * len as f32) as usize).clamp(start + 1, len);
-        start..end
-    }
-}
+pub use leviathan_core::rack_routing::SampleRegion;
 
 #[derive(Clone, Debug)]
 pub struct SampleBank {

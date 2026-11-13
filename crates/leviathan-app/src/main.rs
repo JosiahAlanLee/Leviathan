@@ -1,4 +1,5 @@
 mod audio;
+mod capture;
 mod export;
 mod export_ui;
 mod gen_ui;
@@ -11,6 +12,7 @@ mod master_ui;
 mod midi;
 mod mixer_ui;
 mod project;
+mod rack_ui;
 mod sampler_ui;
 mod session_ui;
 mod smf;
@@ -37,6 +39,7 @@ use master_ui::MasterMeters;
 use midi::{MidiControls, MidiEvent, MidiReceiver, MidiTarget};
 
 use audio::{try_start_audio, AudioCommand, AudioControl, AudioProject, AudioTelemetry};
+use capture::{CapturePort, Outcome, Recorder, Take};
 use sampler_ui::{BankAction, SamplerBankUi};
 use session_ui::{ArrangementAction, ProjectAction, ProjectUi};
 use tracker_edit::EditHistory;
@@ -199,6 +202,10 @@ struct LeviathanApp {
     play_request: u64,
     cursor: TrackerCursor,
     sampler_ui: SamplerBankUi,
+    instruments: project::InstrumentSettings,
+    capture_port: CapturePort,
+    rack_panel: rack_ui::RackPanel,
+    routed_byte: Option<u8>,
     audio: AudioControl,
     tel_rx: rtrb::Consumer<AudioTelemetry>,
     offline_player: Option<SongPlayer>,
@@ -223,6 +230,7 @@ impl LeviathanApp {
             rtrb::Consumer<AudioCommand>,
             rtrb::Producer<AudioTelemetry>,
             MidiReceiver,
+            Recorder,
         ) -> Result<(cpal::Stream, String), String>,
     ) -> Self {
         let viewport = FeedbackViewport::new(cc);
@@ -231,19 +239,25 @@ impl LeviathanApp {
         let (cmd_tx, cmd_rx) = rtrb::RingBuffer::<AudioCommand>::new(256);
         let (tel_tx, tel_rx) = rtrb::RingBuffer::<AudioTelemetry>::new(256);
         let (midi, midi_events) = MidiControls::new();
+        let (capture_port, recorder) = Recorder::channel();
 
-        let (_audio_stream, offline_player, audio_status) =
-            match start_audio(initial_pattern.clone(), cmd_rx, tel_tx, midi_events) {
-                Ok((stream, label)) => (Some(stream), None, label),
-                Err(label) => (
-                    None,
-                    Some(SongPlayer::new(EngineConfig {
-                        sample_rate: 60.0,
-                        ..EngineConfig::default()
-                    })),
-                    label,
-                ),
-            };
+        let (_audio_stream, offline_player, audio_status) = match start_audio(
+            initial_pattern.clone(),
+            cmd_rx,
+            tel_tx,
+            midi_events,
+            recorder,
+        ) {
+            Ok((stream, label)) => (Some(stream), None, label),
+            Err(label) => (
+                None,
+                Some(SongPlayer::new(EngineConfig {
+                    sample_rate: 60.0,
+                    ..EngineConfig::default()
+                })),
+                label,
+            ),
+        };
 
         let mut cursor = TrackerCursor::default();
         cursor.select(4, 0, SubColumn::Note, false);
@@ -275,6 +289,10 @@ impl LeviathanApp {
             play_request: 0,
             cursor,
             sampler_ui: SamplerBankUi::default(),
+            instruments: project::InstrumentSettings::default(),
+            capture_port,
+            rack_panel: rack_ui::RackPanel::default(),
+            routed_byte: None,
             audio: AudioControl::new(cmd_tx),
             tel_rx,
             offline_player,
@@ -629,6 +647,7 @@ impl LeviathanApp {
             sample_regions: self.sampler_ui.regions,
             custom_shader: self.viewport.custom_shader().cloned(),
             voice_calibration: self.voice_calibration,
+            instruments: self.instruments.clone(),
         }
     }
 
@@ -655,6 +674,10 @@ impl LeviathanApp {
         self.lane_mix = project.lane_mix;
         self.lane_patches = project.lane_patches;
         self.voice_calibration = project.voice_calibration;
+        self.instruments = project.instruments;
+        self.rack_panel.status = "";
+        self.rack_panel.routing_error = false;
+        self.routed_byte = None;
         self.master_meters = MasterMeters::default();
         self.histories = (0..project.patterns.len())
             .map(|_| EditHistory::default())
@@ -703,8 +726,29 @@ impl eframe::App for LeviathanApp {
                 self.latest_cv = telemetry.cv;
                 self.latest_scope = telemetry.scope;
                 self.latest_song = telemetry.song;
+                self.rack_panel.stage = telemetry.capture_stage;
+                self.routed_byte = telemetry.routed_byte;
                 peaks.merge(telemetry.master);
             }
+        }
+        if let Some(result) = self
+            .capture_port
+            .poll()
+            .filter(|result| result.project == self.project_generation)
+        {
+            self.rack_panel.status = match result.outcome {
+                Outcome::Complete(rate) => {
+                    if let Some(take) = Take::new(rate, result.frames) {
+                        self.instruments.take = Some(take.clone());
+                        self.send_audio(AudioCommand::InstallTake(take));
+                        "Capture sample ready"
+                    } else {
+                        "Capture had no audio frames"
+                    }
+                }
+                Outcome::Cancelled => "Capture canceled",
+                Outcome::Full => "Capture exceeded 192,000 frames",
+            };
         }
         let now = ctx.input(|input| input.time);
         self.master_meters.update(peaks, now);
@@ -919,6 +963,33 @@ impl eframe::App for LeviathanApp {
                         });
                     }
                     bank_actions.extend(self.sampler_ui.draw(ui, hovering_wav));
+                    match self.rack_panel.draw_capture(
+                        ui, self.instruments.take.as_deref(), self._audio_stream.is_some(), self.capture_port.busy(),
+                    ) {
+                        Some(rack_ui::CaptureAction::Arm(source, beats)) => {
+                            if self.capture_port.request(self.project_generation, source, beats) {
+                                self.rack_panel.status = "";
+                                self.send_audio(AudioCommand::ArmCapture);
+                            }
+                        }
+                        Some(rack_ui::CaptureAction::Cancel) => self.send_audio(AudioCommand::CancelCapture),
+                        None => {}
+                    }
+                    let mut routing = self.instruments.routing;
+                    rack_ui::draw_routing(
+                        ui, &mut routing, safe_lane, self.lane_patches[safe_lane],
+                        self.instruments.take.is_some(), self.routed_byte,
+                        self.rack_panel.routing_error,
+                    );
+                    if routing != self.instruments.routing {
+                        if routing.render_order().is_some() {
+                            self.instruments.routing = routing;
+                            self.rack_panel.routing_error = false;
+                            self.send_audio(AudioCommand::SetRackRouting(routing));
+                        } else {
+                            self.rack_panel.routing_error = true;
+                        }
+                    }
 
                     ui.separator();
                     inspector_edits = inspector_ui::draw(
@@ -1183,7 +1254,11 @@ impl eframe::App for LeviathanApp {
             self.send_audio(AudioCommand::SetLaneChannels(self.lane_mix.dsp_channels()));
         }
         self.sync_midi_target();
-        if self.playing || self.audio.has_pending() || self.master_meters.is_active(now) {
+        if self.playing
+            || self.audio.has_pending()
+            || self.capture_port.busy()
+            || self.master_meters.is_active(now)
+        {
             ctx.request_repaint();
         }
     }
@@ -1235,7 +1310,7 @@ mod tests {
 
     fn offline_app(ctx: &egui::Context) -> LeviathanApp {
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-        LeviathanApp::with_audio(&cc, |_, _, _, _| Err("Offline test clock".to_string()))
+        LeviathanApp::with_audio(&cc, |_, _, _, _, _| Err("Offline test clock".to_string()))
     }
 
     #[test]

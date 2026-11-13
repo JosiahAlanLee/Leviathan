@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use leviathan_core::{EngineConfig, LaunchTarget, SongPlayer, NUM_LANES};
-use leviathan_dsp::{LanePatch, StereoDelay, SynthRack};
+use leviathan_dsp::{CaptureSamples, LanePatch, StereoDelay, SynthRack};
 
 use crate::project::Project;
 use crate::wav::{StereoWav, WavEncoding};
@@ -192,10 +192,19 @@ fn render(
     rack.set_lane_channels(project.lane_mix.dsp_channels());
     rack.set_lane_patches(project.lane_patches);
     rack.set_voice_calibration(project.voice_calibration);
+    rack.set_routing(project.instruments.routing);
     rack.reset_voices();
     rack.set_bender_params(project.bender_params);
     rack.set_delay_mode(project.delay_mode);
     rack.reset_master(project.master_send);
+    let samples = CaptureSamples {
+        current: project
+            .instruments
+            .take
+            .as_deref()
+            .map(crate::capture::Take::sample),
+        ..CaptureSamples::default()
+    };
 
     let mut stems = [[0.0; 2]; NUM_LANES];
     let mut stem_delays: Option<Box<[StereoDelay; NUM_LANES]>> = plan.settings.stems.then(|| {
@@ -220,9 +229,9 @@ fn render(
             rack.retrigger_gates();
         }
         let ((left, right), wet) = if let Some(delays) = &mut stem_delays {
-            rack.render_stereo_with_fx_stems(&cv, &mut stems, delays)
+            rack.render_session_with_stems(&cv, &samples, &mut stems, delays)
         } else {
-            (rack.render_stereo(&cv), [0.0; 2])
+            (rack.render_session(&cv, &samples, None).0, [0.0; 2])
         };
         write([left, right], &stems, wet)?;
         if frame & 1023 == 1023 {
@@ -374,6 +383,7 @@ mod tests {
             sample_regions: Default::default(),
             custom_shader: None,
             voice_calibration: false,
+            instruments: Default::default(),
         }
     }
 

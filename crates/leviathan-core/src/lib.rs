@@ -2,6 +2,7 @@
 
 #[cfg(feature = "serde")]
 mod pattern_serde;
+pub mod rack_routing;
 mod song;
 
 pub use song::{LaunchTarget, PatternChain, SongPlayer, SongStatus, MAX_CHAIN_ENTRIES};

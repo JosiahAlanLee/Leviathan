@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use leviathan_core::rack_routing::RackRouting;
 use leviathan_core::{
     AutomationRow, CvFrame, EngineConfig, LaunchTarget, NoteCell, Pattern, PatternChain,
     SongPlayer, SongStatus, SoundLock, NUM_LANES, ROWS_PER_PATTERN,
@@ -12,6 +13,7 @@ use leviathan_dsp::{
 };
 use leviathan_gpu::{AudioScopeSnapshot, AudioScopeTap};
 
+use crate::capture::{Recorder, Stage, Take, TakeBank};
 use crate::midi::{MidiEvent, MidiKey, MidiReceiver, MidiTarget};
 use crate::project::{Project, PATTERN_BANK_CAPACITY};
 
@@ -29,8 +31,12 @@ pub enum AudioCommand {
     SetLaneChannels([LaneChannel; NUM_LANES]),
     SetLanePatch { lane: usize, patch: LanePatch },
     SetVoiceCalibration(bool),
+    SetRackRouting(RackRouting),
+    InstallTake(Arc<Take>),
+    ArmCapture,
+    CancelCapture,
     Reset,
-    
+
     Launch(LaunchTarget),
     SetChain(PatternChain),
     SetCell {
@@ -96,6 +102,8 @@ pub struct AudioProject {
     chain: PatternChain,
     sample_bank: SampleBank,
     voice_calibration: bool,
+    routing: RackRouting,
+    take: Option<Arc<Take>>,
 }
 
 impl AudioProject {
@@ -114,6 +122,8 @@ impl AudioProject {
             chain: project.chain,
             sample_bank: project.sample_bank(),
             voice_calibration: project.voice_calibration,
+            routing: project.instruments.routing,
+            take: project.instruments.take.clone(),
         }
     }
 
@@ -139,6 +149,7 @@ enum RetainedSnapshot {
     Pattern(Arc<Pattern>),
     Project(Arc<AudioProject>),
     Sample(Arc<[i16]>),
+    Take(Arc<Take>),
 }
 
 impl RetainedSnapshot {
@@ -147,6 +158,7 @@ impl RetainedSnapshot {
             Self::Pattern(pattern) => Arc::strong_count(pattern) > 1,
             Self::Project(project) => Arc::strong_count(project) > 1,
             Self::Sample(sample) => Arc::strong_count(sample) > 1,
+            Self::Take(take) => Arc::strong_count(take) > 1,
         }
     }
 }
@@ -167,6 +179,18 @@ impl AudioControl {
     }
 
     pub fn send(&mut self, command: AudioCommand) {
+        let take = match &command {
+            AudioCommand::InstallTake(take) => Some(take),
+            AudioCommand::ReplaceProject(project) => project.take.as_ref(),
+            _ => None,
+        };
+        if let Some(take) = take {
+            if !self.retained.iter().any(|item| {
+                matches!(item, RetainedSnapshot::Take(retained) if Arc::ptr_eq(retained, take))
+            }) {
+                self.retained.push(RetainedSnapshot::Take(Arc::clone(take)));
+            }
+        }
         let snapshot = match &command {
             AudioCommand::SetPattern { pattern, .. } => {
                 Some(RetainedSnapshot::Pattern(Arc::clone(pattern)))
@@ -213,6 +237,8 @@ pub struct AudioTelemetry {
     pub scope: AudioScopeSnapshot,
     pub playing: bool,
     pub play_request: u64,
+    pub capture_stage: Stage,
+    pub routed_byte: Option<u8>,
 }
 
 #[derive(Clone, Copy)]
@@ -239,6 +265,9 @@ struct RtAudioWorker {
     midi_events: Option<MidiReceiver>,
     midi_target: MidiTarget,
     midi_preview: [Option<MidiPreview>; NUM_LANES],
+    takes: TakeBank,
+    recorder: Option<Recorder>,
+    last_playing_beat: Option<f64>,
 }
 
 impl RtAudioWorker {
@@ -272,6 +301,9 @@ impl RtAudioWorker {
             midi_events,
             midi_target: MidiTarget::default(),
             midi_preview: [None; NUM_LANES],
+            takes: TakeBank::default(),
+            recorder: None,
+            last_playing_beat: None,
         }
     }
 
@@ -291,6 +323,24 @@ impl RtAudioWorker {
                 AudioCommand::SetVoiceCalibration(enabled) => {
                     self.synth.set_voice_calibration(enabled);
                 }
+                AudioCommand::SetRackRouting(routing) => {
+                    self.synth.set_routing(routing);
+                }
+                AudioCommand::InstallTake(take) => {
+                    self.takes
+                        .install(Some(take), self.synth.capture_generations());
+                }
+                AudioCommand::ArmCapture => {
+                    if let Some(recorder) = &mut self.recorder {
+                        recorder.arm(self.generation);
+                    }
+                }
+                AudioCommand::Reset => {
+                    self.cancel_capture();
+                    self.last_playing_beat = None;
+                    self.synth.reset_byte_route();
+                }
+                AudioCommand::CancelCapture => self.cancel_capture(),
                 AudioCommand::SetCell {
                     pattern,
                     lane,
@@ -326,7 +376,13 @@ impl RtAudioWorker {
                     self.synth.set_lane_channels(project.lane_channels);
                     self.synth.set_lane_patches(project.lane_patches);
                     self.synth.set_voice_calibration(project.voice_calibration);
+                    self.synth.set_routing(project.routing);
                     self.synth.reset_voices();
+                    self.synth.reset_byte_route();
+                    self.takes
+                        .install(project.take.clone(), self.synth.capture_generations());
+                    self.cancel_capture();
+                    self.last_playing_beat = None;
                     self.synth.set_delay_mode(project.delay_mode);
                     self.synth.set_bender_params(project.bender_params);
                     self.synth.reset_master(project.master_send);
@@ -357,12 +413,28 @@ impl RtAudioWorker {
                 AudioCommand::SetSampleRegion { bank, region } => {
                     self.synth.sample_bank.set_region(bank, region);
                 }
-                AudioCommand::SetPlaying { request, .. } => self.play_request = request,
+                AudioCommand::SetPlaying { request, playing } => {
+                    self.play_request = request;
+                    if !playing {
+                        self.cancel_capture();
+                        self.last_playing_beat = None;
+                    }
+                }
                 AudioCommand::SetMidiTarget(target) => self.midi_target = target,
                 _ => {}
             }
         }
         self.drain_midi();
+        self.takes.release_unused(self.synth.capture_generations());
+        if let Some(recorder) = &mut self.recorder {
+            recorder.flush();
+        }
+    }
+
+    fn cancel_capture(&mut self) {
+        if let Some(recorder) = &mut self.recorder {
+            recorder.cancel();
+        }
     }
 
     fn drain_midi(&mut self) {
@@ -398,6 +470,13 @@ impl RtAudioWorker {
                 Some(MidiEvent::NoteOff(key)) => self.release_midi(Some(key)),
                 Some(event) => {
                     if event.apply_transport(&mut self.player, self.pattern_count) {
+                        if matches!(event, MidiEvent::Start | MidiEvent::Stop) {
+                            self.cancel_capture();
+                            self.last_playing_beat = None;
+                        }
+                        if event == MidiEvent::Start {
+                            self.synth.reset_byte_route();
+                        }
                         self.tel_divider = 255;
                     }
                 }
@@ -414,7 +493,7 @@ impl RtAudioWorker {
         }
     }
 
-    fn render_with_midi(&mut self, mut cv: CvFrame, retrigger: bool) -> (f32, f32) {
+    fn midi_frame(&mut self, mut cv: CvFrame, retrigger: bool) -> CvFrame {
         let mut lanes = if retrigger { u8::MAX } else { 0 };
         for (lane, slot) in self.midi_preview.iter_mut().enumerate() {
             let Some(preview) = slot else { continue };
@@ -445,7 +524,7 @@ impl RtAudioWorker {
         if lanes != 0 {
             self.synth.retrigger_lanes(lanes);
         }
-        self.synth.render_stereo(&cv)
+        cv
     }
 
     #[inline]
@@ -453,14 +532,29 @@ impl RtAudioWorker {
         let (cv, retrigger) = self
             .player
             .step_sample(&self.patterns[..self.pattern_count]);
-        let pair = if self.midi_preview.iter().any(Option::is_some) {
-            self.render_with_midi(cv, retrigger)
+        let render_cv = if self.midi_preview.iter().any(Option::is_some) {
+            self.midi_frame(cv, retrigger)
         } else {
             if retrigger {
                 self.synth.retrigger_gates();
             }
-            self.synth.render_stereo(&cv)
+            cv
         };
+        let tap = self.recorder.as_mut().and_then(|recorder| {
+            recorder.tap(
+                cv.beat,
+                self.last_playing_beat,
+                self.player.evaluator.playing,
+                self.player.evaluator.config.sample_rate as u32,
+            )
+        });
+        self.last_playing_beat = self.player.evaluator.playing.then_some(cv.beat);
+        let (pair, capture) = self
+            .synth
+            .render_session(&render_cv, &self.takes.samples(), tap);
+        if let Some(recorder) = self.recorder.as_mut().filter(|_| tap.is_some()) {
+            recorder.push(capture);
+        }
         self.scope_tap.push_stereo(pair.0, pair.1);
         self.tel_divider = self.tel_divider.wrapping_add(1);
         if retrigger
@@ -476,6 +570,8 @@ impl RtAudioWorker {
                 scope: self.scope_tap.snapshot(),
                 playing: self.player.evaluator.playing,
                 play_request: self.play_request,
+                capture_stage: self.recorder.as_ref().map_or(Stage::Idle, Recorder::stage),
+                routed_byte: self.synth.routed_byte(),
             };
             // Carry the interval's peaks forward if the UI hasn't drained its ring yet.
             if self.tel_tx.push(telemetry).is_ok() {
@@ -492,6 +588,7 @@ pub fn try_start_audio(
     cmd_rx: rtrb::Consumer<AudioCommand>,
     tel_tx: rtrb::Producer<AudioTelemetry>,
     midi_events: MidiReceiver,
+    recorder: Recorder,
 ) -> Result<(cpal::Stream, String), String> {
     let host = cpal::default_host();
     let Some(device) = host.default_output_device() else {
@@ -513,6 +610,7 @@ pub fn try_start_audio(
         tel_tx,
         Some(midi_events),
     );
+    worker.recorder = Some(recorder);
 
     let err_fn = |err| eprintln!("leviathan audio stream error: {err}");
 
@@ -599,6 +697,162 @@ mod tests {
     use leviathan_core::PlaybackRate;
 
     #[test]
+    fn captures_four_beats_in_stereo_then_loads_and_exports_the_same_take() {
+        use leviathan_core::rack_routing::{ByteLookup, LaneInput};
+        use leviathan_dsp::{default_lane_patches, CaptureTap, MachineKind};
+
+        let mut pattern = Pattern {
+            length: 4,
+            ..Pattern::default()
+        };
+        pattern.lanes[0][0] = NoteCell {
+            active: true,
+            midi: 60,
+            velocity: 127,
+            ..NoteCell::default()
+        };
+        let mut lane_mix = LaneMix::default();
+        lane_mix.channels[0].0.pan = -1.0;
+        let mut project = Project {
+            bpm: 120.0,
+            master_send: 0.0,
+            delay_mode: Default::default(),
+            bender_params: Default::default(),
+            lane_mix,
+            lane_patches: default_lane_patches(),
+            patterns: vec![pattern],
+            selected_pattern: 0,
+            chain: PatternChain::default(),
+            samples: Default::default(),
+            sample_regions: Default::default(),
+            custom_shader: None,
+            voice_calibration: false,
+            instruments: Default::default(),
+        };
+        let (tx, rx) = rtrb::RingBuffer::new(8);
+        let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(8);
+        let (mut port, recorder) = Recorder::channel();
+        let mut control = AudioControl::new(tx);
+        let mut worker = RtAudioWorker::new(Pattern::default(), 48_000.0, rx, tel_tx, None);
+        worker.recorder = Some(recorder);
+        control.send(AudioCommand::ReplaceProject(Arc::new(
+            AudioProject::prepare(&project, 3),
+        )));
+        assert!(port.request(3, CaptureTap::Lane(0), 4));
+        control.send(AudioCommand::ArmCapture);
+        control.send(AudioCommand::SetPlaying {
+            playing: true,
+            request: 1,
+        });
+        for frame in 0..=96_000 {
+            if frame % 257 == 0 {
+                worker.drain_commands();
+            }
+            worker.next_stereo();
+        }
+        let result = port.poll().unwrap();
+        assert_eq!(result.project, 3);
+        assert!(matches!(
+            result.outcome,
+            crate::capture::Outcome::Complete(48_000)
+        ));
+        assert_eq!(result.frames.len(), 96_000);
+        assert!(result
+            .frames
+            .iter()
+            .any(|frame| frame[0].unsigned_abs() > 1000));
+        assert!(result.frames.iter().all(|frame| frame[1] == 0));
+        assert!(result.frames[72_000..]
+            .iter()
+            .any(|frame| frame[0].unsigned_abs() > 1000));
+
+        let take = Take::new(48_000, result.frames).unwrap();
+        project.patterns[0].length = 16;
+        for lane in [1, 2, 4, 5] {
+            project.patterns[0].lanes[lane][0] = project.patterns[0].lanes[0][0];
+        }
+        for (lane, machine) in [
+            (0, MachineKind::VastFunSynth),
+            (1, MachineKind::ByteBusR2r),
+            (2, MachineKind::OtisTranswave),
+            (3, MachineKind::VastFunSynth),
+            (4, MachineKind::VarSampler),
+            (5, MachineKind::OtisTwin),
+        ] {
+            project.lane_patches[lane] = LanePatch::for_machine(machine);
+        }
+        project.instruments.routing.inputs[0] = LaneInput::Capture;
+        project.instruments.routing.inputs[2] = LaneInput::Capture;
+        project.instruments.routing.inputs[3] = LaneInput::Lane(4);
+        project.instruments.routing.inputs[4] = LaneInput::Capture;
+        project.instruments.routing.inputs[5] = LaneInput::Capture;
+        project.instruments.routing.frame_size = 1024;
+        project.instruments.routing.frame_bytebus = true;
+        project.instruments.routing.bytebus.enabled = true;
+        project.instruments.routing.bytebus.lookup = ByteLookup::Invert;
+        project.patterns[0].automation[4].byte_override = true;
+        project.instruments.take = Some(take);
+
+        let dir = std::env::temp_dir().join(format!("leviathan-wave7-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("capture.leviathan.json");
+        let routing = project.instruments.routing;
+        crate::project::save(&path, project).unwrap();
+        let project = crate::project::load(&path).unwrap();
+        assert_eq!(project.instruments.routing, routing);
+        assert_eq!(
+            project.instruments.take.as_ref().unwrap().frames.len(),
+            96_000
+        );
+        let live = render_test_project_live(&project, 96_000, 96_000);
+
+        let destination = dir.join("stems");
+        ExportJob::start(
+            project,
+            false,
+            ExportRequest {
+                settings: ExportSettings {
+                    encoding: WavEncoding::Float32,
+                    stems: true,
+                    tail_seconds: 0.0,
+                    ..ExportSettings::default()
+                },
+                destination: destination.clone(),
+            },
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+        let master = std::fs::read(destination.join("master.wav")).unwrap();
+        let start = master.len() - live.len() * 8;
+        assert_eq!(&master[start - 8..start - 4], b"data");
+        let read = |bytes: &[u8]| f32::from_le_bytes(bytes.try_into().unwrap());
+        for (index, frame) in master[start..].chunks_exact(8).enumerate() {
+            assert_eq!(
+                live[index],
+                (read(&frame[..4]), read(&frame[4..])),
+                "frame {index}"
+            );
+        }
+        for name in ["0-vast", "1-bbus", "2-otis", "3-vast", "4-smpl", "5-otis2"] {
+            let stem = std::fs::read(destination.join(format!("{name}.wav"))).unwrap();
+            assert_eq!(stem.len(), master.len());
+            assert!(
+                stem[start..]
+                    .chunks_exact(4)
+                    .any(|sample| read(sample).abs() > 0.001),
+                "{name}"
+            );
+            if name == "4-smpl" {
+                assert!(stem[start + 72_000 * 8..]
+                    .chunks_exact(4)
+                    .any(|sample| read(sample).abs() > 0.001));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn saved_fs77_lane_and_step_lock_match_live_and_wav() {
         use leviathan_dsp::{default_lane_patches, MachineKind};
 
@@ -656,6 +910,7 @@ mod tests {
                 sample_regions: Default::default(),
                 custom_shader: None,
                 voice_calibration: false,
+                instruments: Default::default(),
             },
         )
         .unwrap();
@@ -759,6 +1014,7 @@ mod tests {
                 sample_regions: Default::default(),
                 custom_shader: None,
                 voice_calibration: false,
+                instruments: Default::default(),
             },
         )
         .unwrap();
@@ -879,6 +1135,7 @@ mod tests {
             sample_regions: Default::default(),
             custom_shader: None,
             voice_calibration: false,
+            instruments: Default::default(),
         };
         let legacy = render_test_project_live(&project, 1_500, 1_980);
 
@@ -991,6 +1248,7 @@ mod tests {
             sample_regions,
             custom_shader: None,
             voice_calibration: false,
+            instruments: Default::default(),
         };
         let destination =
             std::env::temp_dir().join(format!("leviathan-mixer-parity-{}", std::process::id()));
@@ -1122,6 +1380,7 @@ mod tests {
             sample_regions: Default::default(),
             custom_shader: None,
             voice_calibration: false,
+            instruments: Default::default(),
         };
         let (tx, rx) = rtrb::RingBuffer::new(8);
         let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(32);
@@ -1305,6 +1564,7 @@ mod tests {
             sample_regions: Default::default(),
             custom_shader: None,
             voice_calibration: false,
+            instruments: Default::default(),
         };
         audio.send(AudioCommand::SetPlaying {
             playing: true,
@@ -1366,6 +1626,7 @@ mod tests {
             sample_regions: Default::default(),
             custom_shader: None,
             voice_calibration: false,
+            instruments: Default::default(),
         };
         audio.send(AudioCommand::ReplaceProject(Arc::new(
             AudioProject::prepare(&oversized, 2),
@@ -1626,8 +1887,9 @@ mod tests {
             samples: core::array::from_fn(|
               _| None),
             sample_regions: Default::default(),
-          custom_shader: None,
-          voice_calibration: false,
+            custom_shader: None,
+            voice_calibration: false,
+            instruments: Default::default(),
         };
         let snapshot = Arc::new(AudioProject::prepare(&project, 1));
         let retained = Arc::downgrade(&snapshot);
