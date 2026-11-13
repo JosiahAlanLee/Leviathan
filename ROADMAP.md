@@ -155,3 +155,70 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
     - Add a compile/unit-test stack-budget assertion `core::mem::size_of::<SynthRack>() < 262_144` so 6 multi-engine `VoiceState` lanes + 64 KB `SampleBank` stay comfortably under Windows' 1 MB thread stack.
   - **Acceptance Criteria**:
     - Unit tests in `vast.rs` verifying distinct bounded non-silent output across algorithms and `FUN` equations, `is_finite()` stability under high fold/comb settings, `size_of::<SynthRack>() < 262_144` assertion passing, `MachineSpec` registration, `--no-default-features` `#![no_std]` compilation, and `0` compiler warnings.
+
+## Wave 5 Active Backlog (T19–T23 — Electro Percussion, West Coast LPG, ByteBus R-2R, Transwave & Spatial Bus)
+
+> **Coordination & Sequencing Note**: Wave 4 (`T15`–`T18`) is merged on `main`. [`crates/leviathan-dsp/src/spec.rs`](crates/leviathan-dsp/src/spec.rs) drives lane dropdowns, tracker header badges, macro sliders, `.leviathan.json` slugs, and WAV stem names automatically. **`T19` (`perc.rs`), `T20` (`west.rs`), `T21` (`bbus.rs`), and `T22` (`otis.rs`)** each live in an isolated `#![no_std]` submodule under `crates/leviathan-dsp/src/`, while **`T23` (`bender.rs` + `master.rs` + mixer/master UI)** expands the shared stereo send bus without touching per-voice synthesis files. Strictly uphold `CLEANROOM.md` (`BSD-3-Clause`): implement all DSP from mathematical/behavioral specifications only — never copy or translate `GPL-3.0` VCV Rack / community plugin code or `AGPL-3.0` wrapper modules (`Machinemodule` / `Monomodule`). Keep `core::mem::size_of::<SynthRack>() < 262_144` across all tickets so Windows CI stays well under its 1 MB thread stack.
+
+| Ticket | Slug / Badge | Module | 8-Macro `MachineSpec` (`P0`..`P7`) | `#![no_std]` Budget |
+| :--- | :--- | :--- | :--- | :--- |
+| **`T19`** | `perc` / `PERC` | `crates/leviathan-dsp/src/perc.rs` | `P0 Decay`, `P1 Mode`, `P2 BodyTune`, `P3 Snappy`, `P4 MetalSpread`, `P5 BandTone`, `P6 Drive`, `P7 PitchEnv` | `<= 128 B` / lane |
+| **`T20`** | `west` / `WEST` | `crates/leviathan-dsp/src/west.rs` | `P0 VactrolDecay`, `P1 FoldDrive`, `P2 Symmetry`, `P3 TzfmDepth`, `P4 ModRatio`, `P5 RingMix`, `P6 LpgMode`, `P7 Strike` | `<= 160 B` / lane |
+| **`T21`** | `bbus` / `BBUS` | `crates/leviathan-dsp/src/bbus.rs` | `P0 Decay`, `P1 BitMask`, `P2 ShiftRot`, `P3 R2rSkew`, `P4 ClockDiv`, `P5 Cutoff`, `P6 SlewGlitch`, `P7 SubBit` | `<= 96 B` / lane |
+| **`T22`** | `otis` / `OTIS` | `crates/leviathan-dsp/src/otis.rs` | `P0 Decay`, `P1 TableSel`, `P2 FramePos`, `P3 ScanDepth`, `P4 K1Cutoff`, `P5 K2Reso`, `P6 FixedGrit`, `P7 LoopMode` | `<= 128 B` / lane (+ static ROM) |
+| **`T23`** | *(Bus FX)* | `crates/leviathan-dsp/src/bender.rs` | Shared `SpoonBenderBus`: `ShiftHz`, `Feedback`, `TankDecay`, `Freeze` + per-lane `fx_send` | `<= 64 KiB` shared on `MasterBus` |
+
+### `T19` – Clean-Room `ElectroPerc` Drum & 6-Oscillator Metallic Percussion Voice (`PERC`)
+  - **Status**: `IMPLEMENTED` (`49615f0`). Select `PERC` in Lane Patch or Step Lock for snare, clap, rimshot, and metallic hat modes.
+  - **Owned Files**: new `crates/leviathan-dsp/src/perc.rs`, plus enum/table registration in `crates/leviathan-dsp/src/spec.rs` & `crates/leviathan-dsp/src/lib.rs`
+  - **Goal**: Add `MachineKind::ElectroPerc` (`slug: "perc"`, `badge: "PERC"`), a dedicated `#![no_std]` analog/electro percussion synthesizer covering snappy snares, multi-tap claps, rimshots, and 6-ratio metallic hi-hats/cymbals without requiring external `.wav` samples.
+  - **Scope & Constraints**:
+    - Implement four continuous or stepped percussion topologies selected via `P1 Mode`: (0) dual-bridged-T / pitch-swept snare membrane + filtered noise snare wires, (1) 4-burst micro-envelope handclap (`~10 ms` retrigger bursts into resonant bandpass tail), (2) high-Q dual-oscillator rimshot/clave transient, and (3) 6-square-oscillator inharmonic ring/XOR cymbal-hat matrix routed through a steep highpass/bandpass SVF.
+    - Register 8 `MachineSpec` macros (`0.0..=1.0`): `P0 Decay` (`0.32`), `P1 Mode` (`0.10`), `P2 BodyTune` (`0.45`), `P3 Snappy` (`0.55`), `P4 MetalSpread` (`0.50`), `P5 BandTone` (`0.58`), `P6 Drive` (`0.30`), `P7 PitchEnv` (`0.40`).
+    - Zero heap allocations, zero external crates, and `<= 128` bytes per-voice state; retrigger cleanly on `T11` `retrig` ratchets (`1..=4`).
+  - **Acceptance Criteria**:
+    - Unit tests in `perc.rs` verifying distinct non-silent bounded waveforms across all 4 `Mode` regions (`Snare`, `Clap` multi-burst envelope peaks, `Rimshot`, `Metallic Hat` high-frequency zero-crossing density), unconditional `is_finite()` stability across MIDI notes `0..=127`, `MachineSpec` slug/badge registration, `--no-default-features` `#![no_std]` compilation, and `0` workspace compiler warnings.
+
+### `T20` – Clean-Room `WestCoastLpg` Complex TZFM + Wavefolder + Vactrol LPG Voice (`WEST`)
+  - **Status**: `IMPLEMENTED` (`49615f0`). Select `WEST` in Lane Patch or Step Lock for through-zero FM, folding, and the vactrol LPG.
+  - **Owned Files**: new `crates/leviathan-dsp/src/west.rs`, plus enum/table registration in `crates/leviathan-dsp/src/spec.rs` & `crates/leviathan-dsp/src/lib.rs`
+  - **Goal**: Add `MachineKind::WestCoastLpg` (`slug: "west"`, `badge: "WEST"`), a `#![no_std]` West Coast dual-oscillator through-zero linear FM, 5-stage wavefolder, ring/AM modulator, and asymmetric vactrol Low-Pass Gate voice.
+  - **Scope & Constraints**:
+    - Implement modulator + carrier oscillators supporting signed through-zero phase/frequency modulation (`P3 TzfmDepth`, `P4 ModRatio` spanning harmonic ratios and fine detune) and `1005`-style balanced ring/AM blend (`P5 RingMix`), feeding a DC-biased (`P2 Symmetry`) 5-stage sinusoidal/Lockhart-inspired wavefolder (`P1 FoldDrive`).
+    - Model a coupled vactrol Low-Pass Gate (`P6 LpgMode`: `Lowpass`, `Combo LP+VCA`, `VCA-only`) with fast strike transient (`P7 Strike` ping) and nonlinear decelerating vactrol photoresistor release tail (`P0 VactrolDecay`) that simultaneously darkens cutoff and attenuates gain without zipper or DC drift.
+    - Register 8 `MachineSpec` macros (`0.0..=1.0`): `P0 VactrolDecay` (`0.40`), `P1 FoldDrive` (`0.35`), `P2 Symmetry` (`0.50`), `P3 TzfmDepth` (`0.25`), `P4 ModRatio` (`0.50`), `P5 RingMix` (`0.00`), `P6 LpgMode` (`0.50`), `P7 Strike` (`0.60`).
+    - Zero heap allocations and `<= 160` bytes per-voice state.
+  - **Acceptance Criteria**:
+    - Unit tests in `west.rs` verifying zero-mean/bounded output (`[-1.2, 1.2]`) under extreme `FoldDrive = 1.0` + `TzfmDepth = 1.0`, monotonic harmonic overtone increase as `FoldDrive` sweeps `0.0 -> 1.0`, coupled high-frequency rolloff during vactrol tail decay in `Combo` mode, `--no-default-features` `#![no_std]` compilation, and `0` compiler warnings.
+
+### `T21` – Clean-Room `ByteBusR2r` 8-Bit Ladder & Bitwise Permuter Voice (`BBUS`)
+  - **Status**: `OPEN` *(after Wave 4)*
+  - **Owned Files**: new `crates/leviathan-dsp/src/bbus.rs`, plus `ByteBus` word plumbing & registration in `crates/leviathan-dsp/src/spec.rs` & `crates/leviathan-dsp/src/lib.rs`
+  - **Goal**: Add `MachineKind::ByteBusR2r` (`slug: "bbus"`, `badge: "BBUS"`), a `#![no_std]` 8-bit digital subsystem synthesizer inspired by `ByteBusLab` and R-2R ladder hardware that consumes Leviathan's live 9-channel `CvFrame.bytebus_v` stream directly inside `SynthRack`.
+  - **Scope & Constraints**:
+    - Decode the 8 data bits (`cv.bytebus_v[0..8] > 5.0`) + publication clock (`_bus_step` in `SynthRack::render_mix`) into a live 8-bit control byte (falling back to a deterministic step/pitch LFSR byte when the automation bus word is `0x00` so standalone note playback is always audible).
+    - Combine an integer phase accumulator (`u32`) with bitwise `XOR` / `AND` masking (`P1 BitMask`), barrel bit-rotation / Walsh-harmonics (`P2 ShiftRot`), clock-divided sample-and-hold decimation (`P4 ClockDiv`), and a weighted 8-tap R-2R resistor ladder DAC with tunable resistor-mismatch nonlinearity (`P3 R2rSkew`), reconstruction slew/glitch (`P6 SlewGlitch`), and -1/-2 octave sub-bit toggle (`P7 SubBit`).
+    - Register 8 `MachineSpec` macros (`0.0..=1.0`): `P0 Decay` (`0.38`), `P1 BitMask` (`0.45`), `P2 ShiftRot` (`0.25`), `P3 R2rSkew` (`0.20`), `P4 ClockDiv` (`0.15`), `P5 Cutoff` (`0.60`), `P6 SlewGlitch` (`0.30`), `P7 SubBit` (`0.35`).
+  - **Acceptance Criteria**:
+    - Unit tests in `bbus.rs` verifying that changing `cv.bytebus_v[0..8]` patterns measurably alters the synthesized harmonic spectrum at identical MIDI pitch, `R2rSkew` remains DC-bounded and finite across all 256 byte values, `--no-default-features` `#![no_std]` compilation passes, and workspace builds with `0` warnings.
+
+### `T22` – Clean-Room `OtisTranswave` Fixed-Point Wavetable Scanner (`OTIS`, `OtisLab` Archetype)
+  - **Status**: `IMPLEMENTED` (`49615f0`). Select `OTIS` in Lane Patch or Step Lock for four generated transwave banks and three scan modes.
+  - **Owned Files**: new `crates/leviathan-dsp/src/otis.rs`, plus enum/table registration in `crates/leviathan-dsp/src/spec.rs` & `crates/leviathan-dsp/src/lib.rs`
+  - **Goal**: Add `MachineKind::OtisTranswave` (`slug: "otis"`, `badge: "OTIS"`), a `#![no_std]` `ES5505` / Ensoniq-inspired fixed-point (`Q20.12`) transwave frame-scanning synthesizer with dual-pole `K1`/`K2` digital filtering drawn from the `BSD-3-Clause`-clean `OtisLab` behavioral model.
+  - **Scope & Constraints**:
+    - Generate or store compact procedural/constexpr single-cycle transwave banks (4 tables × 16 frames × 128 `i16` samples = `16 KiB` static/shared ROM, **not** duplicated per `VoiceState`) covering formant sweep, metallic bell partials, pulse-width cascade, and digital sync harmonics.
+    - Drive phase accumulation using `u32` `Q20.12` fixed-point fractional addressing with configurable sample-rate grit (`P6 FixedGrit`), smooth bilinear interpolation across adjacent wavetable frames (`P2 FramePos` modulated by envelope/LFO `P3 ScanDepth` in `Fwd`, `Bidir`, or `OneShot` `P7 LoopMode`), and cascade `ES5505`-inspired `K1`/`K2` digital filter poles (`P4 K1Cutoff`, `P5 K2Reso`).
+    - Register 8 `MachineSpec` macros (`0.0..=1.0`): `P0 Decay` (`0.48`), `P1 TableSel` (`0.00`), `P2 FramePos` (`0.20`), `P3 ScanDepth` (`0.55`), `P4 K1Cutoff` (`0.65`), `P5 K2Reso` (`0.30`), `P6 FixedGrit` (`0.25`), `P7 LoopMode` (`0.50`).
+  - **Acceptance Criteria**:
+    - Unit tests in `otis.rs` verifying smooth artifact-free frame interpolation across all 4 wavetable banks, `Q20.12` phase wraparound accuracy over 100,000+ samples without drift or overflow, `core::mem::size_of::<SynthRack>() < 262_144`, `--no-default-features` `#![no_std]` compilation, and `0` compiler warnings.
+
+### `T23` – Shared `SpoonBenderBus` Stereo Frequency-Shifter, Freeze & Diffused FDN Send (`BEND`)
+  - **Status**: `IMPLEMENTED` (`49615f0`). `SetBenderParams` updates the shared BEND bus. Stem export writes its return to `bend.wav` when a lane has a send. Offline renders start with an empty tank.
+  - **Owned Files**: new `crates/leviathan-dsp/src/bender.rs`, `crates/leviathan-dsp/src/master.rs`, `crates/leviathan-dsp/src/lib.rs`, `crates/leviathan-app/src/lane_mix.rs`, `crates/leviathan-app/src/mixer_ui.rs`, `crates/leviathan-app/src/master_ui.rs`, `crates/leviathan-app/src/project.rs`, `crates/leviathan-app/src/audio.rs`, `crates/leviathan-app/src/export.rs`, `crates/leviathan-app/src/main.rs`
+  - **Goal**: Bring the spatial character of `Spoon Bender` and `Séance` into Leviathan as a shared `#![no_std]` stereo auxiliary send bus (`fx_send` per lane -> Hilbert dome frequency shifter + diffused 4-line Hadamard FDN tank with infinite `Freeze` toggle) on `MasterBus` so all lanes share one compact fixed-point/float delay pool.
+  - **Scope & Constraints**:
+    - Implement a `#![no_std]` stereo dome allpass Hilbert network (6th-order IIR 90-degree quadrature pair + quadrature sine/cosine ring oscillator for clean single-sideband up/down Hz shifting `-200 Hz..+200 Hz`) feeding a 4-line Hadamard feedback delay network (`<= 64 KiB` total static delay memory inside `MasterBus`, keeping `size_of::<SynthRack>() < 262_144`) with loop damping and clickless `Freeze` recirculation (`gain = 1.0`, input muted).
+    - Extend `LaneChannel` with `#[serde(default)] pub fx_send: f32` (`0.0` default so pre-`T23` `.leviathan.json` files load unchanged) and add `BenderParams { shift_norm: f32, feedback: f32, decay: f32, freeze: bool }` persisted in `Project` (`#[serde(default)]`), synced lock-free via `AudioCommand::SetBenderParams`, rendered identically in offline `export.rs` (including wet stem option), and exposed in `mixer_ui.rs` + `master_ui.rs`.
+  - **Acceptance Criteria**:
+    - Unit tests verifying single-sideband Hilbert frequency shift shifts a `440 Hz` sine upward/downward cleanly, `Freeze` sustains bounded finite energy (`[-1.0, 1.0]`) over 5+ seconds without runaway blowup, pre-`T23` `.leviathan.json` projects deserialize with `fx_send == 0.0` and neutral bus defaults, `size_of::<SynthRack>() < 262_144`, `--no-default-features` `#![no_std]` check passes, and workspace builds with `0` warnings.
