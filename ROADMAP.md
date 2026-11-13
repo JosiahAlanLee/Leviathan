@@ -263,3 +263,55 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
 - **Macros** — `Decay` 0.48, `SourceKey` 0.25, `PreTilt` 0.52, `TripleAlg` 0.30, `FunEq` 0.35, `FunDepth` 0.46, `PostCut` 0.64, `PostReso` 0.36.
 - **Acceptance** — Exercise all sixteen source and shaper combinations, measure the prefilter and phaser responses, check held-note block transitions and bounded FUN recursion, and verify project round trips and live/WAV parity. Voice state fits in 128 bytes and `SynthRack` stays under 262,144 bytes. The voice shares the existing OTIS tables.
 - **Behavioral references** — [K2600 v2 Musician’s Guide supplement](https://www.manualslib.com/manual/399279/Kurzweil-K2600-V2-0-Musicians-Guide-Supplement-Rev-A.html?page=9), [K2600 Musician’s Guide chapter on FUNs](https://www.manualslib.com/manual/399273/Kurzweil-K2600-Musicians-Guide-Rev-A-Part-Number-910330-Chap-17.html), and [K2661 Musician’s Guide](https://kurzweil.com/wp-content/uploads/2019/10/MG_K2661.pdf).
+
+## Wave 7 (T28–T31 — Resampling and Rack Workflows)
+
+Capture a lane or effects return, replay the take in the tracker, then reuse it as a transwave or Vastish source. Land T28 first and share its sample store across T29 and T30. T31's clock and table logic can start independently. Sequence changes to the shared renderer. The source comparison uses DSP_Emulation `a369a4a` and Gorgon `22b8d4f`. [Rack instrument sources](https://github.com/JosiahAlanLee/DSP_Emulation/tree/a369a4a16898068be769622231241722dc674e0f/vcv) · [Gorgon preview manifest](https://github.com/JosiahAlanLee/Gorgon/blob/22b8d4f0d61e5955deae42f726d57a763b0d8968/docs/PREVIEW_RELEASE.md)
+
+Use the public behavioral references and original Rust under the [clean-room policy](CLEANROOM.md). Keep the DSP crate `#![no_std]`, the audio callback lock-free and allocation-free, and saved machine IDs, parameter locks, and sample banks compatible. Features that affect playback must use the same render path in the app and offline WAV export.
+
+### `T28` – Beat-Synced Capture to a Project Sample Slot
+
+- **Status** — Proposed first.
+- **Capture** — Choose a lane's stereo signal after mute, level and pan, or the stereo BEND return before the master limiter. Arm for a transport beat boundary and record a bounded number of beats using the sample-clock transport. Take each source from the same render pass as the master.
+- **Playback and persistence** — A completed take becomes a project sample with its channel count and original sample rate. Make it selectable in `SMPL` and addressable across its full length. The first hit after publication plays the new take. Any hit already sounding retains its original audio and region until it ends or retriggers. Preserve the four existing WAV banks and their saved mappings. Make new slot selection opt-in so existing step locks resolve as before.
+- **Real-time path** — Size and allocate capture storage before arming. Publish completed takes as one state change and reclaim retired storage away from the callback. Keep file I/O and bulk PCM copies off the callback. Cancel an incomplete take on a transport stop, seek, project change, or capacity failure. Keep the previous take available.
+- **Acceptance** — Verify beat boundaries across block sizes and pattern transitions, stereo and source isolation, retrigger during slot replacement, cancel or overflow recovery, and project save/reopen. Capture and play a four-beat take at 120 BPM and 48 kHz through its final frame, past the current sampler's 16-bit integer address range. Compare live playback and offline master and stems from the same completed 96,000-frame take. Check that legacy banks still render with the same pitch and regions.
+- **Behavioral references** — [Otis Capture](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/otislab/docs/CAPTURE.md) · [Spoon Bender capture](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/spoonbender/docs/MANUAL.md#capture-the-recent-past)
+
+### `T29` – Scan Transwaves from Project Samples
+
+- **Status** — Proposed after T28.
+- **Scope** — Divide a selected sample region into equal-length frames and make it a source for the OTIS family alongside the generated tables. Select frames with position and, when T31 lands, a clocked byte. Retain the playback phase across frame changes and provide a short blend between equal-length frames.
+- **Acceptance** — Use a captured sample with distinguishable frames to check first and last frame selection, incomplete trailing frames, and switching without phase reset. Verify project round-trip and live/WAV parity. Keep existing OTIS and OT2 patches compatible.
+- **Behavioral reference** — [OTIS window scanning and ByteBus frame selection](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/otislab/docs/MANUAL.md#window-scanning-and-frame-stepping)
+
+### `T30` – Vastish Sample and Audio Processing
+
+- **Status** — Proposed after T28. Sequence with T29 where they share sample playback code.
+- **Scope** — Let a VAST processor read a project sample or a routed lane and process it through selectable blocks. Start with one source and one processor per route. A sample uses the note gate. A continuous audio route can run gate-free. Three independently configured Vastish stages, the full block catalog and patchable modulation outputs are follow-ups.
+- **Acceptance** — Feed the same take into `SMPL` and the VAST processor. Check gated and gate-free rendering, route validation for cycles, and export through the same routing used for playback.
+- **Behavioral references** — [Vastish audio input](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/vastish/docs/AUDIO_IN.md) · [Vastish chain](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/vastish/docs/CHAIN.md)
+
+### `T31` – Route ByteBus Words Through Register and Lookup
+
+- **Status** — Proposed. The first destination is `BBUS`.
+- **Scope** — Route the tracker hit mask or fixed row byte through a clocked Register and a one-input Lookup. Add the OTIS frame destination once T29 is available. Expose clock and reset behavior and treat `00` as valid data. The existing DSP clocked receiver can supply a clocked word when an input path is added.
+- **Acceptance** — Compare bypass with existing BBUS playback and test latch timing, reset, a fixed zero word, repeated clock strobes, and project save/reload. Compare the routed words and audio in live playback and offline export.
+- **Behavioral reference** — [ByteBusLab modules and clock contracts](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/bytebus/README.md)
+
+### Rack Follow-Ups
+
+| Area | Remaining functions |
+|---|---|
+| **OTIS and BEND** | External stereo input, eight kit slots with per-hit controls, reverse playback, patch selection, seeded REWORK, frame export to Lookup, clock-ratio echo with separate echo and reverb mixes, fixed-point ESP coloration, and retrospective capture. [OtisLab](https://github.com/JosiahAlanLee/DSP_Emulation/tree/a369a4a16898068be769622231241722dc674e0f/vcv/otislab/docs) · [Spoon Bender](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/spoonbender/docs/MANUAL.md) |
+| **CZish and DAC Stage** | Per-cycle wave alternation, six eight-stage envelopes and single-tone SysEx. Apply the existing T25 converter profiles as an insert, then add variable clock rates, HOLD and CLEAN reconstruction, and encoded-word publication and XOR masking. [CZishLab](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/czish/README.md) |
+| **PVX** | Reuse audio routing for a filter insert. Add independent AR/ADSR envelopes, filter and envelope taps, and selectable oversampling with FIR decimation. [PVX](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/pvx/README.md) |
+| **Séance** | A spectral audio send with phase-preserving Freeze and Wipe first, then seeded Scramble, two-source Cross, and Bridge's eight-band activity and mask. Test dry-path latency compensation and render parity. [Séance](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/seance/docs/MANUAL.md) |
+| **ByteBus and GorgonBridge** | After T31, assess Adapter and Converter, Counter and Counter 2, Lookup2, Switch, Pipeline, Fan, Lattice, patchable Parallel Sum, Wheel, Roulette, and Namagiri as individual follow-ups. Rack also has a live ByteBus overlay for FILL and lane mutes, four-channel audio capture, and Ping latency measurement. [ByteBusLab](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/bytebus/README.md) · [GorgonBridge manual](https://github.com/JosiahAlanLee/Gorgon/blob/22b8d4f0d61e5955deae42f726d57a763b0d8968/rack/docs/MANUAL.md) |
+
+### External Elektron Engines
+
+Keep Machinemodule and Monomodule in their external AGPL Rack plugins with user-supplied OS images. DrumLab is retired. [Adapter license boundary](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/adapter/README.md#the-license-boundary) · [Gorgon preview manifest](https://github.com/JosiahAlanLee/Gorgon/blob/22b8d4f0d61e5955deae42f726d57a763b0d8968/docs/PREVIEW_RELEASE.md)
+
+A separate interoperability proposal should account for both wire layout and event timing. T6 sends a 336-byte UDP snapshot with sequence, timestamp and beat. It omits explicit reset and retrigger fields. The Rack version 2 contract takes a 328-byte expander message with Rack frame, transport revision and reset. The adapters also use their own machine IDs and parameter ranges. Define explicit target mappings and verify retriggers, stop, seek and loop wraps before treating the link as playable. [Leviathan UDP sender](crates/leviathan-app/src/link.rs) · [Rack packet contract](https://github.com/JosiahAlanLee/Gorgon/blob/22b8d4f0d61e5955deae42f726d57a763b0d8968/spec/sound-link.hpp) · [Adapter scheduling](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/adapter/src/Scheduling.hpp)
