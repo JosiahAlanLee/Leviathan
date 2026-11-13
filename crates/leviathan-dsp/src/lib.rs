@@ -7,6 +7,7 @@ mod dac;
 pub mod fm;
 mod master;
 mod otis;
+mod otis_twin;
 mod perc;
 mod pvx;
 pub mod sampler;
@@ -29,7 +30,7 @@ pub use spec::{
     DEFAULT_LANE_PATCHES, MACHINE_SPECS,
 };
 
-pub const MACHINE_COUNT: usize = 14;
+pub const MACHINE_COUNT: usize = 15;
 pub const ALL_LANES_AUDIBLE: u8 = (1 << NUM_LANES) - 1;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -115,6 +116,7 @@ pub enum MachineKind {
     WestCoastLpg = 11,
     OtisTranswave = 12,
     ByteBusR2r = 13,
+    OtisTwin = 14,
 }
 
 impl MachineKind {
@@ -145,6 +147,7 @@ impl MachineKind {
         Self::WestCoastLpg,
         Self::OtisTranswave,
         Self::ByteBusR2r,
+        Self::OtisTwin,
     ];
 
     pub const fn from_id(id: usize) -> Self {
@@ -169,6 +172,7 @@ impl MachineKind {
                 | Self::WestCoastLpg
                 | Self::OtisTranswave
                 | Self::ByteBusR2r
+                | Self::OtisTwin
         )
     }
 
@@ -333,6 +337,7 @@ struct VoiceState {
     perc: perc::Voice,
     west: west::Voice,
     otis: otis::Voice,
+    otis_twin: otis_twin::TwinVoice,
     bbus: bbus::Voice,
     active_machine: Option<MachineKind>,
     note_pitch: f32,
@@ -359,6 +364,7 @@ impl Default for VoiceState {
             perc: perc::Voice::default(),
             west: west::Voice::default(),
             otis: otis::Voice::default(),
+            otis_twin: otis_twin::TwinVoice::default(),
             bbus: bbus::Voice::default(),
             active_machine: None,
             note_pitch: 0.0,
@@ -382,6 +388,7 @@ impl VoiceState {
         self.perc = perc::Voice::default();
         self.west = west::Voice::default();
         self.otis = otis::Voice::default();
+        self.otis_twin = otis_twin::TwinVoice::default();
         self.bbus = bbus::Voice::default();
         self.active_machine = None;
     }
@@ -446,6 +453,7 @@ impl VoiceState {
                 }
                 MachineKind::WestCoastLpg => self.west.step(hz, sample_rate, gate, trigger, &params),
                 MachineKind::OtisTranswave => self.otis.step(hz, sample_rate, trigger, &params),
+                MachineKind::OtisTwin => self.otis_twin.step(hz, sample_rate, gate, trigger, &params),
                 MachineKind::ByteBusR2r => {
                     self.bbus.step(hz, sample_rate, gate, trigger, bus_word, &params)
                 }
@@ -985,6 +993,7 @@ mod tests {
             (MachineKind::WestCoastLpg, 11, "west", "WEST"),
             (MachineKind::OtisTranswave, 12, "otis", "OTIS"),
             (MachineKind::ByteBusR2r, 13, "bbus", "BBUS"),
+            (MachineKind::OtisTwin, 14, "otis2", "OT2"),
         ] {
             assert_eq!((kind.spec().id, kind.slug(), kind.short_name()), (id, slug, badge));
         }

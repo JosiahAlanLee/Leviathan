@@ -551,4 +551,34 @@ mod tests {
             assert!(decoded.peaks.iter().any(|&peak| peak > 0.015), "{name}");
         }
     }
+
+    #[test]
+    fn otis_twin_and_legacy_export_distinct_aligned_stems() {
+        let temp =
+            StagingDirectory::new(&std::env::temp_dir().join("leviathan-test-otis-twin")).unwrap();
+        let stems = temp.path.join("stems");
+        let mut snapshot = project();
+        snapshot.patterns[0].lanes[5][0] = NoteCell::default();
+        snapshot.lane_patches[0] = LanePatch::for_machine(MachineKind::OtisTranswave);
+        snapshot.lane_patches[1] = LanePatch::for_machine(MachineKind::OtisTwin);
+        snapshot.patterns[0].lanes[1][0] = snapshot.patterns[0].lanes[0][0];
+        snapshot.lane_mix.channels[1] = snapshot.lane_mix.channels[0];
+
+        let settings = ExportSettings {
+            stems: true,
+            tail_seconds: 0.04,
+            ..ExportSettings::default()
+        };
+        let plan = RenderPlan::new(&snapshot, settings).unwrap();
+        write_outputs(&snapshot, false, plan, &stems, &AtomicU32::new(0)).unwrap();
+        let read_stem =
+            |name| decode_wav_bytes(name, &fs::read(stems.join(name)).unwrap()).unwrap();
+        let legacy = read_stem("0-otis.wav");
+        let twin = read_stem("1-otis2.wav");
+        assert_eq!(legacy.original_frames, plan.frames as usize);
+        assert_eq!(twin.original_frames, plan.frames as usize);
+        assert!(legacy.peaks.iter().any(|&peak| peak > 0.01));
+        assert!(twin.peaks.iter().any(|&peak| peak > 0.01));
+        assert_ne!(legacy.samples, twin.samples);
+    }
 }

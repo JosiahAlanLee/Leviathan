@@ -587,7 +587,7 @@ mod tests {
     use leviathan_core::PlaybackRate;
 
     #[test]
-    fn wav_master_matches_live_playback_with_bbus_delay_and_bend() {
+    fn wav_master_matches_live_playback_with_bbus_otis_twin_delay_and_bend() {
         let (tx, rx) = rtrb::RingBuffer::new(8);
         let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(32);
         let mut audio = AudioControl::new(tx);
@@ -613,10 +613,12 @@ mod tests {
             ..NoteCell::default()
         };
         pattern.lanes[0][1] = pattern.lanes[0][0];
+        pattern.lanes[1][0] = pattern.lanes[0][0];
         pattern.automation[0].byte_word = 0xa4;
         pattern.automation[1].byte_override = true;
         let mut lane_patches = leviathan_dsp::default_lane_patches();
         lane_patches[0] = LanePatch::for_machine(leviathan_dsp::MachineKind::ByteBusR2r);
+        lane_patches[1] = LanePatch::for_machine(leviathan_dsp::MachineKind::OtisTwin);
         let mut lane_mix = crate::lane_mix::LaneMix::default();
         lane_mix.channels[4].0 = LaneChannel {
             level: 1.0,
@@ -692,6 +694,7 @@ mod tests {
         assert_eq!(std::fs::read(destination.join("wet.wav")).unwrap(), master);
         let stem = std::fs::read(destination.join("wet/4-smpl.wav")).unwrap();
         let bbus = std::fs::read(destination.join("wet/0-bbus.wav")).unwrap();
+        let otis_twin = std::fs::read(destination.join("wet/1-otis2.wav")).unwrap();
         let bend = std::fs::read(destination.join("wet/bend.wav")).unwrap();
         let frozen_master = std::fs::read(destination.join("frozen/master.wav")).unwrap();
         let frozen_bend = std::fs::read(destination.join("frozen/bend.wav")).unwrap();
@@ -703,7 +706,7 @@ mod tests {
         std::fs::remove_dir_all(destination).unwrap();
         let frames = 1500 + 3360;
         let data_offset = master.len() - frames * 8;
-        for bytes in [&master, &stem, &bbus, &bend, &frozen_bend] {
+        for bytes in [&master, &stem, &bbus, &otis_twin, &bend, &frozen_bend] {
             assert_eq!(bytes.len(), master.len());
             assert_eq!(&bytes[data_offset - 8..data_offset - 4], b"data");
             let data_len = u32::from_le_bytes(bytes[data_offset - 4..data_offset].try_into().unwrap());
@@ -714,7 +717,7 @@ mod tests {
             let offset = data_offset + 8 * frame + 4 * channel;
             f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
         };
-        let mut energy = [0.0; 4];
+        let mut energy = [0.0; 5];
         for frame in 0..frames {
             if frame == 1500 {
                 audio.send(AudioCommand::SetPlaying {
@@ -735,6 +738,7 @@ mod tests {
             }
             energy[2] += read_channel(&bend, frame, 0).abs() + read_channel(&bend, frame, 1).abs();
             energy[3] += read_channel(&bbus, frame, 0).abs();
+            energy[4] += read_channel(&otis_twin, frame, 0).abs();
         }
         assert!(energy.iter().all(|&sum| sum > 0.1), "{energy:?}");
     }

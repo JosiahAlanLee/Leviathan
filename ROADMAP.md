@@ -167,7 +167,7 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
 | **`T21`** | `bbus` / `BBUS` | `crates/leviathan-dsp/src/bbus.rs`, `crates/leviathan-dsp/src/dac.rs` | `P0 Decay`, `P1 BusMask`, `P2 FirTilt`, `P3 R2rSkew`, `P4 ClockHold`, `P5 Cutoff`, `P6 SlewGlitch`, `P7 SubBit` | `<= 96 B` / lane |
 | **`T22`** | `otis` / `OTIS` | `crates/leviathan-dsp/src/otis.rs` | `P0 Decay`, `P1 TableSel`, `P2 FramePos`, `P3 ScanDepth`, `P4 K1Cutoff`, `P5 K2Reso`, `P6 FixedGrit`, `P7 LoopMode` | `<= 128 B` / lane (+ static ROM) |
 | **`T23`** | *(Bus FX)* | `crates/leviathan-dsp/src/bender.rs` | Shared `SpoonBenderBus`: `ShiftHz`, `Feedback`, `TankDecay`, `Freeze` + per-lane `fx_send` | `<= 64 KiB` shared on `MasterBus` |
-| **`T24`** | *(OTIS upgrade)* | `leviathan-dsp` machine and registry | `P0 Decay`, `P1 TableSel`, `P2 FramePos`, `P3 ScanDepth`, `P4 FilterF1`, `P5 FilterF2`, `P6 TwinSpread`, `P7 ModeGrit` | `<= 96 B` / lane (+ shared ROM) |
+| **`T24`** | `otis2` / `OT2` | `crates/leviathan-dsp/src/otis_twin.rs` | `P0 Decay`, `P1 TableSel`, `P2 FramePos`, `P3 ScanDepth`, `P4 FilterF1`, `P5 FilterF2`, `P6 TwinSpread`, `P7 ModeGrit` | `<= 96 B` / lane (+ shared ROM) |
 
 ### `T19` – Clean-Room `ElectroPerc` Drum & 6-Oscillator Metallic Percussion Voice (`PERC`)
   - **Status**: `IMPLEMENTED` (`c125d5b`). Select `PERC` in Lane Patch or Step Lock for snare, clap, rimshot, and metallic hat modes.
@@ -225,9 +225,9 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
 
 ### `T24` – OTIS Twin Transwaves and Series Filters
 
-- **Status** — Open, after T22. Add an opt-in machine variant so existing `otis` patches and numeric step locks keep the T22 sound and macro meanings.
+- **Status** — `IMPLEMENTED` (`bc0c65c`). Select `OT2` in Lane Patch or Step Lock. Existing `otis` patches and numeric step locks at ID `12` retain the T22 sound and macro meanings.
 - **Twin transwaves** — Use two independent phase accumulators with Q20.12 addressing and bilinear frame/phase interpolation. Oscillator B counter-scans the selected bank and offers detuned unison, fifth, and octave ranges. Provide a true single-reader setting and smooth the blend. Generate a shared 16 KiB ROM with formant, bell, PWM/sync, and sub-fold banks. Use generated waveforms and behavioral references.
 - **Filters** — Use F1 for the low-pass ceiling with asymmetric coefficient slew. F2 below center introduces a Fizmo-inspired resonant four-pole low-pass, center uses a neutral three-pole low-pass, and above center adds a high-pass floor. The prototype's three-pole LP plus two-pole HP is a Leviathan voicing. The ASR-10 manual documents four-pole splits of 3+1 or 2+2 for hardware comparisons.
-- **Proposed macros** — `Decay` 0.48, `TableSel` 0.00, `FramePos` 0.20, `ScanDepth` 0.55, `FilterF1` 0.68, `FilterF2` 0.35, `TwinSpread` 0.42, `ModeGrit` 0.45. `ModeGrit` selects OneShot, Bidir, or FwdWrap with a grit range within each zone.
+- **Macros** — `Decay` 0.48, `TableSel` 0.00, `FramePos` 0.20, `ScanDepth` 0.55, `FilterF1` 0.68, `FilterF2` 0.35, `TwinSpread` 0.42, `ModeGrit` 0.45. `ModeGrit` selects OneShot, Bidir, or FwdWrap with a grit range within each zone.
 - **Acceptance** — Verify that the two frame readers travel in opposite directions in Bidir mode and preserve phase accuracy over 128,000 samples. Measure the resonant and bass-cut responses. Check wrap and mode transitions for discontinuities, keep per-lane state within 96 bytes and `SynthRack` under 262,144 bytes, and verify existing OTIS project and WAV behavior.
 - **Behavioral references** — [FIZMO User’s Guide](https://www.vintagesynth.com/sites/default/files/2017-05/FIZMO_Users_Guide.pdf) and [ASR-10 Musician’s Manual](https://ensoniq.manymanuals.com/digital-pianos/asr-10/instruction-manual-11191/208).
