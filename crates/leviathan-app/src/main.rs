@@ -30,7 +30,7 @@ use leviathan_core::{
     CvFrame, EngineConfig, FillCondition, LaunchTarget, NoteCell, Pattern, PatternChain,
     SongPlayer, SongStatus, SoundLock, NUM_LANES, ROWS_PER_PATTERN,
 };
-use leviathan_dsp::{default_lane_patches, BenderParams, LanePatch, MachineKind, MasterPeaks};
+use leviathan_dsp::{default_lane_patches, BenderParams, DelayMode, LanePatch, MachineKind, MasterPeaks};
 use link::SoundLinkBridge;
 use locks_ui::draw_lane_patch_inspector;
 use master_ui::MasterMeters;
@@ -187,6 +187,7 @@ struct LeviathanApp {
     fill_active: bool,
     bpm: f64,
     master_send: f32,
+    delay_mode: DelayMode,
     bender_params: BenderParams,
     lane_mix: LaneMix,
     lane_patches: [LanePatch; NUM_LANES],
@@ -261,6 +262,7 @@ impl LeviathanApp {
             fill_active: false,
             bpm: 132.0,
             master_send: 0.0,
+            delay_mode: DelayMode::default(),
             bender_params: BenderParams::default(),
             lane_mix: LaneMix::default(),
             lane_patches: default_lane_patches(),
@@ -614,6 +616,7 @@ impl LeviathanApp {
         project::Project {
             bpm: self.bpm,
             master_send: self.master_send,
+            delay_mode: self.delay_mode,
             bender_params: self.bender_params,
             lane_mix: self.lane_mix,
             lane_patches: self.lane_patches,
@@ -644,6 +647,7 @@ impl LeviathanApp {
         let prepared = Arc::new(AudioProject::prepare(&project, self.project_generation));
         self.bpm = project.bpm;
         self.master_send = project.master_send;
+        self.delay_mode = project.delay_mode;
         self.bender_params = project.bender_params;
         self.lane_mix = project.lane_mix;
         self.lane_patches = project.lane_patches;
@@ -883,6 +887,9 @@ impl eframe::App for LeviathanApp {
                     ui.separator();
                     self.viewport.draw_shader_controls(ui, hovering_wgsl);
                     mixer_ui::draw(ui, &mut self.lane_mix, &self.lane_patches);
+                    if master_ui::draw_delay_mode(ui, &mut self.delay_mode) {
+                        self.send_audio(AudioCommand::SetDelayMode(self.delay_mode));
+                    }
                     if master_ui::draw_bender(ui, &mut self.bender_params) {
                         self.send_audio(AudioCommand::SetBenderParams(self.bender_params));
                     }
