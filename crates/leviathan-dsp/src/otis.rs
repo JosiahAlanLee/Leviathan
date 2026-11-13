@@ -189,6 +189,15 @@ fn scan_sample(table: usize, frame: u32, phase: u32) -> f32 {
     pair[0] + frame_frac * (pair[1] - pair[0])
 }
 
+/// Read-only wavetable modulation tap for FS77.
+#[inline]
+pub(super) fn sample_rcm_rom(table: usize, frame: f32, phase: f32) -> f32 {
+    let frame_end = (FRAMES - 1) as u32 * FRACTION;
+    let frame = (frame.clamp(0.0, 1.0) * frame_end as f32 + 0.5) as u32;
+    let phase = ((wrap_turns(phase) * CYCLE as f32) as u32) & (CYCLE - 1);
+    scan_sample(table.min(TABLES - 1), frame, phase) * (1.0 / 32_768.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

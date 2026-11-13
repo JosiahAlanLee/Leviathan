@@ -31,14 +31,19 @@ def main() -> int:
     parser.add_argument("--check", action="store_true", help="Check applicability without writing")
     args = parser.parse_args()
     patch = Path(__file__).resolve().with_name("t24-otis-twin.patch")
+    return apply_patch(args.repo, patch, args.check)
+
+
+def apply_patch(repo: Path, patch: Path, check_only: bool) -> int:
     if not patch.is_file():
-        parser.error(f"Missing bundled patch {patch}")
+        print(f"Missing bundled patch {patch}", file=sys.stderr)
+        return 1
 
     try:
         # Git may check the bundled text patch out with CRLF. Pass the
         # canonical bytes through stdin to avoid platform newline conversion.
         diff = patch.read_bytes().replace(b"\r\n", b"\n")
-        root = git(args.repo.resolve(), "rev-parse", "--show-toplevel")
+        root = git(repo.resolve(), "rev-parse", "--show-toplevel")
         if root.returncode:
             print(root.stderr.decode(errors="replace").rstrip(), file=sys.stderr)
             return 1
@@ -47,13 +52,13 @@ def main() -> int:
         if check.returncode:
             reverse = git(repo, "apply", "--index", "--check", "--reverse", "-", stdin=diff)
             if reverse.returncode:
-                print("T24 patch could not be applied.", file=sys.stderr)
+                print(f"{patch.name} could not be applied.", file=sys.stderr)
                 print(check.stderr.decode(errors="replace").rstrip(), file=sys.stderr)
                 return 1
-            print("T24 patch is already applied.")
+            print(f"{patch.name} is already applied.")
             return 0
-        if args.check:
-            print("T24 patch applies cleanly.")
+        if check_only:
+            print(f"{patch.name} applies cleanly.")
             return 0
 
         applied = git(repo, "apply", "--index", "-", stdin=diff)
@@ -64,7 +69,7 @@ def main() -> int:
         print(error, file=sys.stderr)
         return 1
 
-    print("Applied and staged the T24 patch. Review with git diff --cached.")
+    print(f"Applied and staged {patch.name}. Review with git diff --cached.")
     return 0
 
 

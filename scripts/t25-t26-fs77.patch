@@ -1,0 +1,1370 @@
+diff --git a/CLEANROOM.md b/CLEANROOM.md
+index 6654e35a2aaada3f2240054a289f46ad2a436ab3..421f3dbd45532c1d23ff799ffe801aeddf5741f8 100644
+--- a/CLEANROOM.md
++++ b/CLEANROOM.md
+@@ -16,3 +16,7 @@ Leviathan is authored under the `BSD-3-Clause` license using a clean-room bounda
+    - BEND uses the published [allpass quadrature topology](https://www.mikrocontroller.net/attachment/33904/hilbert_Olli_Niemitalo.pdf) with independently fitted coefficients and a [normalized orthogonal feedback network](https://www.di.univr.it/documenti/ArticoloRivista/allegato/allegato574545.pdf). The source inputs for Wave 5 were the roadmap, mathematical descriptions, and Leviathan's existing Rust code.
+    - BBUS uses the [Parallel Sum behavior](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/docs/NLC_BUS_SPEC.md#5-parallel-sum-from-burhans-timbre) and the [Adapter clock contract](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/bytebus/docs/ADAPTER.md#clocks-startup-and-reset). The tracker bridge, register injection, FIR morph, and ladder transfer and transient are original Rust derived from those behaviors and the T21 requirements.
+    - OTIS Twin uses the supplied T24 Rust prototype, the behavioral references in the roadmap, and Leviathan's DSP primitives. It generates its shared 16 KiB tables from mathematical waveforms.
++
++4. **Wave 6 DSP Provenance**
++   - T25 uses the supplied Rust prototype and the converter behavior described in the roadmap. Yamaha's datasheet supplies the YM3012 serial fields. The CZ transfer is a provisional mathematical model.
++   - T26 uses the supplied FS77 Rust prototype, Yamaha's SY77 and FS1R behavioral descriptions, and Leviathan DSP primitives. The waveform modulator reads Leviathan's generated OTIS table.
+diff --git a/README.md b/README.md
+index d2d7f4a904372ef40668a8c060a883b1093ea6a3..3f3dcc6db0c5247762c1c206f330228d93e9fb70 100644
+--- a/README.md
++++ b/README.md
+@@ -39,6 +39,7 @@ Leviathan uses a strict hexagonal ("ports and adapters") layout so external GPU,
+ - **Swing** delays odd rows from 50% to 75% of each two-row pair while preserving pattern length. In the step inspector, **Nudge** moves a hit by up to 24 ticks either way (48 ticks per row), and **Retrig** divides the step into up to four evenly spaced hits. Nudges stay within the pattern, with later hits taking over overlapping notes on the same lane.
+ - Select **PERC**, **WEST**, or **OTIS** in **Lane Patch** to play the electro percussion, West Coast LPG, or transwave scanner voice. Each also supports per-step machine and parameter locks.
+ - Select **OT2** in **Lane Patch** or **Step Lock** for counter-scanning transwaves. **TwinSpread** starts with one reader and blends in detuned unison, a fifth, or an octave as you turn it up. **FilterF2** adds resonance below center and raises the high-pass floor above it.
++- Select **FS77** for formant FM. Lock **FormantHz** on individual steps to sequence vowels. Turn up **WaveRcm** to feed an OTIS waveform into the FM, or **SkirtUnv** to widen the formants and add breath. **ResoDac** moves from a resonant low-pass with provisional CZ coloration to a vocal band-pass with YM3012 coloration.
+ - Select **BBUS** for the bit-stream FIR and R-2R voice. **Fixed ByteBus word** in the row inspector accepts all 256 values, including `00`. With it off, playback uses the lane gate mask. Auditioning while stopped uses the standalone generator.
+ - Open **Lane Mixer** in the side panel for each lane's level, constant-power pan, and delay and BEND sends. The master delay send raises all lanes' delay send together. **M** and **S** in the lane headers control mute and solo. The shared **BEND** panel controls frequency shift, feedback, decay, and Freeze. Freeze holds the current feedback tail while muting new input to the bus.
+ - In **VarSampler Banks**, **Start** and **End** mark the active sample region. **Sustain Loop** repeats that region while the lane gate is high and finishes the current pass on release. With sustain looping off, the step's loop and scan locks work within the trim.
+diff --git a/ROADMAP.md b/ROADMAP.md
+index db7e46f893c90bbcebf422e2a3f2785bf1469e0c..2bcc98333e7e6d40d24bb683e8dd7c19f2fa72d2 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -200,7 +200,7 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
+ - **Voice** — A 32-bit phase accumulator drives an eight-stage XOR/XNOR register and an eight-tap bipolar FIR. Process every crossed slot, including wrap, at sixteen slots per note cycle. The offset-binary ladder models resistor skew, sample-and-hold, slew, and a decaying major-carry transient. The sub path blends one and two octaves down. All voice state stays within 96 bytes.
+ - **Macros** — `Decay` 0.38, `BusMask` 0.45, `FirTilt` 0.30, `R2rSkew` 0.20, `ClockHold` 0.15, `Cutoff` 0.60, `SlewGlitch` 0.30, `SubBit` 0.35.
+ - **Acceptance** — Verify a clocked zero word, held data through clock gaps, tracker changes at 8× speed, multi-slot phase advances, bounded DAC output over all 256 codes, carry decay, legacy project loading, and sample-for-sample live/WAV parity.
+-- **Converter follow-up** — Validate the Yamaha and linear signed word formats with exact vectors and keep CZ companding provisional pending measurements. Distinguish input anti-aliasing from output reconstruction. Add opt-in DAC character to FM4 or CZPD after validating the profiles independently.
++- **Converter follow-up** — See T25 for the independent converter profiles. Existing voices retain their current signal paths.
+
+ ### `T22` – Clean-Room `OtisTranswave` Fixed-Point Wavetable Scanner (`OTIS`, `OtisLab` Archetype)
+   - **Status**: `IMPLEMENTED` (`c125d5b`). Select `OTIS` in Lane Patch or Step Lock for four generated transwave banks and three scan modes.
+@@ -231,3 +231,24 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
+ - **Macros** — `Decay` 0.48, `TableSel` 0.00, `FramePos` 0.20, `ScanDepth` 0.55, `FilterF1` 0.68, `FilterF2` 0.35, `TwinSpread` 0.42, `ModeGrit` 0.45. `ModeGrit` selects OneShot, Bidir, or FwdWrap with a grit range within each zone.
+ - **Acceptance** — Verify that the two frame readers travel in opposite directions in Bidir mode and preserve phase accuracy over 128,000 samples. Measure the resonant and bass-cut responses. Check wrap and mode transitions for discontinuities, keep per-lane state within 96 bytes and `SynthRack` under 262,144 bytes, and verify existing OTIS project and WAV behavior.
+ - **Behavioral references** — [FIZMO User’s Guide](https://www.vintagesynth.com/sites/default/files/2017-05/FIZMO_Users_Guide.pdf) and [ASR-10 Musician’s Manual](https://ensoniq.manymanuals.com/digital-pianos/asr-10/instruction-manual-11191/208).
++
++## Wave 6 (T25–T26 — Converter Profiles and Formant FM)
++
++### `T25` – Converter Word Formats and DAC Coloration
++
++- **Status** — `IMPLEMENTED` (`ff633b4`). The shared `leviathan_dsp::dac` stage has no tracker controls or new audio commands.
++- **Word formats** — The YM3012 serial codec uses a 10-bit offset-binary mantissa and exponent codes 1–7. It reconstructs signed integer PCM for audio processing. The linear profile truncates signed PCM to 4–16 bits. The 8-bit R-2R profile reuses the ladder transfer. BBUS keeps its existing ladder timing, slew, and carry transient.
++- **Provisional CZ** — The 40 kHz profile has selectable instantaneous or syllabic range tracking and an optional range-gain mismatch. The companding law and gain mismatch are modeling choices pending hardware measurements.
++- **Clock and filters** — The YM profile defaults to the YM2151/OPM example rate of approximately 55.93 kHz. At lower host rates it updates once per host sample. A one-pole input prefilter attenuates some content that would fold at a reduced latch rate. An independent output filter smooths the held steps.
++- **Acceptance** — Verify serial fields at exponent boundaries, signed round trips across all 65,536 PCM values, linear bit-depth vectors, CZ range tracking, and independent input and output filter behavior. Keep the inline state within 32 bytes.
++- **Behavioral references** — [YM3012 datasheet](https://bitsavers.org/components/yamaha/YM3012_199204.pdf), [YM2151 application manual](https://map.grauw.nl/resources/sound/yamaha_ym2151_synthesis.pdf), and [DAC Stage behavioral specification](https://github.com/JosiahAlanLee/DSP_Emulation/blob/main/docs/DAC_STAGE_SPEC.md).
++
++### `T26` – FS77 Formant FM and Wavetable Phase Modulation
++
++- **Status** — `IMPLEMENTED` (`e70d8a3`). Select `FS77` in Lane Patch or Step Lock. The saved slug is `fs77` and the numeric lock ID is `15`.
++- **FM and wavetable modulation** — Four operator slots use seven procedural spectral shapes, four routing algorithms, and two-sample feedback averaging. `WaveRcm` blends in sample-based phase modulation from a read-only tap of the existing OTIS table. The four-operator routing and shapes are Leviathan designs inspired by the SY77 and FS1R.
++- **Vowel sequencing** — `FormantHz` sweeps two grain carriers through /u/, /o/, /a/, /e/, and /i/. The carrier rates stay in Hz while the fundamental determines the harmonic spacing. `SkirtUnv` widens the voiced spectral envelope and adds a band-pass noise transient centered near F2. Tracker locks sequence the vowel control.
++- **Filters and converter color** — `ResoDac` blends a resonant low-pass cascade below center into a high-pass/low-pass cascade above center. Provisional CZ coloration blends in below 0.30 and YM3012 coloration above 0.55, with a 5 ms slew and separate converter histories. These are Leviathan voicing choices. Yamaha's SY77 service manual describes a YM3029 and PCM56P output stage.
++- **Macros** — `Decay` 0.45, `FmIndex` 0.38, `WaveRcm` 0.25, `FormantHz` 0.42, `SkirtUnv` 0.30, `AlgRatio` 0.35, `FilterCut` 0.68, `ResoDac` 0.32.
++- **Acceptance** — Verify voiced and unvoiced responses, vowel centers over multiple octaves, audible wavetable modulation, bounded feedback, and smooth converter transitions. Save and reload a project using the lane patch and ID-15 step locks, verify audible WAV stems, and compare live and offline master samples. Keep voice state within 128 bytes and the rack under 262,144 bytes.
++- **Behavioral references** — [SY77 operating manual](https://chrisarndt.de/files/yamaha/sy77/SY77%20-%20Operating%20Manual%20-%20Complete.pdf), [SY77 service manual](https://manualzz.com/doc/24299236/yamaha-sy77-music-synthesizer-service-manual), and [FS1R owner's manual](https://usa.yamaha.com/files/download/other_assets/5/333335/FS1RE1.PDF).
+diff --git a/crates/leviathan-app/src/audio.rs b/crates/leviathan-app/src/audio.rs
+index f76b03721b9b2a604a7e6c526cd717ed970a0492..53fd52713aa495ad6defd4a98121c7177535de78 100644
+--- a/crates/leviathan-app/src/audio.rs
++++ b/crates/leviathan-app/src/audio.rs
+@@ -586,6 +586,137 @@ mod tests {
+     use crate::wav::{sample_peaks, DecodedWav, WavEncoding};
+     use leviathan_core::PlaybackRate;
+
++    #[test]
++    fn saved_fs77_lane_and_step_lock_match_live_and_wav() {
++        use leviathan_dsp::{default_lane_patches, MachineKind};
++
++        let directory =
++            std::env::temp_dir().join(format!("leviathan-fs77-parity-{}", std::process::id()));
++        std::fs::create_dir_all(&directory).unwrap();
++        let path = directory.join("formants.leviathan.json");
++        let destination = directory.join("stems");
++        let mut pattern = Pattern {
++            length: 4,
++            rate: PlaybackRate::EightX,
++            ..Pattern::default()
++        };
++        let mut patches = default_lane_patches();
++        patches[0] = LanePatch::for_machine(MachineKind::Fs77FormantFm);
++        patches[0].params[3] = 0.0;
++        patches[0].params[7] = 0.12;
++        let note = NoteCell {
++            active: true,
++            midi: 48,
++            velocity: 115,
++            gate_fraction: 1.0,
++            ..NoteCell::default()
++        };
++        pattern.lanes[0][0] = note;
++        let mut lock = SoundLock {
++            machine: 15,
++            mask: (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 7),
++            values: patches[0].params,
++        };
++        lock.values[2] = 0.85;
++        lock.values[3] = 1.0;
++        lock.values[4] = 0.75;
++        lock.values[5] = 0.85;
++        lock.values[7] = 0.85;
++        let first_lock = lock;
++        pattern.lanes[1][1] = NoteCell { lock, ..note };
++        // A second vowel and DAC region on the same voice exercises the crossfade.
++        lock.values[3] = 0.5;
++        lock.values[7] = 0.15;
++        pattern.lanes[1][2] = NoteCell { lock, ..note };
++        crate::project::save(
++            &path,
++            Project {
++                bpm: 120.0,
++                master_send: 0.0,
++                bender_params: Default::default(),
++                lane_mix: LaneMix::default(),
++                lane_patches: patches,
++                patterns: vec![pattern],
++                selected_pattern: 0,
++                chain: PatternChain::default(),
++                samples: Default::default(),
++                sample_regions: Default::default(),
++                custom_shader: None,
++            },
++        )
++        .unwrap();
++        let saved = std::fs::read_to_string(&path).unwrap();
++        assert!(saved.contains(r#""machine":"fs77""#));
++        assert!(saved.contains(r#""machine":15"#));
++        let project = crate::project::load(&path).unwrap();
++        assert_eq!(project.lane_patches, patches);
++        assert_eq!(project.patterns[0].lanes[1][1].lock, first_lock);
++        assert_eq!(project.patterns[0].lanes[1][2].lock, lock);
++
++        let settings = ExportSettings {
++            encoding: WavEncoding::Float32,
++            stems: true,
++            tail_seconds: 0.01,
++            ..ExportSettings::default()
++        };
++        // Four rows at 8× and 120 BPM are 3,000 frames at 48 kHz.
++        let music_frames = 3_000;
++        let live = fs77_live_frames(&project, music_frames, music_frames + 480);
++        ExportJob::start(
++            project,
++            false,
++            ExportRequest {
++                destination: destination.clone(),
++                settings,
++            },
++        )
++        .unwrap()
++        .finish()
++        .unwrap();
++        let master = std::fs::read(destination.join("master.wav")).unwrap();
++        let lane = std::fs::read(destination.join("0-fs77.wav")).unwrap();
++        let locked_lane =
++            std::fs::read(destination.join(format!("1-{}.wav", patches[1].machine.slug()))).unwrap();
++        std::fs::remove_dir_all(directory).unwrap();
++        let data_start = master.len() - live.len() * 8;
++        assert_eq!(&master[data_start - 8..data_start - 4], b"data");
++        let read = |bytes: &[u8]| f32::from_le_bytes(bytes.try_into().unwrap());
++        for stem in [&lane, &locked_lane] {
++            assert_eq!(stem.len(), master.len());
++            assert!(stem[data_start..].chunks_exact(4).any(|s| read(s).abs() > 0.01));
++        }
++        for (n, frame) in master[data_start..].chunks_exact(8).enumerate() {
++            assert_eq!(live[n], (read(&frame[..4]), read(&frame[4..])), "frame {n}");
++        }
++    }
++
++    fn fs77_live_frames(project: &Project, music_frames: usize, frames: usize) -> Vec<(f32, f32)> {
++        let (tx, rx) = rtrb::RingBuffer::new(8);
++        let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(16);
++        let mut audio = AudioControl::new(tx);
++        let mut worker = RtAudioWorker::new(Pattern::default(), 48_000.0, rx, tel_tx, None);
++        audio.send(AudioCommand::ReplaceProject(Arc::new(AudioProject::prepare(
++            project, 1,
++        ))));
++        audio.send(AudioCommand::SetPlaying {
++            playing: true,
++            request: 1,
++        });
++        worker.drain_commands();
++        let mut rendered = Vec::with_capacity(frames);
++        for n in 0..frames {
++            if n == music_frames {
++                audio.send(AudioCommand::SetPlaying {
++                    playing: false,
++                    request: 2,
++                });
++                worker.drain_commands();
++            }
++            rendered.push(worker.next_stereo());
++        }
++        rendered
++    }
++
+     #[test]
+     fn wav_master_matches_live_playback_with_bbus_otis_twin_delay_and_bend() {
+         let (tx, rx) = rtrb::RingBuffer::new(8);
+diff --git a/crates/leviathan-dsp/src/dac.rs b/crates/leviathan-dsp/src/dac.rs
+index e0e15d4c38489b82f3a597d366979b5d3082e1a3..f84af999bcd1e5f685a1fe303399067657d7582a 100644
+--- a/crates/leviathan-dsp/src/dac.rs
++++ b/crates/leviathan-dsp/src/dac.rs
+@@ -1,3 +1,5 @@
++//! Converter word formats and host-rate rendering for opt-in DAC coloration.
++
+ use crate::voice::approach;
+
+ /// Eight-bit offset-binary transfer with a calibrated midscale and skewed bit weights.
+@@ -55,6 +57,208 @@ impl R2r {
+     }
+ }
+
++const YM_OPM_RATE_HZ: f32 = 3_579_545.0 / 64.0;
++const CZ_RATE_HZ: f32 = 40_000.0;
++
++/// Range selector for the provisional Casio-style compander.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum CzRange {
++    Instantaneous,
++    Syllabic,
++}
++
++/// Word format and reconstruction settings for a single audio stream.
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++pub enum ConverterProfile {
++    #[default]
++    Bypass,
++    R2rOffset {
++        skew: f32,
++    },
++    Ym3012Fp,
++    CzProvisional {
++        range: CzRange,
++        track: f32,
++    },
++    LinearSigned {
++        bits: u8,
++    },
++}
++
++/// Encodes signed PCM into the YM3012 serial fields, with the first three bits cleared.
++/// Bits 3–12 hold the offset-binary mantissa and bits 13–15 hold the exponent.
++#[inline]
++pub const fn encode_ym3012_word(pcm: i16) -> u16 {
++    let sign_removed = if pcm < 0 { !pcm } else { pcm } as u16;
++    let shift = (u16::BITS - sign_removed.leading_zeros()).saturating_sub(9);
++    let mantissa = ((pcm >> shift) + 512) as u16;
++    (((7 - shift) as u16) << 13) | (mantissa << 3)
++}
++
++/// Reconstructs the integer PCM level. Exponent zero is reserved.
++#[inline]
++pub const fn decode_ym3012_word(word: u16) -> Option<i16> {
++    let exponent = word >> 13;
++    if exponent == 0 {
++        return None;
++    }
++    let mantissa = ((word >> 3) & 0x03ff) as i16 - 512;
++    Some(mantissa << (7 - exponent))
++}
++
++/// Keeps 4–16 signed bits, left-aligned in the original 16-bit range.
++#[inline]
++pub fn quantize_linear_i16(pcm: i16, bits: u8) -> i16 {
++    let drop = 16 - bits.clamp(4, 16);
++    (pcm >> drop) << drop
++}
++
++#[inline]
++fn pcm16(input: f32) -> i16 {
++    let scaled = input * 32_768.0;
++    let half = if scaled >= 0.0 { 0.5 } else { -0.5 };
++    (scaled + half) as i16
++}
++
++#[inline]
++fn normalized(value: f32) -> f32 {
++    value.max(0.0).min(1.0)
++}
++
++fn cz_quantize(input: f32, reference: f32, track: f32) -> f32 {
++    let pcm = (input * 8_192.0).clamp(-8_192.0, 8_191.0) as i32;
++    let shift = if reference >= 0.5 {
++        2
++    } else if reference >= 0.25 {
++        1
++    } else {
++        0
++    };
++    let track = normalized(track);
++    let gain = match shift {
++        1 => 1.0 + 0.085 * track,
++        2 => 1.0 - 0.115 * track,
++        _ => 1.0,
++    };
++    let truncated = ((pcm >> shift) << shift) as f32;
++    truncated * (gain / 8_192.0)
++}
++
++/// Inline state for prefilter, latch, compander and output reconstruction.
++#[derive(Clone, Copy, Debug)]
++pub struct DacStage {
++    phase: f32,
++    prefiltered: f32,
++    held: f32,
++    envelope: f32,
++    reconstructed: f32,
++}
++
++const _: () = assert!(core::mem::size_of::<DacStage>() <= 32);
++
++impl Default for DacStage {
++    fn default() -> Self {
++        Self {
++            phase: 1.0,
++            prefiltered: 0.0,
++            held: 0.0,
++            envelope: 0.0,
++            reconstructed: 0.0,
++        }
++    }
++}
++
++impl DacStage {
++    /// Processes a normalized sample. Clock hold reduces the host-capped device rate
++    /// by up to 32×. A one-pole prefilter reduces foldover when the latch rate drops.
++    /// A separate one-pole reconstruction filter follows the held word.
++    #[inline]
++    pub fn step(
++        &mut self,
++        input: f32,
++        sample_rate: f32,
++        profile: ConverterProfile,
++        clock_hold: f32,
++    ) -> f32 {
++        let (device_rate, reconstruction_hz) = match profile {
++            ConverterProfile::Bypass => {
++                *self = Self::default();
++                return input;
++            }
++            ConverterProfile::Ym3012Fp => (YM_OPM_RATE_HZ, 21_000.0),
++            ConverterProfile::CzProvisional { .. } => (CZ_RATE_HZ, 20_000.0),
++            _ => (sample_rate, 22_000.0),
++        };
++        let rate = if sample_rate.is_finite() {
++            sample_rate.max(8_000.0)
++        } else {
++            48_000.0
++        };
++        let hold = normalized(clock_hold);
++        let clock = (device_rate.min(rate) / (1.0 + 31.0 * hold * hold)).clamp(500.0, rate);
++        let input = if input.is_finite() {
++            input.clamp(-1.0, 1.0)
++        } else {
++            0.0
++        };
++        if clock < rate {
++            self.prefiltered +=
++                one_pole_coefficient(0.45 * clock, rate) * (input - self.prefiltered);
++        } else {
++            self.prefiltered = input;
++        }
++
++        let magnitude = self.prefiltered.abs();
++        self.envelope = if matches!(
++            profile,
++            ConverterProfile::CzProvisional {
++                range: CzRange::Syllabic,
++                ..
++            }
++        ) {
++            let seconds = if magnitude > self.envelope {
++                0.001
++            } else {
++                0.050
++            };
++            approach(self.envelope, magnitude, seconds, rate)
++        } else {
++            0.0
++        };
++        self.phase += clock / rate;
++        if self.phase >= 1.0 {
++            self.phase -= self.phase as u32 as f32;
++            let sample = self.prefiltered;
++            self.held = match profile {
++                ConverterProfile::Bypass => sample,
++                ConverterProfile::R2rOffset { skew } => {
++                    let code = (sample * 128.0 + 128.5) as u8;
++                    ladder(code, normalized(skew))
++                }
++                ConverterProfile::Ym3012Fp => {
++                    let word = encode_ym3012_word(pcm16(sample));
++                    f32::from(decode_ym3012_word(word).unwrap_or(0)) / 32_768.0
++                }
++                ConverterProfile::CzProvisional { track, .. } => {
++                    cz_quantize(sample, magnitude.max(self.envelope), track)
++                }
++                ConverterProfile::LinearSigned { bits } => {
++                    f32::from(quantize_linear_i16(pcm16(sample), bits)) / 32_768.0
++                }
++            };
++        }
++        self.reconstructed +=
++            one_pole_coefficient(reconstruction_hz, rate) * (self.held - self.reconstructed);
++        self.reconstructed
++    }
++}
++
++#[inline]
++fn one_pole_coefficient(corner_hz: f32, sample_rate: f32) -> f32 {
++    let frequency = core::f32::consts::TAU * corner_hz;
++    frequency / (sample_rate + frequency)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -99,4 +303,131 @@ mod tests {
+         dac.step(0.5, 48_000.0, 1.0, 0.0, 0.0);
+         assert_eq!(dac.code, 0xc0);
+     }
++
++    #[test]
++    fn ym3012_serial_fields_match_signed_pcm_vectors() {
++        for (pcm, word, reconstructed) in [
++            (0, 0xf000, 0),
++            (1, 0xf008, 1),
++            (-1, 0xeff8, -1),
++            (511, 0xfff8, 511),
++            (512, 0xd800, 512),
++            (-512, 0xe000, -512),
++            (-513, 0xc7f8, -514),
++            (1_023, 0xdff8, 1_022),
++            (1_024, 0xb800, 1_024),
++            (16_384, 0x3800, 16_384),
++            (-16_384, 0x4000, -16_384),
++            (i16::MAX, 0x3ff8, 32_704),
++            (i16::MIN, 0x2000, i16::MIN),
++        ] {
++            assert_eq!(encode_ym3012_word(pcm), word);
++            assert_eq!(decode_ym3012_word(word | 0b111), Some(reconstructed));
++        }
++        assert_eq!(decode_ym3012_word(0x1fff), None);
++    }
++
++    #[test]
++    fn ym3012_pcm_roundtrip_floors_to_the_smallest_available_step() {
++        for pcm in i16::MIN..=i16::MAX {
++            let input = i32::from(pcm);
++            let step = [1, 2, 4, 8, 16, 32, 64]
++                .into_iter()
++                .find(|&step| (-512..=511).contains(&input.div_euclid(step)))
++                .unwrap();
++            let expected = input.div_euclid(step) * step;
++            let word = encode_ym3012_word(pcm);
++            assert_eq!(decode_ym3012_word(word), Some(expected as i16), "{input}");
++        }
++    }
++
++    #[test]
++    fn signed_word_truncation_preserves_msb_alignment() {
++        for (input, bits, output) in [
++            (0x1234, 16, 0x1234),
++            (i16::MIN, 16, i16::MIN),
++            (0x123f, 12, 0x1230),
++            (-1, 12, -16),
++            (0x12ff, 8, 0x1200),
++            (-128, 8, -256),
++            (0x3fff, 4, 0x3000),
++            (0x3fff, 0, 0x3000),
++            (i16::MAX, 32, i16::MAX),
++        ] {
++            assert_eq!(quantize_linear_i16(input, bits), output);
++        }
++    }
++
++    #[test]
++    fn cz_range_reference_and_tracking_are_independent() {
++        let mut instant = DacStage::default();
++        let mut syllabic = DacStage::default();
++        let i = ConverterProfile::CzProvisional {
++            range: CzRange::Instantaneous,
++            track: 0.0,
++        };
++        let s = ConverterProfile::CzProvisional {
++            range: CzRange::Syllabic,
++            track: 0.0,
++        };
++        for _ in 0..480 {
++            instant.step(0.9, 40_000.0, i, 0.0);
++            syllabic.step(0.9, 40_000.0, s, 0.0);
++        }
++        let quiet = 3.0 / 8_192.0;
++        instant.step(quiet, 40_000.0, i, 0.0);
++        syllabic.step(quiet, 40_000.0, s, 0.0);
++        assert_eq!(instant.held, quiet);
++        assert_eq!(syllabic.held, 0.0);
++        assert!(cz_quantize(0.35, 0.35, 1.0) > cz_quantize(0.35, 0.35, 0.0));
++        assert!(cz_quantize(0.75, 0.75, 1.0) < cz_quantize(0.75, 0.75, 0.0));
++    }
++
++    #[test]
++    fn prefilter_attenuates_a_tone_that_folds_into_the_passband() {
++        let rate = 48_000.0_f32;
++        let hold = 0.8_f32;
++        let profile = ConverterProfile::LinearSigned { bits: 16 };
++        let clock = rate / (1.0 + 31.0 * hold * hold);
++        let passband = 220.0;
++        let amplitude = |input_hz: f32| {
++            let mut stage = DacStage::default();
++            let (mut real, mut imaginary) = (0.0_f32, 0.0_f32);
++            for n in 0..52_800 {
++                let time = n as f32 / rate;
++                let input = 0.8 * (core::f32::consts::TAU * input_hz * time).sin();
++                let output = stage.step(input, rate, profile, hold);
++                if n >= 4_800 {
++                    let angle = core::f32::consts::TAU * passband * time;
++                    real += output * angle.cos();
++                    imaginary += output * angle.sin();
++                }
++            }
++            real.hypot(imaginary) / 24_000.0
++        };
++        let pass = amplitude(passband);
++        let folded = amplitude(clock + passband);
++        assert!(pass > 0.7 && folded < 0.5 * pass, "{pass} {folded}");
++    }
++
++    #[test]
++    fn reconstruction_moves_between_latches_and_bypass_resets_state() {
++        let mut stage = DacStage::default();
++        let profile = ConverterProfile::R2rOffset { skew: 0.0 };
++        for _ in 0..256 {
++            stage.step(0.5, 48_000.0, profile, 1.0);
++        }
++        // Start at a latch boundary. Keep changing input until the next latch.
++        stage.phase = 1.0 - 1.0 / 32.0;
++        let previous = stage.step(-0.5, 48_000.0, profile, 1.0);
++        let held = stage.held;
++        let output = stage.step(-0.5, 48_000.0, profile, 1.0);
++        assert_eq!(stage.held, held);
++        assert!(held < output && output < previous);
++        assert_eq!(
++            stage.step(-0.3, 48_000.0, ConverterProfile::Bypass, 1.0),
++            -0.3
++        );
++        assert_eq!(stage.step(0.0, 48_000.0, profile, 1.0), 0.0);
++    }
+ }
+diff --git a/crates/leviathan-dsp/src/fs77.rs b/crates/leviathan-dsp/src/fs77.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..4136e1e1536e7c56082100e522509dcc4ece59d1
+--- /dev/null
++++ b/crates/leviathan-dsp/src/fs77.rs
+@@ -0,0 +1,671 @@
++//! Four-operator phase modulation with generated OTIS waveforms and voiced and unvoiced formants.
++
++use crate::dac::{ConverterProfile, CzRange, DacStage};
++use crate::otis::sample_rcm_rom;
++use crate::voice::{approach, choice, cosine, noise, phase_step, sine, StateVariable};
++use crate::{fast_tanh, wrap_turns};
++use leviathan_core::SOUND_PARAMS;
++
++const MOD_RATIOS: [f32; 8] = [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 7.0];
++const DAC_SLEW_SECONDS: f32 = 0.005;
++
++/// Vowel formant centers `(F1_Hz, F2_Hz)` across `/u/ -> /o/ -> /a/ -> /e/ -> /i/`.
++const VOWEL_FORMANTS_HZ: [(f32, f32); 5] = [
++    (310.0, 870.0),   // /u/ ("oo")
++    (450.0, 1_050.0), // /o/ ("oh")
++    (730.0, 1_150.0), // /a/ ("ah")
++    (530.0, 1_840.0), // /e/ ("eh")
++    (290.0, 2_290.0), // /i/ ("ee")
++];
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Fs77Algorithm {
++    Cascade,
++    DualFormant,
++    RcmStack,
++    Vowel,
++}
++
++/// Interpolates fixed-Hz `(F1, F2)` vowel formant frequencies across `0.0 ..= 1.0`.
++#[inline]
++fn vowel_formant_pair_hz(norm: f32) -> (f32, f32) {
++    let scaled = norm.clamp(0.0, 1.0) * 4.0;
++    let idx = (scaled as usize).min(3);
++    let frac = scaled - (idx as f32);
++    let (a1, a2) = VOWEL_FORMANTS_HZ[idx];
++    let (b1, b2) = VOWEL_FORMANTS_HZ[idx + 1];
++    (a1 + (b1 - a1) * frac, a2 + (b2 - a2) * frac)
++}
++
++/// Seven FS1R-inspired operator shapes, indexed from the sine to the narrow resonant shape.
++#[inline]
++fn fs1r_operator_wave(shape: usize, p: f32) -> f32 {
++    match shape {
++        0 => sine(p),
++        1 => {
++            // All 1: warm sawtooth-like harmonic series
++            (0.72 * sine(p) + 0.34 * sine(2.0 * p) + 0.18 * sine(3.0 * p)) * 0.88
++        }
++        2 => {
++            // All 2: half-rectified zero-mean bright harmonic wave
++            let s = sine(p);
++            s.max(0.0) * 1.55 - 0.49
++        }
++        3 => {
++            // Odd 1: hollow square/woodwind odd harmonics
++            (0.76 * sine(p) + 0.28 * sine(3.0 * p) + 0.14 * sine(5.0 * p)) * 0.90
++        }
++        4 => {
++            // Odd 2: pinched odd-harmonic reed pulse
++            sine(p) * cosine(2.0 * p) * 1.32
++        }
++        5 => {
++            // Res 1: raised-cosine windowed resonant sync (3.5x)
++            0.5 * (1.0 - cosine(p)) * sine(3.5 * p) * 1.42
++        }
++        _ => {
++            // Res 2: higher formant-peaked sync (5.5x)
++            let window = 0.5 * (1.0 - cosine(p));
++            window * window * sine(5.5 * p) * 1.42
++        }
++    }
++}
++
++/// Continuous morph across the 7 FS1R spectral shapes (`wave_morph` in `0.0 ..= 1.0`).
++#[inline]
++fn morphed_fs1r_wave(wave_morph: f32, phase: f32) -> f32 {
++    let phase = wrap_turns(phase);
++    let scaled = wave_morph.clamp(0.0, 1.0) * 6.0;
++    let i0 = (scaled as usize).min(5);
++    let frac = scaled - (i0 as f32);
++    let w0 = fs1r_operator_wave(i0, phase);
++    if frac < 1e-4 {
++        w0
++    } else {
++        let w1 = fs1r_operator_wave(i0 + 1, phase);
++        w0 + (w1 - w0) * frac
++    }
++}
++
++/// Evaluates an FS1R-inspired Phase-Aligned Formant (`PAF`) grain locked to fundamental `fund_phase`
++/// with fixed-Hz formant carriers `(f1_phase, f2_phase)` and `skirt` bandwidth (`0.0 ..= 1.0`).
++#[inline]
++fn fs1r_formant_grain(
++    fund_phase: f32,
++    f1_phase: f32,
++    f2_phase: f32,
++    skirt: f32,
++    pm_mod: f32,
++) -> f32 {
++    let base_win = (0.5 * (1.0 - cosine(fund_phase))).clamp(0.0, 1.0);
++    let win2 = base_win * base_win;
++    let win4 = win2 * win2;
++    let win8 = win4 * win4;
++
++    let sk = skirt.clamp(0.0, 1.0);
++    let env_grain = if sk < 0.5 {
++        let u = sk * 2.0;
++        base_win + (win2 - base_win) * u
++    } else {
++        let u = (sk - 0.5) * 2.0;
++        win2 + (win8 - win2) * u
++    };
++    let grain_gain = 1.0 + 0.95 * sk;
++
++    let c1 = sine(f1_phase + pm_mod);
++    let c2 = sine(f2_phase + 0.65 * pm_mod);
++    env_grain * grain_gain * (0.68 * c1 + 0.44 * c2)
++}
++
++#[inline]
++fn cubic_curve(x: f32) -> f32 {
++    x * x * (0.45 + 0.55 * x)
++}
++
++#[derive(Clone, Debug, Default)]
++pub(super) struct Voice {
++    phases: [f32; 4],
++    formant_f1_phase: f32,
++    formant_f2_phase: f32,
++    amp_env: f32,
++    mod_env: f32,
++    breath_env: f32,
++    fb_z1: f32,
++    fb_z2: f32,
++    rcm_scan: f32,
++    unvoiced_svf: StateVariable,
++    filt1: StateVariable,
++    filt2: StateVariable,
++    cz_dac: DacStage,
++    ym_dac: DacStage,
++    cz_mix: f32,
++    ym_mix: f32,
++}
++
++const _: () = assert!(core::mem::size_of::<Voice>() <= 128);
++
++impl Voice {
++    #[inline]
++    fn decode_alg_and_ratio(value: f32) -> (Fs77Algorithm, f32) {
++        let zone = choice(value, 4);
++        let intra = value * 4.0 - zone as f32;
++        let alg = match zone {
++            0 => Fs77Algorithm::Cascade,
++            1 => Fs77Algorithm::DualFormant,
++            2 => Fs77Algorithm::RcmStack,
++            _ => Fs77Algorithm::Vowel,
++        };
++        (alg, MOD_RATIOS[choice(intra, MOD_RATIOS.len())])
++    }
++
++    #[inline]
++    pub(super) fn step(
++        &mut self,
++        hz: f32,
++        sample_rate: f32,
++        gate: bool,
++        trigger: Option<f32>,
++        params: &[f32; SOUND_PARAMS],
++        rng: &mut u32,
++    ) -> f32 {
++        let sr = sample_rate.max(8_000.0);
++        let base_hz = hz.clamp(16.0, sr * 0.44);
++
++        let [decay, fm_index, wave_rcm, formant_norm, skirt_unv, alg_ratio, filter_cut, reso_dac] =
++            *params;
++        let (alg, mod_ratio) = Self::decode_alg_and_ratio(alg_ratio);
++
++        if let Some(vel) = trigger {
++            self.amp_env = vel;
++            self.mod_env = 1.0;
++            self.breath_env = 1.0;
++        }
++
++        let amp_tau = if gate {
++            0.05 + 3.10 * decay * decay
++        } else {
++            0.012 + 0.85 * decay * decay
++        };
++        let mod_tau = 0.018 + 0.90 * decay;
++        let breath_tau = 0.010 + 0.22 * decay;
++        self.amp_env = approach(self.amp_env, 0.0, amp_tau, sr);
++        self.mod_env = approach(self.mod_env, 0.0, mod_tau, sr);
++        self.breath_env = approach(self.breath_env, 0.0, breath_tau, sr);
++
++        if self.amp_env < 1e-6 {
++            if self.amp_env != 0.0 || trigger.is_some() {
++                *self = Self::default();
++            }
++            return 0.0;
++        }
++
++        let prev_p0 = self.phases[0];
++        let op_ratios = [
++            1.0,
++            mod_ratio,
++            (mod_ratio * 2.0).min(12.0),
++            (mod_ratio * 1.5).min(12.0),
++        ];
++        for (ph, &r) in self.phases.iter_mut().zip(op_ratios.iter()) {
++            let f = (base_hz * r).clamp(16.0, sr * 0.44);
++            *ph = wrap_turns(*ph + phase_step(f, sr));
++        }
++
++        let (f1_hz, f2_hz) = vowel_formant_pair_hz(formant_norm);
++        let f1_step = phase_step(f1_hz, sr);
++        let f2_step = phase_step(f2_hz, sr);
++        if self.phases[0] < prev_p0 {
++            let elapsed = self.phases[0] / phase_step(base_hz, sr);
++            self.formant_f1_phase = elapsed * f1_step;
++            self.formant_f2_phase = elapsed * f2_step;
++        } else {
++            self.formant_f1_phase = wrap_turns(self.formant_f1_phase + f1_step);
++            self.formant_f2_phase = wrap_turns(self.formant_f2_phase + f2_step);
++        }
++
++        // SY77 RCM wavetable modulator (`otis::ROM` bank selected by `FormantHz` & `WaveRcm`)
++        self.rcm_scan = wrap_turns(self.rcm_scan + (0.35 + 2.4 * fm_index) / sr);
++        let rcm_mix = ((wave_rcm - 0.40) * (1.0 / 0.60)).clamp(0.0, 1.0);
++        let rcm_sig = if rcm_mix > 1e-4 {
++            let rcm_bank = choice(formant_norm, 4);
++            let rcm_frame = 1.0 - (2.0 * self.rcm_scan - 1.0).abs();
++            sample_rcm_rom(rcm_bank, rcm_frame, self.phases[3]) * rcm_mix
++        } else {
++            0.0
++        };
++
++        // Averaging two feedback samples attenuates rapid alternation in the loop.
++        let fb_amt = 0.08 + 0.34 * fm_index;
++        let fb_avg = 0.5 * (self.fb_z1 + self.fb_z2);
++        let shape_morph = (wave_rcm * 1.35).clamp(0.0, 1.0);
++        let op4 = morphed_fs1r_wave(
++            shape_morph,
++            self.phases[3] + fb_amt * fb_avg + 0.42 * rcm_sig,
++        );
++        self.fb_z2 = self.fb_z1;
++        self.fb_z1 = op4;
++
++        let idx_dyn = fm_index * (0.28 + 0.72 * self.mod_env) * 1.55;
++        let skirt = (skirt_unv * 1.25).clamp(0.0, 1.0);
++
++        let voiced = match alg {
++            Fs77Algorithm::Cascade => {
++                let op3 =
++                    morphed_fs1r_wave(shape_morph * 0.7, self.phases[2] + idx_dyn * 0.75 * op4);
++                let op2 = morphed_fs1r_wave(shape_morph * 0.4, self.phases[1] + idx_dyn * op3);
++                let fm_car = sine(self.phases[0] + idx_dyn * op2);
++                let sub_form = fs1r_formant_grain(
++                    self.phases[0],
++                    self.formant_f1_phase,
++                    self.formant_f2_phase,
++                    skirt,
++                    0.18 * op2,
++                );
++                0.78 * fm_car + 0.28 * sub_form
++            }
++            Fs77Algorithm::DualFormant => {
++                let op3 = morphed_fs1r_wave(shape_morph, self.phases[2] + idx_dyn * 0.85 * op4);
++                let fm_bell = sine(self.phases[0] + idx_dyn * 0.65 * op3) * self.mod_env;
++                let op2 = sine(self.phases[1]);
++                let vocal = fs1r_formant_grain(
++                    self.phases[0],
++                    self.formant_f1_phase,
++                    self.formant_f2_phase,
++                    skirt,
++                    idx_dyn * 0.32 * op2 + 0.25 * rcm_sig,
++                );
++                0.42 * fm_bell + 0.72 * vocal
++            }
++            Fs77Algorithm::RcmStack => {
++                let op3 = morphed_fs1r_wave(shape_morph * 0.8, self.phases[2]);
++                let mod_sum = (0.55 * op4 + 0.45 * op3 + 0.65 * rcm_sig) * idx_dyn * 0.65;
++                let c1 = sine(self.phases[0] + mod_sum);
++                let op2 = morphed_fs1r_wave(shape_morph * 0.5, self.phases[1]);
++                let c2 = fs1r_formant_grain(
++                    self.phases[0],
++                    self.formant_f1_phase,
++                    self.formant_f2_phase,
++                    skirt,
++                    0.25 * op2,
++                );
++                0.62 * c1 + 0.46 * c2
++            }
++            Fs77Algorithm::Vowel => {
++                let op2 =
++                    morphed_fs1r_wave(shape_morph * 0.6, self.phases[1] + 0.35 * idx_dyn * op4);
++                fs1r_formant_grain(
++                    self.phases[0],
++                    self.formant_f1_phase,
++                    self.formant_f2_phase,
++                    skirt,
++                    idx_dyn * 0.38 * op2 + 0.30 * rcm_sig,
++                )
++            }
++        };
++
++        // FS1R Unvoiced consonant / breath operator tuned to vowel `F2` (`skirt_unv > 0.35`)
++        let unv_amt = ((skirt_unv - 0.35) * (1.0 / 0.65)).clamp(0.0, 1.0);
++        let unvoiced = if unv_amt > 1e-4 {
++            let white = noise(rng);
++            let g_unv = ((core::f32::consts::PI * f2_hz) / sr).clamp(0.02, 0.65);
++            let bp = self.unvoiced_svf.step(white, g_unv, 0.22, 1.0).band;
++            bp * unv_amt * (0.30 + 0.70 * self.breath_env) * 0.85
++        } else {
++            0.0
++        };
++
++        let raw_mix = fast_tanh((voiced + unvoiced) * 1.12);
++
++        // SY77 Dual Coupled 12 dB Digital Filters (`filt1` + `filt2`, single step per filter)
++        let cut_norm = (filter_cut * 0.82 + 0.18 * self.mod_env).clamp(0.0, 1.0);
++        let cut_hz = 95.0 + cubic_curve(cut_norm) * 14_500.0;
++        let g_f = ((core::f32::consts::PI * cut_hz.min(sr * 0.42)) / sr).clamp(0.008, 0.72);
++
++        let lp_reso = if reso_dac < 0.50 {
++            (0.50 - reso_dac) * 2.0
++        } else {
++            0.0
++        };
++        let bp_ym_amt = if reso_dac > 0.50 {
++            (reso_dac - 0.50) * 2.0
++        } else {
++            0.0
++        };
++
++        let damping = (0.95 - 0.78 * lp_reso - 0.45 * bp_ym_amt).clamp(0.14, 1.10);
++        let g_f1 = if bp_ym_amt > 0.0 {
++            (g_f * (1.0 - 0.82 * bp_ym_amt + 0.36 * bp_ym_amt * bp_ym_amt)).clamp(0.005, 0.72)
++        } else {
++            g_f
++        };
++        let stage1 = self
++            .filt1
++            .step(raw_mix, g_f1, damping, 1.0 + 0.35 * lp_reso);
++        let in2 = stage1.low * (1.0 - bp_ym_amt) + stage1.high * bp_ym_amt;
++        let filtered = self.filt2.step(in2, g_f, damping, 1.0).low;
++
++        let converted = self.converter_mix(filtered, sr, reso_dac);
++        let makeup = 1.12 + 0.45 * bp_ym_amt;
++        let out = fast_tanh(converted * makeup) * self.amp_env;
++        if out.abs() < 1e-12 {
++            0.0
++        } else {
++            out
++        }
++    }
++
++    fn converter_mix(&mut self, dry: f32, rate: f32, control: f32) -> f32 {
++        let cz_target = (0.30 - control).max(0.0) / 0.30;
++        let ym_target = (control - 0.55).max(0.0) / 0.45;
++        self.cz_mix = approach(self.cz_mix, cz_target, DAC_SLEW_SECONDS, rate);
++        self.ym_mix = approach(self.ym_mix, ym_target, DAC_SLEW_SECONDS, rate);
++
++        // Separate histories let the outgoing profile finish its crossfade.
++        let mut output = dry;
++        if self.cz_mix > 0.0 {
++            let profile = ConverterProfile::CzProvisional {
++                range: CzRange::Syllabic,
++                track: 0.40,
++            };
++            let wet = self.cz_dac.step(dry, rate, profile, 0.0);
++            output += self.cz_mix * (wet - dry);
++        } else {
++            self.cz_dac = DacStage::default();
++        }
++        if self.ym_mix > 0.0 {
++            let wet = self.ym_dac.step(dry, rate, ConverterProfile::Ym3012Fp, 0.0);
++            output += self.ym_mix * (wet - dry);
++        } else {
++            self.ym_dac = DacStage::default();
++        }
++        output
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const FS77_DEFAULTS: [f32; SOUND_PARAMS] =
++        crate::MachineKind::Fs77FormantFm.spec().default_params();
++
++    #[test]
++    fn fs77_voice_fits_memory_budget_and_decays_cleanly() {
++        assert!(core::mem::size_of::<Voice>() <= 128);
++        let mut voice = Voice::default();
++        let mut rng = 0x1234_5678_u32;
++        let mut p = FS77_DEFAULTS;
++        p[0] = 0.18;
++        let first = voice.step(220.0, 48_000.0, false, Some(0.95), &p, &mut rng);
++        assert!(first.is_finite());
++        let mut peak = first.abs();
++        for _ in 0..16_000 {
++            let s = voice.step(220.0, 48_000.0, false, None, &p, &mut rng);
++            assert!(s.is_finite());
++            peak = peak.max(s.abs());
++        }
++        assert!(peak > 0.10);
++        assert!(voice.amp_env < 0.05);
++    }
++
++    #[test]
++    fn all_four_algorithms_produce_distinct_bounded_audio() {
++        let mut energies = [0.0_f32; 4];
++        for (alg_idx, slot) in energies.iter_mut().enumerate() {
++            let mut v = Voice::default();
++            let mut rng = 0xCAFE_BABE_u32;
++            let mut p = FS77_DEFAULTS;
++            p[2] = 0.85;
++            p[5] = (alg_idx as f32 + 0.12) * 0.25;
++            for i in 0..1_024 {
++                let s = v.step(
++                    110.0,
++                    48_000.0,
++                    true,
++                    if i == 0 { Some(0.9) } else { None },
++                    &p,
++                    &mut rng,
++                );
++                assert!(s.is_finite() && (-1.1..=1.1).contains(&s));
++                *slot += s.abs();
++            }
++            assert!(*slot > 5.0);
++        }
++        for (a, energy) in energies.iter().enumerate() {
++            for other in &energies[a + 1..] {
++                assert!((energy - other).abs() > 0.25, "{energies:?}");
++            }
++        }
++    }
++
++    #[test]
++    fn vowel_morph_shifts_energy_into_the_upper_formant() {
++        let mut p_u = FS77_DEFAULTS;
++        p_u[1] = 0.05;
++        p_u[3] = 0.00;
++        p_u[4] = 0.20;
++        p_u[5] = 0.85;
++        p_u[6] = 0.95;
++        p_u[7] = 0.50;
++
++        let mut p_i = p_u;
++        p_i[3] = 1.00;
++
++        let mut vu = Voice::default();
++        let mut vi = Voice::default();
++        let mut rng_u = 1_u32;
++        let mut rng_i = 1_u32;
++
++        let mut prev_u = 0.0_f32;
++        let mut prev_i = 0.0_f32;
++        let mut hf_u = 0.0_f32;
++        let mut tot_u = 1e-9_f32;
++        let mut hf_i = 0.0_f32;
++        let mut tot_i = 1e-9_f32;
++
++        for k in 0..4_096 {
++            let trig = if k == 0 { Some(0.95) } else { None };
++            let su = vu.step(110.0, 48_000.0, true, trig, &p_u, &mut rng_u);
++            let si = vi.step(110.0, 48_000.0, true, trig, &p_i, &mut rng_i);
++            if k >= 256 {
++                let du = su - prev_u;
++                let di = si - prev_i;
++                hf_u += du * du;
++                tot_u += su * su;
++                hf_i += di * di;
++                tot_i += si * si;
++            }
++            prev_u = su;
++            prev_i = si;
++        }
++        assert!((hf_i / tot_i) > (hf_u / tot_u) * 1.6);
++    }
++
++    #[test]
++    fn unvoiced_consonant_pair_adds_high_frequency_breath_transient() {
++        let mut p_voiced = FS77_DEFAULTS;
++        p_voiced[3] = 0.90;
++        p_voiced[4] = 0.80;
++        p_voiced[5] = 0.85;
++        p_voiced[6] = 0.92;
++        p_voiced[7] = 0.50;
++
++        let mut p_unv = p_voiced;
++        p_unv[4] = 1.0;
++
++        let mut vv = Voice::default();
++        let mut vu = Voice::default();
++        let mut r1 = 0xABCD_1234_u32;
++        let mut r2 = 0xABCD_1234_u32;
++        let mut diff_e = 0.0_f32;
++
++        for k in 0..2_048 {
++            let trig = if k == 0 { Some(0.95) } else { None };
++            let a = vv.step(146.83, 48_000.0, true, trig, &p_voiced, &mut r1);
++            let b = vu.step(146.83, 48_000.0, true, trig, &p_unv, &mut r2);
++            let d = b - a;
++            diff_e += d * d;
++        }
++        assert!(diff_e > 0.5);
++    }
++
++    #[test]
++    fn filter_modes_and_converter_profiles_are_bounded_under_max_feedback() {
++        for control in [0.0, 0.5, 1.0] {
++            let mut voice = Voice::default();
++            let mut rng = 0x7777_7777_u32;
++            let params = [0.65, 1.0, 1.0, 0.75, 0.80, 0.10, 0.55, control];
++            for sample in 0..16_000 {
++                let output = voice.step(
++                    330.0,
++                    48_000.0,
++                    sample < 8_000,
++                    (sample == 0).then_some(1.0),
++                    &params,
++                    &mut rng,
++                );
++                assert!(output.is_finite() && (-1.0..=1.0).contains(&output));
++            }
++        }
++    }
++
++    #[test]
++    fn rcm_modulation_changes_audio_with_operator_shape_held_fixed() {
++        let mut params = FS77_DEFAULTS;
++        params[2] = 0.80;
++        params[5] = 0.60;
++        params[7] = 0.50;
++        let mut a = Voice::default();
++        let mut b = Voice::default();
++        let (mut rng_a, mut rng_b) = (1, 1);
++        let mut difference = 0.0;
++        for sample in 0..4_096 {
++            let trigger = (sample == 0).then_some(0.95);
++            let x = a.step(165.0, 48_000.0, true, trigger, &params, &mut rng_a);
++            let mut stronger = params;
++            stronger[2] = 1.0;
++            let y = b.step(165.0, 48_000.0, true, trigger, &stronger, &mut rng_b);
++            difference += (x - y) * (x - y);
++        }
++        assert!(difference > 0.05, "{difference}");
++    }
++
++    #[test]
++    fn vowel_carrier_is_fixed_and_the_skirt_widens_with_grain_shaping() {
++        let mut params = FS77_DEFAULTS;
++        params[1] = 0.0;
++        params[2] = 0.0;
++        params[3] = 1.0;
++        params[4] = 0.20;
++        params[5] = 0.85;
++        params[6] = 0.95;
++        params[7] = 0.50;
++        // The /i/ upper formant is 2,290 Hz. Pitch determines the harmonic spacing.
++        for pitch in [55.0, 110.0, 220.0, 440.0] {
++            let mut voice = Voice::default();
++            let mut rng = 1;
++            let (mut center, mut above, mut below) = ([0.0; 2], [0.0; 2], [0.0; 2]);
++            let harmonic = (2_290.0_f32 / pitch + 0.5) as u32;
++            for n in 0..9_600 {
++                let output = voice.step(
++                    pitch,
++                    48_000.0,
++                    true,
++                    (n == 0).then_some(0.95),
++                    &params,
++                    &mut rng,
++                );
++                if n >= 1_600 {
++                    for (bin, frequency) in [
++                        (&mut center, harmonic as f32 * pitch),
++                        (&mut above, (harmonic as f32 + 2.0) * pitch),
++                        (&mut below, (harmonic as f32 - 2.0) * pitch),
++                    ] {
++                        let phase = (n as f32 * frequency / 48_000.0) % 1.0;
++                        bin[0] += output * sine(phase);
++                        bin[1] += output * cosine(phase);
++                    }
++                }
++            }
++            let energy = |bin: [f32; 2]| bin[0] * bin[0] + bin[1] * bin[1];
++            assert!(
++                energy(center) > 4.0 * energy(above).max(energy(below)),
++                "{pitch}"
++            );
++        }
++        // Measure an off-center sideband relative to the formant carrier in the grain.
++        let sideband_ratio = |skirt| {
++            let (mut main, mut side) = (0.0, 0.0);
++            for n in 0..256 {
++                let phase = n as f32 / 256.0;
++                let grain = fs1r_formant_grain(phase, 0.0, 16.0 * phase, skirt, 0.0);
++                main += grain * sine(16.0 * phase);
++                side += grain * sine(19.0 * phase);
++            }
++            (side / main).abs()
++        };
++        assert!(sideband_ratio(1.0) > sideband_ratio(0.0) + 0.1);
++    }
++
++    #[test]
++    fn converter_crossfades_ignore_tiny_edits_at_both_boundaries() {
++        for (before, after) in [(0.30, 0.299_99), (0.549_99, 0.550_01)] {
++            let mut voice = Voice::default();
++            let mut params = FS77_DEFAULTS;
++            params[7] = before;
++            let mut switched_params = params;
++            switched_params[7] = after;
++            let mut rng = 1;
++            for sample in 0..4_096 {
++                let mut switched = voice.clone();
++                let mut switched_rng = rng;
++                let trigger = (sample == 0).then_some(0.95);
++                let unchanged = voice.step(220.0, 48_000.0, true, trigger, &params, &mut rng);
++                let changed = switched.step(
++                    220.0,
++                    48_000.0,
++                    true,
++                    trigger,
++                    &switched_params,
++                    &mut switched_rng,
++                );
++                assert!(
++                    (changed - unchanged).abs() < 0.002,
++                    "{sample} {before} {after}"
++                );
++            }
++        }
++        let mut voice = Voice::default();
++        for _ in 0..4_800 {
++            voice.converter_mix(0.6, 48_000.0, 0.0);
++        }
++        assert!(voice.cz_mix > 0.99);
++        voice.converter_mix(0.6, 48_000.0, 1.0);
++        assert!(voice.cz_mix > 0.99 && (0.0..0.01).contains(&voice.ym_mix));
++        for _ in 0..4_800 {
++            voice.converter_mix(0.6, 48_000.0, 1.0);
++        }
++        assert!(voice.cz_mix < 1e-4 && voice.ym_mix > 0.99);
++    }
++
++    #[test]
++    fn zero_velocity_is_silent_and_release_clears_the_voice() {
++        let mut voice = Voice::default();
++        let mut rng = 1;
++        let mut params = FS77_DEFAULTS;
++        params[0] = 0.0;
++        assert_eq!(
++            voice.step(220.0, 48_000.0, true, Some(0.0), &params, &mut rng),
++            0.0
++        );
++        voice.step(220.0, 48_000.0, true, Some(1.0), &params, &mut rng);
++        for _ in 0..12_000 {
++            voice.step(220.0, 48_000.0, false, None, &params, &mut rng);
++        }
++        assert_eq!(voice.phases, [0.0; 4]);
++        assert_eq!(
++            voice.step(220.0, 48_000.0, false, None, &params, &mut rng),
++            0.0
++        );
++    }
++}
+diff --git a/crates/leviathan-dsp/src/lib.rs b/crates/leviathan-dsp/src/lib.rs
+index 4779e1a9387feec665e96c374adca12d619769a5..bffdffb4210cb08e7402ebd614db7598ab482437 100644
+--- a/crates/leviathan-dsp/src/lib.rs
++++ b/crates/leviathan-dsp/src/lib.rs
+@@ -3,8 +3,9 @@
+ mod bbus;
+ mod bender;
+ mod cz;
+-mod dac;
++pub mod dac;
+ pub mod fm;
++mod fs77;
+ mod master;
+ mod otis;
+ mod otis_twin;
+@@ -30,7 +31,7 @@ pub use spec::{
+     DEFAULT_LANE_PATCHES, MACHINE_SPECS,
+ };
+
+-pub const MACHINE_COUNT: usize = 15;
++pub const MACHINE_COUNT: usize = 16;
+ pub const ALL_LANES_AUDIBLE: u8 = (1 << NUM_LANES) - 1;
+
+ #[derive(Clone, Copy, Debug, PartialEq)]
+@@ -117,6 +118,7 @@ pub enum MachineKind {
+     OtisTranswave = 12,
+     ByteBusR2r = 13,
+     OtisTwin = 14,
++    Fs77FormantFm = 15,
+ }
+
+ impl MachineKind {
+@@ -148,6 +150,7 @@ impl MachineKind {
+         Self::OtisTranswave,
+         Self::ByteBusR2r,
+         Self::OtisTwin,
++        Self::Fs77FormantFm,
+     ];
+
+     pub const fn from_id(id: usize) -> Self {
+@@ -173,6 +176,7 @@ impl MachineKind {
+                 | Self::OtisTranswave
+                 | Self::ByteBusR2r
+                 | Self::OtisTwin
++                | Self::Fs77FormantFm
+         )
+     }
+
+@@ -339,6 +343,7 @@ struct VoiceState {
+     otis: otis::Voice,
+     otis_twin: otis_twin::TwinVoice,
+     bbus: bbus::Voice,
++    fs77: fs77::Voice,
+     active_machine: Option<MachineKind>,
+     note_pitch: f32,
+     note_lock: SoundLock,
+@@ -366,6 +371,7 @@ impl Default for VoiceState {
+             otis: otis::Voice::default(),
+             otis_twin: otis_twin::TwinVoice::default(),
+             bbus: bbus::Voice::default(),
++            fs77: fs77::Voice::default(),
+             active_machine: None,
+             note_pitch: 0.0,
+             note_lock: SoundLock::default(),
+@@ -390,6 +396,7 @@ impl VoiceState {
+         self.otis = otis::Voice::default();
+         self.otis_twin = otis_twin::TwinVoice::default();
+         self.bbus = bbus::Voice::default();
++        self.fs77 = fs77::Voice::default();
+         self.active_machine = None;
+     }
+
+@@ -457,6 +464,9 @@ impl VoiceState {
+                 MachineKind::ByteBusR2r => {
+                     self.bbus.step(hz, sample_rate, gate, trigger, bus_word, &params)
+                 }
++                MachineKind::Fs77FormantFm => {
++                    self.fs77.step(hz, sample_rate, gate, trigger, &params, &mut self.rng)
++                }
+                 _ => 0.0,
+             };
+         }
+@@ -994,6 +1004,7 @@ mod tests {
+             (MachineKind::OtisTranswave, 12, "otis", "OTIS"),
+             (MachineKind::ByteBusR2r, 13, "bbus", "BBUS"),
+             (MachineKind::OtisTwin, 14, "otis2", "OT2"),
++            (MachineKind::Fs77FormantFm, 15, "fs77", "FS77"),
+         ] {
+             assert_eq!((kind.spec().id, kind.slug(), kind.short_name()), (id, slug, badge));
+         }
+diff --git a/crates/leviathan-dsp/src/otis.rs b/crates/leviathan-dsp/src/otis.rs
+index 45d5b4c2c1b7e71777c72b9092c5a07b69002826..7162b7bbe09dc14ea96b751056275b4dcee1fe13 100644
+--- a/crates/leviathan-dsp/src/otis.rs
++++ b/crates/leviathan-dsp/src/otis.rs
+@@ -189,6 +189,15 @@ fn scan_sample(table: usize, frame: u32, phase: u32) -> f32 {
+     pair[0] + frame_frac * (pair[1] - pair[0])
+ }
+
++/// Read-only wavetable modulation tap for FS77.
++#[inline]
++pub(super) fn sample_rcm_rom(table: usize, frame: f32, phase: f32) -> f32 {
++    let frame_end = (FRAMES - 1) as u32 * FRACTION;
++    let frame = (frame.clamp(0.0, 1.0) * frame_end as f32 + 0.5) as u32;
++    let phase = ((wrap_turns(phase) * CYCLE as f32) as u32) & (CYCLE - 1);
++    scan_sample(table.min(TABLES - 1), frame, phase) * (1.0 / 32_768.0)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/crates/leviathan-dsp/src/spec.rs b/crates/leviathan-dsp/src/spec.rs
+index 204af43ca559befbf1bf8480847cde73b092d337..95c32fc59ed1b27caccad606d3d7c2cd3711fd31 100644
+--- a/crates/leviathan-dsp/src/spec.rs
++++ b/crates/leviathan-dsp/src/spec.rs
+@@ -295,6 +295,23 @@ pub const MACHINE_SPECS: [MachineSpec; MACHINE_COUNT] = [
+             ParamSpec::new("ModeGrit", 0.45),
+         ],
+     },
++    MachineSpec {
++        kind: MachineKind::Fs77FormantFm,
++        id: 15,
++        slug: "fs77",
++        badge: "FS77",
++        name: "FS77 Formant FM",
++        params: [
++            ParamSpec::new("Decay", 0.45),
++            ParamSpec::new("FmIndex", 0.38),
++            ParamSpec::new("WaveRcm", 0.25),
++            ParamSpec::new("FormantHz", 0.42),
++            ParamSpec::new("SkirtUnv", 0.30),
++            ParamSpec::new("AlgRatio", 0.35),
++            ParamSpec::new("FilterCut", 0.68),
++            ParamSpec::new("ResoDac", 0.32),
++        ],
++    },
+ ];
+
+ #[inline]
