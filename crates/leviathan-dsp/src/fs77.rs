@@ -1,7 +1,7 @@
 //! Four-operator phase modulation with generated OTIS waveforms and voiced and unvoiced formants.
 
 use crate::dac::{ConverterProfile, CzRange, DacStage};
-use crate::otis::sample_rcm_rom;
+use crate::otis::sample_rom;
 use crate::voice::{approach, choice, cosine, noise, phase_step, sine, StateVariable};
 use crate::{fast_tanh, wrap_turns};
 use leviathan_core::SOUND_PARAMS;
@@ -229,7 +229,7 @@ impl Voice {
         let rcm_sig = if rcm_mix > 1e-4 {
             let rcm_bank = choice(formant_norm, 4);
             let rcm_frame = 1.0 - (2.0 * self.rcm_scan - 1.0).abs();
-            sample_rcm_rom(rcm_bank, rcm_frame, self.phases[3]) * rcm_mix
+            sample_rom(rcm_bank, rcm_frame, self.phases[3]) * rcm_mix
         } else {
             0.0
         };
