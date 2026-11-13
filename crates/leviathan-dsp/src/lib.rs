@@ -26,7 +26,7 @@ use sampler::{SampleBank, VarClockSamplerVoice};
 
 pub use bbus::{ByteBusReceiver, ByteBusSource};
 pub use bender::{BenderParams, BENDER_MAX_SHIFT_HZ};
-pub use master::{MasterPeaks, StereoDelay};
+pub use master::{DelayMode, MasterPeaks, StereoDelay};
 pub use spec::{
     default_lane_patches, machine_spec, LanePatch, MachineSpec, ParamSpec, DEFAULT_LANE_MACHINES,
     DEFAULT_LANE_PATCHES, MACHINE_SPECS,
@@ -671,6 +671,10 @@ impl SynthRack {
 
     pub fn set_master_send(&mut self, send: f32) {
         self.master.set_send(send);
+    }
+
+    pub fn set_delay_mode(&mut self, mode: DelayMode) {
+        self.master.set_delay_mode(mode);
     }
 
     pub fn set_bender_params(&mut self, params: BenderParams) {

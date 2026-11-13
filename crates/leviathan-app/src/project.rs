@@ -9,7 +9,7 @@ use leviathan_core::{
     ROWS_PER_PATTERN, SOUND_PARAMS,
 };
 use leviathan_dsp::sampler::{SampleBank, SampleRegion, MAX_WAVE_LEN, NUM_BANKS};
-use leviathan_dsp::{default_lane_patches, BenderParams, LanePatch, MachineKind};
+use leviathan_dsp::{default_lane_patches, BenderParams, DelayMode, LanePatch, MachineKind};
 use serde::{Deserialize, Serialize};
 
 use crate::lane_mix::LaneMix;
@@ -26,6 +26,7 @@ pub struct CustomShader {
 pub struct Project {
     pub bpm: f64,
     pub master_send: f32,
+    pub delay_mode: DelayMode,
     pub bender_params: BenderParams,
     pub lane_mix: LaneMix,
     pub lane_patches: [LanePatch; NUM_LANES],
@@ -56,6 +57,8 @@ struct ProjectFile {
     bpm: f64,
     #[serde(default)]
     master_send: f32,
+    #[serde(default, with = "DelayModeDef")]
+    delay_mode: DelayMode,
     #[serde(default, with = "BenderParamsDef")]
     bender_params: BenderParams,
     #[serde(flatten)]
@@ -71,6 +74,13 @@ struct ProjectFile {
     sample_regions: [StoredSampleRegion; NUM_BANKS],
     #[serde(default)]
     custom_shader: Option<CustomShader>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "DelayMode", rename_all = "snake_case")]
+enum DelayModeDef {
+    Slapback,
+    LongPingPong,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -233,6 +243,7 @@ impl ProjectFile {
         Ok(Project {
             bpm: self.bpm,
             master_send: self.master_send,
+            delay_mode: self.delay_mode,
             bender_params: self.bender_params,
             lane_mix: self.lane_mix,
             lane_patches,
@@ -301,6 +312,7 @@ pub fn save(path: &Path, project: Project) -> Result<(), String> {
         version: PROJECT_VERSION,
         bpm: project.bpm,
         master_send: project.master_send,
+        delay_mode: project.delay_mode,
         bender_params: project.bender_params,
         lane_mix: project.lane_mix,
         lane_patches: Some(core::array::from_fn(|lane| {
@@ -415,6 +427,7 @@ mod tests {
         let snapshot = |bpm, master_send, selected_pattern, lane_mix| Project {
             bpm,
             master_send,
+            delay_mode: DelayMode::LongPingPong,
             bender_params,
             lane_patches,
             lane_mix,
@@ -445,6 +458,7 @@ mod tests {
         fs::remove_file(path).unwrap();
         assert_eq!(project.bpm.to_bits(), bpm.to_bits());
         assert_eq!(project.master_send.to_bits(), send.to_bits());
+        assert_eq!(project.delay_mode, DelayMode::LongPingPong);
         assert_eq!(project.bender_params, bender_params);
         assert_eq!(project.lane_patches, lane_patches);
         assert_eq!(project.lane_mix, mix);
@@ -478,6 +492,7 @@ mod tests {
             version: PROJECT_VERSION + 1,
             bpm: 120.0,
             master_send: 0.0,
+            delay_mode: Default::default(),
             bender_params: Default::default(),
             lane_patches: None,
             lane_mix: LaneMix::default(),
@@ -508,6 +523,7 @@ mod tests {
             version: PROJECT_VERSION,
             bpm: 120.0,
             master_send: 0.0,
+            delay_mode: Default::default(),
             bender_params: Default::default(),
             lane_patches: None,
             lane_mix: LaneMix::default(),
@@ -548,6 +564,7 @@ mod tests {
             Project {
                 bpm: 120.0,
                 master_send: 0.0,
+                delay_mode: Default::default(),
                 bender_params: Default::default(),
                 lane_patches: patches,
                 lane_mix: LaneMix::default(),
@@ -574,6 +591,7 @@ mod tests {
             version: PROJECT_VERSION,
             bpm: 120.0,
             master_send: 0.5,
+            delay_mode: Default::default(),
             bender_params: Default::default(),
             lane_patches: None,
             lane_mix: LaneMix {
@@ -592,6 +610,7 @@ mod tests {
         let fields = json.as_object_mut().unwrap();
         for field in [
             "master_send",
+            "delay_mode",
             "bender_params",
             "mute_mask",
             "solo_mask",
@@ -616,6 +635,7 @@ mod tests {
         let old: ProjectFile = serde_json::from_value(json.clone()).unwrap();
         let old = old.into_project().unwrap();
         assert_eq!(old.master_send, 0.0);
+        assert_eq!(old.delay_mode, DelayMode::Slapback);
         assert_eq!(old.bender_params, BenderParams::default());
         assert_eq!(old.lane_mix, LaneMix::default());
         assert_eq!(old.sample_regions, [SampleRegion::default(); NUM_BANKS]);
@@ -690,6 +710,7 @@ mod tests {
             Project {
                 bpm: 120.0,
                 master_send: 0.25,
+                delay_mode: Default::default(),
                 bender_params: Default::default(),
                 lane_patches: default_lane_patches(),
                 lane_mix,

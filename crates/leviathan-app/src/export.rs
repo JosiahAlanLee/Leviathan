@@ -193,11 +193,16 @@ fn render(
     rack.set_lane_patches(project.lane_patches);
     rack.reset_voices();
     rack.set_bender_params(project.bender_params);
+    rack.set_delay_mode(project.delay_mode);
     rack.reset_master(project.master_send);
 
     let mut stems = [[0.0; 2]; NUM_LANES];
     let mut stem_delays: Option<Box<[StereoDelay; NUM_LANES]>> = plan.settings.stems.then(|| {
-        std::iter::repeat_with(|| StereoDelay::new(plan.settings.sample_rate as f32))
+        std::iter::repeat_with(|| {
+            let mut delay = StereoDelay::new(plan.settings.sample_rate as f32);
+            delay.set_mode(project.delay_mode);
+            delay
+        })
             .take(NUM_LANES)
             .collect::<Vec<_>>()
             .into_boxed_slice()
@@ -357,6 +362,7 @@ mod tests {
         Project {
             bpm: 120.0,
             master_send: 0.3,
+            delay_mode: Default::default(),
             bender_params: Default::default(),
             lane_patches: default_lane_patches(),
             lane_mix: LaneMix::default(),

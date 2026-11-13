@@ -1,8 +1,26 @@
 use eframe::egui;
-use leviathan_dsp::{BenderParams, MasterPeaks, BENDER_MAX_SHIFT_HZ};
+use leviathan_dsp::{BenderParams, DelayMode, MasterPeaks, BENDER_MAX_SHIFT_HZ};
 
 const LEVEL_FLOOR: f32 = 0.001;
 const CLIP_HOLD_SECONDS: f64 = 1.0;
+
+pub fn draw_delay_mode(ui: &mut egui::Ui, mode: &mut DelayMode) -> bool {
+    let before = *mode;
+    let label = match mode {
+        DelayMode::Slapback => "Slapback",
+        DelayMode::LongPingPong => "Long Ping-Pong",
+    };
+    egui::ComboBox::from_label("Delay mode")
+        .selected_text(label)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(mode, DelayMode::Slapback, "Slapback");
+            ui.selectable_value(mode, DelayMode::LongPingPong, "Long Ping-Pong")
+                .on_hover_text("Fixed 125 / 166.7 ms taps through 96 kHz");
+        })
+        .response
+        .on_hover_text("Switching modes clears the delay tail.");
+    *mode != before
+}
 
 pub fn draw_bender(ui: &mut egui::Ui, params: &mut BenderParams) -> bool {
     let before = *params;

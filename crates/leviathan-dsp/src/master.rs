@@ -1,8 +1,10 @@
 use crate::bender::{BenderParams, SpoonBenderBus};
 
-const DELAY_FRAMES: usize = 8192;
-const DELAY_SECONDS: [f32; 2] = [0.017, 0.021];
-const FEEDBACK: f32 = 0.28;
+const DELAY_WORDS: usize = 16_384;
+const SLAPBACK_FRAMES: usize = DELAY_WORDS / 2;
+const SLAPBACK_SECONDS: [f32; 2] = [0.017, 0.021];
+const LONG_SECONDS: [f32; 2] = [0.125, 1.0 / 6.0];
+const Q14_SCALE: f32 = 16_384.0;
 pub(super) const MAX_SEND: f32 = 0.45;
 const KNEE: f32 = 0.8;
 
@@ -22,40 +24,92 @@ impl MasterPeaks {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DelayMode {
+    #[default]
+    Slapback,
+    LongPingPong,
+}
+
+impl DelayMode {
+    fn offsets(self, sample_rate: f32) -> [usize; 2] {
+        let (seconds, rate, frames) = match self {
+            Self::Slapback => (SLAPBACK_SECONDS, sample_rate, SLAPBACK_FRAMES),
+            Self::LongPingPong => (
+                LONG_SECONDS,
+                sample_rate.min(DELAY_WORDS as f32 / LONG_SECONDS[1]),
+                DELAY_WORDS,
+            ),
+        };
+        seconds.map(|seconds| ((seconds * rate + 0.5) as usize).clamp(1, frames))
+    }
+}
+
 /// The shared stereo delay used by the master and individual export stems.
 pub struct StereoDelay {
-    delay: [[f32; 2]; DELAY_FRAMES],
+    // Slapback stores two f32 bit patterns per frame. Long Ping-Pong
+    // stores one packed pair of signed Q1.14 samples in the same pool.
+    delay: [u32; DELAY_WORDS],
     offsets: [usize; 2],
     cursor: usize,
+    sample_rate: f32,
+    mode: DelayMode,
 }
+
+const _: () = assert!(core::mem::size_of::<StereoDelay>() <= 65_600);
 
 impl StereoDelay {
     pub fn new(sample_rate: f32) -> Self {
-        let offsets = DELAY_SECONDS
-            .map(|seconds| ((seconds * sample_rate + 0.5) as usize).clamp(1, DELAY_FRAMES));
+        let mode = DelayMode::default();
         Self {
-            delay: [[0.0; 2]; DELAY_FRAMES],
-            offsets,
+            delay: [0; DELAY_WORDS],
+            offsets: mode.offsets(sample_rate),
             cursor: 0,
+            sample_rate,
+            mode,
+        }
+    }
+
+    pub fn set_mode(&mut self, mode: DelayMode) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.offsets = mode.offsets(self.sample_rate);
+            self.clear();
         }
     }
 
     fn clear(&mut self) {
-        self.delay.fill([0.0; 2]);
+        self.delay.fill(0);
         self.cursor = 0;
     }
 
     fn process(&mut self, input: [f32; 2]) -> [f32; 2] {
         let [send_l, send_r] = input.map(finite_sample);
-        let left = self.delay[(self.cursor + DELAY_FRAMES - self.offsets[0]) % DELAY_FRAMES][0];
-        let right = self.delay[(self.cursor + DELAY_FRAMES - self.offsets[1]) % DELAY_FRAMES][1];
-        // An input first reaches the opposite channel, and each echo crosses back.
-        self.delay[self.cursor] = [
-            flush_tail(send_r + right * FEEDBACK),
-            flush_tail(send_l + left * FEEDBACK),
-        ];
-        self.cursor = (self.cursor + 1) % DELAY_FRAMES;
-        [left, right]
+        let [left_offset, right_offset] = self.offsets;
+        // Each input and each pass of feedback crosses to the opposite side.
+        let (echo, frames) = match self.mode {
+            DelayMode::Slapback => {
+                let l = (self.cursor + SLAPBACK_FRAMES - left_offset) % SLAPBACK_FRAMES;
+                let r = (self.cursor + SLAPBACK_FRAMES - right_offset) % SLAPBACK_FRAMES;
+                let left = f32::from_bits(self.delay[2 * l]);
+                let right = f32::from_bits(self.delay[2 * r + 1]);
+                self.delay[2 * self.cursor] = flush_tail(send_r + 0.28 * right).to_bits();
+                self.delay[2 * self.cursor + 1] = flush_tail(send_l + 0.28 * left).to_bits();
+                ([left, right], SLAPBACK_FRAMES)
+            }
+            DelayMode::LongPingPong => {
+                let l = (self.cursor + DELAY_WORDS - left_offset) % DELAY_WORDS;
+                let r = (self.cursor + DELAY_WORDS - right_offset) % DELAY_WORDS;
+                let left = f32::from(self.delay[l] as i16) / Q14_SCALE;
+                let right = f32::from((self.delay[r] >> 16) as i16) / Q14_SCALE;
+                let next_l = ((send_r + 0.48 * right) * Q14_SCALE) as i16 as u16;
+                let next_r = ((send_l + 0.48 * left) * Q14_SCALE) as i16 as u16;
+                self.delay[self.cursor] = u32::from(next_l) | (u32::from(next_r) << 16);
+                ([left, right], DELAY_WORDS)
+            }
+        };
+        self.cursor = (self.cursor + 1) & (frames - 1);
+        echo
     }
 
     pub(super) fn mix(&mut self, dry: [f32; 2], send: [f32; 2]) -> [f32; 2] {
@@ -100,6 +154,10 @@ impl MasterBus {
 
     pub(super) fn set_bender_params(&mut self, params: BenderParams) {
         self.bender.set_params(params);
+    }
+
+    pub(super) fn set_delay_mode(&mut self, mode: DelayMode) {
+        self.delay.set_mode(mode);
     }
 
     pub(super) fn reset(&mut self, send: f32) {
@@ -213,6 +271,35 @@ mod tests {
     }
 
     #[test]
+    fn long_ping_pong_crosses_channels_and_keeps_the_delay_ratio() {
+        for (rate, left_frames, right_frames) in [
+            (44_100.0, 5513, 7350),
+            (48_000.0, 6000, 8000),
+            (96_000.0, 12000, 16000),
+            (192_000.0, 12288, 16384),
+        ] {
+            let mut delay = StereoDelay::new(rate);
+            delay.set_mode(DelayMode::LongPingPong);
+            assert_eq!(delay.process([-0.5, 0.0]), [0.0; 2]);
+            for _ in 1..right_frames {
+                assert_eq!(delay.process([0.0; 2]), [0.0; 2]);
+            }
+            assert_eq!(delay.process([0.0; 2]), [0.0, -0.5]);
+            for _ in 1..left_frames {
+                assert_eq!(delay.process([0.0; 2]), [0.0; 2]);
+            }
+            let [left, right] = delay.process([0.0; 2]);
+            assert!((left + 0.24).abs() < 1.0 / Q14_SCALE);
+            assert_eq!(right, 0.0);
+
+            delay.set_mode(DelayMode::Slapback);
+            for _ in 0..SLAPBACK_FRAMES {
+                assert_eq!(delay.process([0.0; 2]), [0.0; 2]);
+            }
+        }
+    }
+
+    #[test]
     fn limiter_links_gain_and_records_overs_before_limiting() {
         let mut bus = MasterBus::new(48_000.0);
         let [left, right] = render(&mut bus, [1.5, -0.5]);
@@ -236,7 +323,7 @@ mod tests {
         render(&mut bus, [1.5, 0.0]);
         bus.reset(0.0);
         assert_eq!(bus.peaks, MasterPeaks::default());
-        for _ in 0..DELAY_FRAMES {
+        for _ in 0..SLAPBACK_FRAMES {
             assert_eq!(render(&mut bus, [0.0; 2]), [0.0; 2]);
         }
     }
