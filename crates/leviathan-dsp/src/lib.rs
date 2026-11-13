@@ -3,7 +3,7 @@
 mod bbus;
 mod bender;
 mod cz;
-mod dac;
+pub mod dac;
 pub mod fm;
 mod master;
 mod otis;

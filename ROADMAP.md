@@ -200,7 +200,7 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
 - **Voice** — A 32-bit phase accumulator drives an eight-stage XOR/XNOR register and an eight-tap bipolar FIR. Process every crossed slot, including wrap, at sixteen slots per note cycle. The offset-binary ladder models resistor skew, sample-and-hold, slew, and a decaying major-carry transient. The sub path blends one and two octaves down. All voice state stays within 96 bytes.
 - **Macros** — `Decay` 0.38, `BusMask` 0.45, `FirTilt` 0.30, `R2rSkew` 0.20, `ClockHold` 0.15, `Cutoff` 0.60, `SlewGlitch` 0.30, `SubBit` 0.35.
 - **Acceptance** — Verify a clocked zero word, held data through clock gaps, tracker changes at 8× speed, multi-slot phase advances, bounded DAC output over all 256 codes, carry decay, legacy project loading, and sample-for-sample live/WAV parity.
-- **Converter follow-up** — Validate the Yamaha and linear signed word formats with exact vectors and keep CZ companding provisional pending measurements. Distinguish input anti-aliasing from output reconstruction. Add opt-in DAC character to FM4 or CZPD after validating the profiles independently.
+- **Converter follow-up** — See T25 for the independent converter profiles. Existing voices retain their current signal paths.
 
 ### `T22` – Clean-Room `OtisTranswave` Fixed-Point Wavetable Scanner (`OTIS`, `OtisLab` Archetype)
   - **Status**: `IMPLEMENTED` (`c125d5b`). Select `OTIS` in Lane Patch or Step Lock for four generated transwave banks and three scan modes.
@@ -231,3 +231,14 @@ Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-fr
 - **Macros** — `Decay` 0.48, `TableSel` 0.00, `FramePos` 0.20, `ScanDepth` 0.55, `FilterF1` 0.68, `FilterF2` 0.35, `TwinSpread` 0.42, `ModeGrit` 0.45. `ModeGrit` selects OneShot, Bidir, or FwdWrap with a grit range within each zone.
 - **Acceptance** — Verify that the two frame readers travel in opposite directions in Bidir mode and preserve phase accuracy over 128,000 samples. Measure the resonant and bass-cut responses. Check wrap and mode transitions for discontinuities, keep per-lane state within 96 bytes and `SynthRack` under 262,144 bytes, and verify existing OTIS project and WAV behavior.
 - **Behavioral references** — [FIZMO User’s Guide](https://www.vintagesynth.com/sites/default/files/2017-05/FIZMO_Users_Guide.pdf) and [ASR-10 Musician’s Manual](https://ensoniq.manymanuals.com/digital-pianos/asr-10/instruction-manual-11191/208).
+
+## Wave 6 (T25–T26 — Converter Profiles and Formant FM)
+
+### `T25` – Converter Word Formats and DAC Coloration
+
+- **Status** — `IMPLEMENTED` (`ff633b4`). The shared `leviathan_dsp::dac` stage has no tracker controls or new audio commands.
+- **Word formats** — The YM3012 serial codec uses a 10-bit offset-binary mantissa and exponent codes 1–7. It reconstructs signed integer PCM for audio processing. The linear profile truncates signed PCM to 4–16 bits. The 8-bit R-2R profile reuses the ladder transfer. BBUS keeps its existing ladder timing, slew, and carry transient.
+- **Provisional CZ** — The 40 kHz profile has selectable instantaneous or syllabic range tracking and an optional range-gain mismatch. The companding law and gain mismatch are modeling choices pending hardware measurements.
+- **Clock and filters** — The YM profile defaults to the YM2151/OPM example rate of approximately 55.93 kHz. At lower host rates it updates once per host sample. A one-pole input prefilter attenuates some content that would fold at a reduced latch rate. An independent output filter smooths the held steps.
+- **Acceptance** — Verify serial fields at exponent boundaries, signed round trips across all 65,536 PCM values, linear bit-depth vectors, CZ range tracking, and independent input and output filter behavior. Keep the inline state within 32 bytes.
+- **Behavioral references** — [YM3012 datasheet](https://bitsavers.org/components/yamaha/YM3012_199204.pdf), [YM2151 application manual](https://map.grauw.nl/resources/sound/yamaha_ym2151_synthesis.pdf), and [DAC Stage behavioral specification](https://github.com/JosiahAlanLee/DSP_Emulation/blob/main/docs/DAC_STAGE_SPEC.md).
