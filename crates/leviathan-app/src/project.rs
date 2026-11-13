@@ -250,7 +250,7 @@ fn validate_pattern(pattern: &Pattern) -> Result<(), &'static str> {
         {
             return Err("Invalid step nudge or retrigger count");
         }
-        if !(-1..=6).contains(&cell.lock.machine)
+        if !MachineKind::is_step_lock_valid(cell.lock.machine)
             || cell.lock.mask > 0xff
             || cell.lock.values.iter().any(|value| !value.is_finite())
         {
@@ -466,7 +466,7 @@ mod tests {
     #[test]
     fn rejects_out_of_range_sound_lock_machine() {
         let mut pat = Pattern::default();
-        pat.lanes[0][0].lock.machine = 7;
+        pat.lanes[0][0].lock.machine = leviathan_dsp::MACHINE_COUNT as i16;
         let project = ProjectFile {
             version: PROJECT_VERSION,
             bpm: 120.0,
@@ -482,6 +482,46 @@ mod tests {
         };
         let json = serde_json::to_value(&project).unwrap();
         assert!(project_error(&json).contains("Invalid sound lock"));
+    }
+
+    #[test]
+    fn expansion_patches_and_step_machine_ids_round_trip() {
+        let path =
+            std::env::temp_dir().join(format!("leviathan-expansion-{}.json", std::process::id()));
+        let engines = [
+            MachineKind::CzPhaseDist,
+            MachineKind::PolivoksSub,
+            MachineKind::VastFunSynth,
+        ];
+        let mut pattern = Pattern::default();
+        let mut patches = default_lane_patches();
+        for (lane, engine) in engines.into_iter().enumerate() {
+            patches[lane] = LanePatch::for_machine(engine);
+            patches[lane].params[0] = (lane + 1) as f32 / 4.0;
+            pattern.lanes[lane][0].lock.machine = engines[(lane + 1) % engines.len()] as i16;
+            pattern.lanes[lane][0].lock.mask = 1 << 3;
+            pattern.lanes[lane][0].lock.values[3] = 0.75;
+        }
+        save(
+            &path,
+            Project {
+                bpm: 120.0,
+                master_send: 0.0,
+                lane_patches: patches,
+                lane_mix: LaneMix::default(),
+                patterns: vec![pattern.clone()],
+                selected_pattern: 0,
+                chain: PatternChain::default(),
+                samples: core::array::from_fn(|_| None),
+                sample_regions: Default::default(),
+                custom_shader: None,
+            },
+        )
+        .unwrap();
+        let project = load(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(project.lane_patches, patches);
+        assert_eq!(project.patterns[0].lanes, pattern.lanes);
     }
 
     #[test]
