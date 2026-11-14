@@ -10,12 +10,16 @@ mod captured;
 mod cz;
 pub mod dac;
 pub mod fm;
+pub mod esp;
+pub mod echo;
 mod fs77;
 mod master;
 mod otis;
+pub mod otis_kit;
 mod otis_twin;
 mod perc;
 mod pvx;
+pub mod rework;
 pub mod sampler;
 pub mod spec;
 mod vast;
@@ -39,7 +43,7 @@ pub use spec::{
     DEFAULT_LANE_PATCHES, MACHINE_SPECS,
 };
 
-pub const MACHINE_COUNT: usize = 17;
+pub const MACHINE_COUNT: usize = 18;
 pub const ALL_LANES_AUDIBLE: u8 = (1 << NUM_LANES) - 1;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -128,6 +132,7 @@ pub enum MachineKind {
     OtisTwin = 14,
     Fs77FormantFm = 15,
     VastTriple = 16,
+    OtisKit = 17,
 }
 
 impl MachineKind {
@@ -161,6 +166,7 @@ impl MachineKind {
         Self::OtisTwin,
         Self::Fs77FormantFm,
         Self::VastTriple,
+        Self::OtisKit,
     ];
 
     pub const fn from_id(id: usize) -> Self {
@@ -188,6 +194,7 @@ impl MachineKind {
                 | Self::OtisTwin
                 | Self::Fs77FormantFm
                 | Self::VastTriple
+                | Self::OtisKit
         )
     }
 
@@ -364,6 +371,7 @@ struct VoiceState {
     perc: perc::Voice,
     west: west::Voice,
     otis: otis::Voice,
+    kit: otis_kit::Voice,
     otis_twin: otis_twin::TwinVoice,
     bbus: bbus::Voice,
     fs77: fs77::Voice,
@@ -395,6 +403,7 @@ impl Default for VoiceState {
             perc: perc::Voice::default(),
             west: west::Voice::default(),
             otis: otis::Voice::default(),
+            kit: otis_kit::Voice::default(),
             otis_twin: otis_twin::TwinVoice::default(),
             bbus: bbus::Voice::default(),
             fs77: fs77::Voice::default(),
@@ -423,6 +432,7 @@ impl VoiceState {
         self.perc = perc::Voice::default();
         self.west = west::Voice::default();
         self.otis = otis::Voice::default();
+        self.kit = otis_kit::Voice::default();
         self.otis_twin = otis_twin::TwinVoice::default();
         self.bbus = bbus::Voice::default();
         self.fs77 = fs77::Voice::default();
@@ -637,11 +647,10 @@ impl VoiceState {
         routing: &RackRouting,
         routed: &[[f32; 2]; NUM_LANES],
         frame_byte: Option<u8>,
+        kit_slots: &[otis_kit::Slot; otis_kit::SLOTS],
+        kit_lane: otis_kit::Lane,
     ) -> [f32; 2] {
         let input = routing.inputs[lane];
-        if input == LaneInput::Instrument {
-            return [self.render(cv, lane, patch, rate, sample_bank, bus_word, calibrated); 2];
-        }
         let gate = cv.gate_v[lane] > 2.5;
         let requested = MachineKind::from_patch_and_lock(patch, &cv.locks[lane]);
         let machine = if gate {
@@ -649,6 +658,27 @@ impl VoiceState {
         } else {
             self.active_machine.unwrap_or(patch.machine)
         };
+        if machine == MachineKind::OtisKit {
+            let switching = self.active_machine != Some(machine);
+            if switching {
+                self.reset_synthesis();
+            }
+            let attack = gate && (switching || !self.prev_gate || cv.retrigger_mask & (1 << lane) != 0);
+            self.prev_gate = gate;
+            self.active_machine = Some(machine);
+            let Some(memory) = samples.kit else { return [0.0; 2] };
+            let params = if attack {
+                voice::controls(patch.resolve_lock(&cv.locks[lane]).values, &machine.spec().params)
+            } else {
+                [0.5; 8]
+            };
+            let velocity = attack.then(|| (cv.velocity_v[lane] / 10.0).clamp(0.0, 1.0));
+            let value = self.kit.step(lane, rate, memory, kit_slots, kit_lane, cv.pitch_v[lane], velocity, &params, frame_byte);
+            return [value * if calibrated { 0.8 } else { 1.0 }; 2];
+        }
+        if input == LaneInput::Instrument {
+            return [self.render(cv, lane, patch, rate, sample_bank, bus_word, calibrated); 2];
+        }
         let sampled = matches!(
             machine,
             MachineKind::VarSampler
@@ -779,6 +809,9 @@ pub struct SynthRack {
     render_order: [usize; NUM_LANES],
     byte_register: byte_route::Register,
     routed_byte: Option<u8>,
+    kit_slots: [otis_kit::Slot; otis_kit::SLOTS],
+    kit_lanes: [otis_kit::Lane; NUM_LANES],
+    kit_bytebus: bool,
 }
 
 // Leave stack headroom for worker initialization and Windows test threads.
@@ -802,6 +835,9 @@ impl SynthRack {
             render_order: core::array::from_fn(|lane| lane),
             byte_register: byte_route::Register::default(),
             routed_byte: None,
+            kit_slots: [otis_kit::Slot::default(); otis_kit::SLOTS],
+            kit_lanes: [otis_kit::Lane::default(); NUM_LANES],
+            kit_bytebus: false,
         }
     }
     pub fn lane_patches(&self) -> &[LanePatch; NUM_LANES] {
@@ -855,8 +891,8 @@ impl SynthRack {
                 voice.reset_synthesis();
             }
         }
-        let was_clocked = self.routing.bytebus.enabled || self.routing.frame_bytebus;
-        let clocked = routing.bytebus.enabled || routing.frame_bytebus;
+        let was_clocked = self.routing.bytebus.enabled || self.routing.frame_bytebus || self.kit_bytebus;
+        let clocked = routing.bytebus.enabled || routing.frame_bytebus || self.kit_bytebus;
         self.routing = routing;
         self.render_order = order;
         if was_clocked != clocked {
@@ -871,8 +907,37 @@ impl SynthRack {
         self.routed_byte = None;
     }
 
+    pub fn reset_transport_clocks(&mut self) {
+        self.reset_byte_route();
+        self.master.reset_echo_clock();
+    }
+
     pub fn routed_byte(&self) -> Option<u8> {
         self.routed_byte
+    }
+
+    pub fn set_kit_controls(
+        &mut self,
+        slots: [otis_kit::Slot; otis_kit::SLOTS],
+        lanes: [otis_kit::Lane; NUM_LANES],
+    ) {
+        if slots.iter().all(|slot| slot.is_valid()) && lanes.iter().all(|lane| lane.clock < 3) {
+            self.kit_slots = slots;
+            self.kit_lanes = lanes;
+            let bytebus = lanes.iter().any(|lane| lane.bytebus);
+            if self.kit_bytebus != bytebus && !self.routing.bytebus.enabled && !self.routing.frame_bytebus {
+                self.reset_byte_route();
+            }
+            self.kit_bytebus = bytebus;
+        }
+    }
+
+    pub fn kit_sounding(&self) -> [u8; NUM_LANES] {
+        self.voices.each_ref().map(|voice| voice.kit.sounding())
+    }
+
+    pub fn kit_generations(&self) -> [[[Option<u64>; 2]; otis_kit::SLOTS]; NUM_LANES] {
+        self.voices.each_ref().map(|voice| voice.kit.generations())
     }
 
     pub fn capture_generations(&self) -> [Option<u64>; NUM_LANES] {
@@ -910,6 +975,18 @@ impl SynthRack {
         self.master.set_bender_params(params);
     }
 
+    pub fn set_echo_params(&mut self, params: echo::Params) {
+        self.master.set_echo_params(params);
+    }
+
+    pub fn set_tempo(&mut self, bpm: f64) {
+        self.master.set_tempo(bpm);
+    }
+
+    pub fn echo_timing(&self) -> echo::Timing {
+        self.master.echo_timing()
+    }
+
     pub fn reset_master(&mut self, send: f32) {
         self.master.reset(send);
     }
@@ -943,6 +1020,7 @@ impl SynthRack {
             bbus::tracker_word(cv),
             &CaptureSamples::default(),
             None,
+            &mut [],
         )
         .0
     }
@@ -950,7 +1028,7 @@ impl SynthRack {
     /// Renders with an already decoded external ByteBus word. Use
     /// `ByteBusReceiver` for raw clocked voltages and `None` for standalone.
     pub fn render_stereo_with_bytebus(&mut self, cv: &CvFrame, word: Option<u8>) -> (f32, f32) {
-        self.render_mix(cv, None, None, word, &CaptureSamples::default(), None)
+        self.render_mix(cv, None, None, word, &CaptureSamples::default(), None, &mut [])
             .0
     }
 
@@ -968,6 +1046,7 @@ impl SynthRack {
             bbus::tracker_word(cv),
             &CaptureSamples::default(),
             None,
+            &mut [],
         )
         .0
     }
@@ -997,6 +1076,7 @@ impl SynthRack {
             bbus::tracker_word(cv),
             &CaptureSamples::default(),
             None,
+            &mut [],
         );
         (master, wet)
     }
@@ -1008,8 +1088,18 @@ impl SynthRack {
         samples: &CaptureSamples<'_>,
         tap: Option<CaptureTap>,
     ) -> ((f32, f32), [f32; 2]) {
+        self.render_session_with_echo(cv, samples, tap, &mut [])
+    }
+
+    pub fn render_session_with_echo(
+        &mut self,
+        cv: &CvFrame,
+        samples: &CaptureSamples<'_>,
+        tap: Option<CaptureTap>,
+        echo_storage: &mut [[f32; 2]],
+    ) -> ((f32, f32), [f32; 2]) {
         let (master, _, sample) =
-            self.render_mix(cv, None, None, bbus::tracker_word(cv), samples, tap);
+            self.render_mix(cv, None, None, bbus::tracker_word(cv), samples, tap, echo_storage);
         (master, sample)
     }
 
@@ -1020,13 +1110,19 @@ impl SynthRack {
         stems: &mut [[f32; 2]; NUM_LANES],
         delays: &mut [StereoDelay; NUM_LANES],
     ) -> ((f32, f32), [f32; 2]) {
+        self.render_session_with_echo_stems(cv, samples, stems, delays, &mut [])
+    }
+
+    pub fn render_session_with_echo_stems(
+        &mut self,
+        cv: &CvFrame,
+        samples: &CaptureSamples<'_>,
+        stems: &mut [[f32; 2]; NUM_LANES],
+        delays: &mut [StereoDelay; NUM_LANES],
+        echo_storage: &mut [[f32; 2]],
+    ) -> ((f32, f32), [f32; 2]) {
         let (master, wet, _) = self.render_mix(
-            cv,
-            Some(stems),
-            Some(delays),
-            bbus::tracker_word(cv),
-            samples,
-            None,
+            cv, Some(stems), Some(delays), bbus::tracker_word(cv), samples, None, echo_storage,
         );
         (master, wet)
     }
@@ -1040,9 +1136,12 @@ impl SynthRack {
         bus_word: Option<u8>,
         samples: &CaptureSamples<'_>,
         tap: Option<CaptureTap>,
+        echo_storage: &mut [[f32; 2]],
     ) -> ((f32, f32), [f32; 2], [f32; 2]) {
         let _bus_step = self.counter.step(cv.bytebus_v[8] > 5.0, cv.reset_v > 5.0);
-        let byte_routing = self.routing.bytebus.enabled || self.routing.frame_bytebus;
+        let byte_routing = self.routing.bytebus.enabled
+            || self.routing.frame_bytebus
+            || self.kit_bytebus;
         let held_byte =
             byte_routing.then(|| self.byte_register.step(cv, bus_word, self.routing.bytebus));
         let routed_byte = if cv.run_v > 2.5 { held_byte } else { None };
@@ -1074,6 +1173,8 @@ impl SynthRack {
                 &self.routing,
                 &lane_dry,
                 held_byte,
+                &self.kit_slots,
+                self.kit_lanes[lane],
             );
 
             // Keep the voice running under the mute so it resumes at the same phase.
@@ -1114,7 +1215,7 @@ impl SynthRack {
             }
         }
 
-        let ([left, right], wet) = self.master.process(dry_mix, delay_mix, fx_mix);
+        let ([left, right], wet) = self.master.process(cv, dry_mix, delay_mix, fx_mix, echo_storage);
         let captured = match tap {
             Some(CaptureTap::Lane(lane)) => {
                 lane_dry.get(usize::from(lane)).copied().unwrap_or_default()
@@ -1145,18 +1246,10 @@ mod tests {
         let mut channels = DEFAULT_LANE_CHANNELS;
         channels[0].fx_send = 0.8;
         rack.set_lane_channels(channels);
-        rack.reset_voices();
         let mut cv = CvFrame::default();
         cv.gate_v[0] = 10.0;
         cv.velocity_v[0] = 10.0;
         let inputs = CaptureSamples::default();
-        let captured: std::vec::Vec<[f32; 2]> = (0..12_000)
-            .map(|_| rack.render_session(&cv, &inputs, Some(CaptureTap::Bend)).1)
-            .collect();
-        assert!(captured.iter().any(|frame| frame[0].abs() > 1e-4));
-        assert!(captured.iter().any(|frame| frame[1].abs() > 1e-4));
-        rack.reset_voices();
-        rack.reset_master(0.0);
         let mut stems = [[0.0; 2]; NUM_LANES];
         let mut delays: std::boxed::Box<[StereoDelay; NUM_LANES]> =
             core::iter::repeat_with(|| StereoDelay::new(48_000.0))
@@ -1166,9 +1259,34 @@ mod tests {
                 .try_into()
                 .ok()
                 .unwrap();
-        for expected in captured {
-            let (_, wet) = rack.render_session_with_stems(&cv, &inputs, &mut stems, &mut delays);
-            assert_eq!(wet, expected);
+        let mut echo_memory = std::vec![[0.0; 2]; echo::capacity(48_000.0)];
+        for mode in esp::Mode::ALL {
+            rack.set_echo_params(echo::Params {
+                esp: mode,
+                echo_mix: 0.7,
+                space_mix: 0.35,
+                time: 0.56,
+                ..echo::Params::default()
+            });
+            rack.reset_voices();
+            rack.reset_master(0.0);
+            let captured: std::vec::Vec<[f32; 2]> = (0..12_000)
+                .map(|_| {
+                    rack.render_session_with_echo(
+                        &cv, &inputs, Some(CaptureTap::Bend), &mut echo_memory,
+                    ).1
+                })
+                .collect();
+            assert!(captured.iter().any(|frame| frame[0].abs() > 1e-4));
+            assert!(captured.iter().any(|frame| frame[1].abs() > 1e-4));
+            rack.reset_voices();
+            rack.reset_master(0.0);
+            for expected in captured {
+                let (_, wet) = rack.render_session_with_echo_stems(
+                    &cv, &inputs, &mut stems, &mut delays, &mut echo_memory,
+                );
+                assert_eq!(wet, expected, "{mode:?}");
+            }
         }
     }
 
@@ -1418,6 +1536,11 @@ mod tests {
             rack.set_lane_audible_mask(1);
             rack.set_voice_calibration(enabled);
             for machine in MachineKind::ALL {
+                // This survey measures machines with a self-contained patch.
+                // OtisKit exercises calibration with PCM in its own fixture.
+                if machine == MachineKind::OtisKit {
+                    continue;
+                }
                 let patch = if enabled {
                     LanePatch::for_machine_with_calibration(machine)
                 } else {
@@ -1519,6 +1642,7 @@ mod tests {
             (MachineKind::OtisTwin, 14, "otis2", "OT2"),
             (MachineKind::Fs77FormantFm, 15, "fs77", "FS77"),
             (MachineKind::VastTriple, 16, "k26", "K26"),
+            (MachineKind::OtisKit, 17, "okit", "OKIT"),
         ] {
             assert_eq!((kind.spec().id, kind.slug(), kind.short_name()), (id, slug, badge));
         }

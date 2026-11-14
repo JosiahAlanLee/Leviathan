@@ -9,11 +9,13 @@ use leviathan_core::{
 };
 use leviathan_dsp::{
     sampler::{SampleBank, SampleRegion},
-    BenderParams, DelayMode, LaneChannel, LanePatch, MasterPeaks, SynthRack,
+    echo, otis_kit, BenderParams, DelayMode, LaneChannel, LanePatch, MasterPeaks, SynthRack,
 };
 use leviathan_gpu::{AudioScopeSnapshot, AudioScopeTap};
 
+use crate::audition;
 use crate::capture::{Recorder, Stage, Take, TakeBank};
+use crate::kit::{Kit, KitBank, KitSample};
 use crate::midi::{MidiEvent, MidiKey, MidiReceiver, MidiTarget};
 use crate::project::{Project, PATTERN_BANK_CAPACITY};
 
@@ -32,6 +34,13 @@ pub enum AudioCommand {
     SetMasterSend(f32),
     SetDelayMode(DelayMode),
     SetBenderParams(BenderParams),
+    SetEchoParams(echo::Params),
+    Audition(Arc<audition::Request>),
+    SetKit(Arc<Kit>),
+    SetKitControls {
+        params: [otis_kit::Slot; otis_kit::SLOTS],
+        lanes: [otis_kit::Lane; NUM_LANES],
+    },
     SetLaneAudibleMask(u8),
     SetLaneChannels([LaneChannel; NUM_LANES]),
     SetLanePatch { lane: usize, patch: LanePatch },
@@ -113,6 +122,8 @@ pub struct AudioProject {
     voice_calibration: bool,
     routing: RackRouting,
     take: Option<Arc<Take>>,
+    kit: Kit,
+    echo: echo::Params,
 }
 
 impl AudioProject {
@@ -133,6 +144,8 @@ impl AudioProject {
             voice_calibration: project.voice_calibration,
             routing: project.instruments.routing,
             take: project.instruments.take.clone(),
+            kit: project.instruments.kit.clone(),
+            echo: project.instruments.echo,
         }
     }
 
@@ -159,6 +172,9 @@ enum RetainedSnapshot {
     Project(Arc<AudioProject>),
     Sample(Arc<[i16]>),
     Take(Arc<Take>),
+    KitSample(Arc<KitSample>),
+    Kit(Arc<Kit>),
+    Audition(Arc<audition::Request>),
 }
 
 impl RetainedSnapshot {
@@ -168,6 +184,9 @@ impl RetainedSnapshot {
             Self::Project(project) => Arc::strong_count(project) > 1,
             Self::Sample(sample) => Arc::strong_count(sample) > 1,
             Self::Take(take) => Arc::strong_count(take) > 1,
+            Self::KitSample(sample) => Arc::strong_count(sample) > 1,
+            Self::Kit(kit) => Arc::strong_count(kit) > 1,
+            Self::Audition(audition) => Arc::strong_count(audition) > 1,
         }
     }
 }
@@ -200,10 +219,26 @@ impl AudioControl {
                 self.retained.push(RetainedSnapshot::Take(Arc::clone(take)));
             }
         }
+        let kit = match &command {
+            AudioCommand::SetKit(kit) => Some(kit.as_ref()),
+            AudioCommand::ReplaceProject(project) => Some(&project.kit),
+            _ => None,
+        };
+        if let Some(kit) = kit {
+            for sample in kit.samples.iter().flatten() {
+                if !self.retained.iter().any(|item| {
+                    matches!(item, RetainedSnapshot::KitSample(held) if Arc::ptr_eq(held, sample))
+                }) {
+                    self.retained.push(RetainedSnapshot::KitSample(Arc::clone(sample)));
+                }
+            }
+        }
         let snapshot = match &command {
             AudioCommand::SetPattern { pattern, .. } => {
                 Some(RetainedSnapshot::Pattern(Arc::clone(pattern)))
             }
+            AudioCommand::SetKit(kit) => Some(RetainedSnapshot::Kit(Arc::clone(kit))),
+            AudioCommand::Audition(request) => Some(RetainedSnapshot::Audition(Arc::clone(request))),
             AudioCommand::ReplaceProject(project) => {
                 Some(RetainedSnapshot::Project(Arc::clone(project)))
             }
@@ -250,6 +285,8 @@ pub struct AudioTelemetry {
     pub capture_beats_left: Option<f64>,
     pub transport_position: (f64, usize),
     pub routed_byte: Option<u8>,
+    pub echo_timing: echo::Timing,
+    pub kit_sounding: [u8; NUM_LANES],
 }
 
 #[derive(Clone, Copy)]
@@ -277,6 +314,9 @@ struct RtAudioWorker {
     midi_target: MidiTarget,
     midi_preview: [Option<MidiPreview>; NUM_LANES],
     takes: TakeBank,
+    kit: KitBank,
+    echo_storage: Box<[[f32; 2]]>,
+    audition: audition::Player,
     recorder: Option<Recorder>,
     last_playing_beat: Option<f64>,
 }
@@ -313,6 +353,9 @@ impl RtAudioWorker {
             midi_target: MidiTarget::default(),
             midi_preview: [None; NUM_LANES],
             takes: TakeBank::default(),
+            kit: KitBank::default(),
+            echo_storage: vec![[0.0; 2]; echo::capacity(sample_rate as f32)].into_boxed_slice(),
+            audition: audition::Player::default(),
             recorder: None,
             last_playing_beat: None,
         }
@@ -328,6 +371,16 @@ impl RtAudioWorker {
                 AudioCommand::SetMasterSend(send) => self.synth.set_master_send(send),
                 AudioCommand::SetDelayMode(mode) => self.synth.set_delay_mode(mode),
                 AudioCommand::SetBenderParams(params) => self.synth.set_bender_params(params),
+                AudioCommand::SetEchoParams(params) => self.synth.set_echo_params(params),
+                AudioCommand::Audition(request) => self.audition.start(Some(request)),
+                AudioCommand::SetBpm(bpm) => self.synth.set_tempo(bpm),
+                AudioCommand::SetKit(kit) => {
+                    self.synth.set_kit_controls(kit.params, kit.lanes);
+                    self.kit.install(&kit, self.synth.kit_generations());
+                }
+                AudioCommand::SetKitControls { params, lanes } => {
+                    self.synth.set_kit_controls(params, lanes);
+                }
                 AudioCommand::SetLaneAudibleMask(mask) => self.synth.set_lane_audible_mask(mask),
                 AudioCommand::SetLaneChannels(channels) => self.synth.set_lane_channels(channels),
                 AudioCommand::SetLanePatch { lane, patch } => self.synth.set_lane_patch(lane, patch),
@@ -349,7 +402,8 @@ impl RtAudioWorker {
                 AudioCommand::Reset => {
                     self.cancel_capture();
                     self.last_playing_beat = None;
-                    self.synth.reset_byte_route();
+                    self.synth.reset_transport_clocks();
+                    self.tel_divider = 255;
                 }
                 AudioCommand::CancelCapture => self.cancel_capture(),
                 AudioCommand::SetCell {
@@ -378,6 +432,7 @@ impl RtAudioWorker {
                     }
                 }
                 AudioCommand::ReplaceProject(project) => {
+                    self.audition.start(None);
                     for (dest, source) in self.patterns.iter_mut().zip(&project.patterns) {
                         dest.clone_from(source);
                     }
@@ -395,7 +450,11 @@ impl RtAudioWorker {
                     self.cancel_capture();
                     self.last_playing_beat = None;
                     self.synth.set_delay_mode(project.delay_mode);
+                    self.synth.set_kit_controls(project.kit.params, project.kit.lanes);
+                    self.kit.install(&project.kit, self.synth.kit_generations());
                     self.synth.set_bender_params(project.bender_params);
+                    self.synth.set_echo_params(project.echo);
+                    self.synth.set_tempo(project.bpm);
                     self.synth.reset_master(project.master_send);
                     self.generation = project.generation;
                     self.tel_divider = 255;
@@ -438,7 +497,7 @@ impl RtAudioWorker {
                     self.play_request = request;
                     self.cancel_capture();
                     self.last_playing_beat = None;
-                    self.synth.reset_byte_route();
+                    self.synth.reset_transport_clocks();
                 }
                 AudioCommand::SetMidiTarget(target) => self.midi_target = target,
                 _ => {}
@@ -446,6 +505,7 @@ impl RtAudioWorker {
         }
         self.drain_midi();
         self.takes.release_unused(self.synth.capture_generations());
+        self.kit.release_unused(self.synth.kit_generations());
         if let Some(recorder) = &mut self.recorder {
             recorder.flush();
         }
@@ -495,7 +555,7 @@ impl RtAudioWorker {
                             self.last_playing_beat = None;
                         }
                         if event == MidiEvent::Start {
-                            self.synth.reset_byte_route();
+                            self.synth.reset_transport_clocks();
                         }
                         self.tel_divider = 255;
                     }
@@ -569,12 +629,18 @@ impl RtAudioWorker {
             )
         });
         self.last_playing_beat = self.player.evaluator.playing.then_some(cv.beat);
-        let (pair, capture) = self
-            .synth
-            .render_session(&render_cv, &self.takes.samples(), tap);
+        let mut samples = self.takes.samples();
+        samples.kit = Some(&self.kit);
+        let (pair, capture) = self.synth.render_session_with_echo(
+            &render_cv, &samples, tap, &mut self.echo_storage,
+        );
         if let Some(recorder) = self.recorder.as_mut().filter(|_| tap.is_some()) {
             recorder.push(capture);
         }
+        let audition = self.audition.step(self.player.evaluator.config.sample_rate);
+        let pair = if audition == [0.0; 2] { pair } else {
+            ((pair.0 + audition[0]).clamp(-1.0, 1.0), (pair.1 + audition[1]).clamp(-1.0, 1.0))
+        };
         self.scope_tap.push_stereo(pair.0, pair.1);
         self.tel_divider = self.tel_divider.wrapping_add(1);
         if retrigger
@@ -602,6 +668,8 @@ impl RtAudioWorker {
                         .cursor_position(&self.patterns[..self.pattern_count])
                 },
                 routed_byte: self.synth.routed_byte(),
+                echo_timing: self.synth.echo_timing(),
+                kit_sounding: self.synth.kit_sounding(),
             };
             // Carry the interval's peaks forward if the UI hasn't drained its ring yet.
             if self.tel_tx.push(telemetry).is_ok() {
@@ -1124,6 +1192,67 @@ mod tests {
             rendered.push(worker.next_stereo());
         }
         rendered
+    }
+
+    #[test]
+    fn kit_and_echo_match_live_and_export_after_project_reload() {
+        use crate::export::{ExportJob, ExportRequest, ExportSettings};
+        use crate::wav::WavEncoding;
+        use crate::project;
+        use leviathan_dsp::{default_lane_patches, esp, MachineKind};
+
+        let mut pattern = Pattern { length: 8, rate: PlaybackRate::EightX, ..Pattern::default() };
+        for row in 0..8 {
+            pattern.lanes[0][row] = NoteCell { active: true, midi: 60 + row as u8, velocity: 127, ..NoteCell::default() };
+        }
+        let mut lane_patches = default_lane_patches();
+        lane_patches[0] = LanePatch::for_machine(MachineKind::OtisKit);
+        let mut project = Project {
+            bpm: 120.0, master_send: 0.0, delay_mode: Default::default(), bender_params: Default::default(),
+            lane_mix: LaneMix::default(), lane_patches, patterns: vec![pattern], selected_pattern: 0,
+            chain: PatternChain::default(), samples: Default::default(), sample_regions: Default::default(),
+            custom_shader: None, voice_calibration: true, instruments: Default::default(),
+        };
+        project.lane_mix.channels[0].0.fx_send = 0.85;
+        project.instruments.kit.load_factory();
+        project.instruments.kit.params[1].reverse = true;
+        project.instruments.echo = echo::Params {
+            echo_mix: 0.75, space_mix: 0.25, time: 0.52, feedback: 0.9, ..echo::Params::default()
+        };
+        let dir = std::env::temp_dir().join(format!("leviathan-w8-parity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kit.leviathan.json");
+        let mut energies = Vec::new();
+        for (index, mode) in esp::Mode::ALL.into_iter().enumerate() {
+            project.instruments.echo.esp = mode;
+            let live = render_test_project_live(&project, 6000, 15_600);
+            project::save(&path, project).unwrap();
+            project = project::load(&path).unwrap();
+            let source = project::load(&path).unwrap();
+            let destination = dir.join(format!("bounce-{index}"));
+            ExportJob::start(source, false, ExportRequest {
+                settings: ExportSettings { tail_seconds: 0.2, stems: true, encoding: WavEncoding::Float32, ..ExportSettings::default() },
+                destination: destination.clone(),
+            }).unwrap().finish().unwrap();
+            let decode = |bytes: &[u8]| f32::from_le_bytes(bytes.try_into().unwrap());
+            let master = std::fs::read(destination.join("master.wav")).unwrap();
+            let read = |frame: &[u8]| (decode(&frame[..4]), decode(&frame[4..]));
+            let start = master.len() - live.len() * 8;
+            assert_eq!(&master[start - 8..start - 4], b"data");
+            let frames = master[start..].chunks_exact(8);
+            assert_eq!(frames.len(), live.len());
+            for (frame, expected) in frames.zip(live.iter()) {
+                assert_eq!(read(frame), *expected, "{mode:?}");
+            }
+            let kit = std::fs::read(destination.join("0-okit.wav")).unwrap();
+            assert!(kit[start..].chunks_exact(4).any(|frame| decode(frame).abs() > 0.01));
+            let wet = std::fs::read(destination.join("bend.wav")).unwrap();
+            let energy: f64 = wet[start..].chunks_exact(4).map(|frame| f64::from(decode(frame)).powi(2)).sum();
+            assert!(energy > 0.1);
+            energies.push(energy);
+        }
+        assert!(energies[1..].iter().all(|energy| (energy - energies[0]).abs() > 1e-4));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

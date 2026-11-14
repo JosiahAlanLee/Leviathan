@@ -57,6 +57,14 @@ Leviathan uses a strict hexagonal ("ports and adapters") layout so external GPU,
 - **OTIS** and **OT2** treat the trimmed region as fixed-length frames. Set **samples per frame**, then scan them with **FramePos** or enable **Clock OTIS frames from ByteBus**. **VAST** takes a gated capture sample or a continuous signal from another lane's dry mixer tap. These processors fold stereo input to mono.
 - **Register → Lookup → BBUS** clocks the tracker word through a shared register at ByteBus clock edges. Set the reset seed and choose Identity, Invert, Square or Fold. The clocked output can also select OTIS frames independently of BBUS. Captures and routing save with the project and render in WAV and stem exports.
 
+## Wave 8 Echo, OtisKit and REWORK
+
+- In **Mixer** (F3), set **Echo mix** to send through Echo before Space. Set **Space mix** to zero for Echo alone. **Transport** follows quarter-notes and **ByteBus** measures clock intervals. At 120 BPM, 1× is 500 ms on Transport and 125 ms on the default ByteBus. The panel shows the effective delay and any ESP limit. **LOOP** accumulates the selected Hz shift across repeats. **POST** shifts each outgoing repeat once. Existing projects open with Echo and ESP off.
+- Select **OKIT** in **Lane Patch** or in a **Step Lock**. Go to **Samples** (F5) and open **OtisKit**. The **Factory kit** button fills all eight slots. You can also load a WAV, load a folder in filename order, or arm a capture directly into the selected slot. Capture from the **Capture and Banks** tab still writes to the stereo take.
+- **Tracker** addressing maps MIDI 60–67 (C-4 through G-4) to slots 1–8 at unity pitch. Each additional group of eight notes transposes an octave. **ByteBus** addressing takes bits 0–2 from Register/Lookup and uses the tracker note for pitch. An optional slot offset wraps around the bank. Kit controls and step offsets are latched on each hit.
+- **REWORK** previews the capture's trim region or an OtisKit slot from Start to its end. Set the seed, fineness and amount, listen to A and B, and commit the result. A replacement or project reload invalidates a stale preview. Export includes committed audio. Preview audition plays from the monitor and stays outside the recorded and exported signal.
+- Projects save as version 2 in the same `.leviathan.json` file. The new version stores the stereo take and mono kit slots as base64 little-endian signed 16-bit PCM with explicit rate and frame count. Version 1 files with numeric PCM still load.
+
 ## Custom WGSL Shaders & SoundLink UDP
 
 - Drop any `.wgsl` file onto the window (or use **Load .wgsl** in **Scene** (F6)) to run custom ping-pong fragment shaders driven by Leviathan's 64-byte `VisualUniforms` and `prev_tex` feedback buffer.

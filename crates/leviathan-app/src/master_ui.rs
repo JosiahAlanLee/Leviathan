@@ -126,3 +126,78 @@ mod tests {
         assert!(!meters.is_active(7.0));
     }
 }
+
+pub fn draw_echo(
+    ui: &mut egui::Ui,
+    params: &mut leviathan_dsp::echo::Params,
+    timing: leviathan_dsp::echo::Timing,
+    bpm: f64,
+) -> bool {
+    use leviathan_dsp::{echo, esp};
+    let before = *params;
+    egui::CollapsingHeader::new("Echo and ESP").default_open(true).show(ui, |ui| {
+        ui.small("Send → Echo → Space → Return");
+        ui.add(egui::Slider::new(&mut params.echo_mix, 0.0..=1.0).text("Echo mix"));
+        ui.add(egui::Slider::new(&mut params.space_mix, 0.0..=1.0).text("Space mix"));
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut params.sync, echo::Sync::Free, "Free");
+            ui.selectable_value(&mut params.sync, echo::Sync::Transport, "Transport");
+            ui.selectable_value(&mut params.sync, echo::Sync::ByteBus, "ByteBus");
+        });
+        if params.sync == echo::Sync::Free {
+            ui.add(egui::Slider::new(&mut params.time, 0.0..=1.0).show_value(false).text("Time"));
+        } else {
+            let label = |ratio: (u8, u8)| {
+                if ratio.1 == 1 { format!("{}×", ratio.0) } else { format!("{}/{}×", ratio.0, ratio.1) }
+            };
+            egui::ComboBox::from_id_salt("echo_ratio")
+                .selected_text(label(echo::RATIOS[usize::from(params.ratio)]))
+                .show_ui(ui, |ui| {
+                    for (i, ratio) in echo::RATIOS.into_iter().enumerate() {
+                        ui.selectable_value(&mut params.ratio, i as u8, label(ratio));
+                    }
+                });
+        }
+        let (target, effective, waiting) = if timing.effective_seconds > 0.0 && *params == before {
+            (timing.target_seconds, timing.effective_seconds, timing.awaiting_clock)
+        } else {
+            let (n, d) = echo::RATIOS[usize::from(params.ratio)];
+            let target = if params.sync == echo::Sync::Transport {
+                f32::from(n) / f32::from(d) * 60.0 / bpm as f32
+            } else {
+                params.free_seconds()
+            };
+            (target, target.min(params.max_seconds(48_000.0)), params.sync == echo::Sync::ByteBus)
+        };
+        ui.monospace(if effective + 0.000001 < target {
+            format!("{:.1} ms · capped from {:.1} ms", effective * 1000.0, target * 1000.0)
+        } else if waiting {
+            format!("{:.1} ms · waiting for two edges", effective * 1000.0)
+        } else {
+            format!("{:.1} ms", effective * 1000.0)
+        });
+        ui.add(egui::Slider::new(&mut params.feedback, 0.0..=1.10).text("Echo feedback"));
+        ui.add(egui::Slider::new(&mut params.tone, 0.0..=1.0).text("Tone"));
+        ui.add(egui::Slider::new(&mut params.spread, 0.0..=1.0).text("Spread"));
+        ui.add(egui::Slider::new(&mut params.shift_hz, -200.0..=200.0).suffix(" Hz").text("Echo shift"));
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut params.shift_in_loop, true, "LOOP").on_hover_text("Shift accumulates on each repeat");
+            ui.selectable_value(&mut params.shift_in_loop, false, "POST").on_hover_text("Shift each outgoing echo once");
+        });
+        egui::ComboBox::from_id_salt("esp_rate")
+            .selected_text(esp_label(params.esp))
+            .show_ui(ui, |ui| {
+                for mode in esp::Mode::ALL {
+                    ui.selectable_value(&mut params.esp, mode, esp_label(mode));
+                }
+            });
+        ui.add_enabled_ui(params.esp != esp::Mode::Off, |ui| {
+            ui.checkbox(&mut params.limit_64k, "64K echo memory limit");
+        });
+    });
+    *params != before
+}
+
+fn esp_label(mode: leviathan_dsp::esp::Mode) -> String {
+    mode.rate().map_or_else(|| "ESP Off".into(), |rate| format!("ESP {:.1} kHz", rate / 1000.0))
+}

@@ -28,6 +28,10 @@ impl Take {
         }))
     }
 
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn sample(&self) -> CaptureSample<'_> {
         CaptureSample {
             generation: self.generation,
@@ -76,6 +80,7 @@ impl TakeBank {
 
     pub fn samples(&self) -> CaptureSamples<'_> {
         CaptureSamples {
+            kit: None,
             current: self.current.as_deref().map(Take::sample),
             previous: self
                 .previous

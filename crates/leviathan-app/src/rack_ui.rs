@@ -50,6 +50,7 @@ impl RackPanel {
         has_audio: bool,
         busy: bool,
         playing: bool,
+        kit_slot: Option<usize>,
     ) -> Option<CaptureAction> {
         egui::CollapsingHeader::new("Capture sample")
             .default_open(true)
@@ -70,12 +71,17 @@ impl RackPanel {
                             .suffix(" beats"),
                     );
                 });
-                if let Some(take) = take {
-                    ui.label(format!(
-                        "{:.2} s stereo · {} Hz",
-                        take.frames.len() as f64 / f64::from(take.rate),
-                        take.rate
-                    ));
+                if let Some(slot) = kit_slot {
+                    ui.small(format!("Target · Kit {}", slot + 1));
+                } else {
+                    ui.small("Target · Stereo take");
+                    if let Some(take) = take {
+                        ui.label(format!(
+                            "{:.2} s stereo · {} Hz",
+                            take.frames.len() as f64 / f64::from(take.rate),
+                            take.rate
+                        ));
+                    }
                 }
                 if busy {
                     ui.label(self.busy_text(playing));

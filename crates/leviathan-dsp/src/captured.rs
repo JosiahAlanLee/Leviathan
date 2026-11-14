@@ -16,6 +16,7 @@ pub struct CaptureSample<'a> {
 #[derive(Default)]
 pub struct CaptureSamples<'a> {
     pub current: Option<CaptureSample<'a>>,
+    pub kit: Option<&'a dyn crate::otis_kit::Memory>,
     pub previous: [Option<CaptureSample<'a>>; NUM_LANES],
 }
 

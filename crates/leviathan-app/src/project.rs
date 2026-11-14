@@ -10,15 +10,18 @@ use leviathan_core::{
     ROWS_PER_PATTERN, SOUND_PARAMS,
 };
 use leviathan_dsp::sampler::{SampleBank, SampleRegion, MAX_WAVE_LEN, NUM_BANKS};
-use leviathan_dsp::{default_lane_patches, BenderParams, DelayMode, LanePatch, MachineKind};
+use leviathan_dsp::otis_kit::{Lane as KitLane, Slot as KitSlot, MAX_FRAMES as MAX_KIT_FRAMES, SLOTS};
+use leviathan_dsp::{default_lane_patches, echo, esp, BenderParams, DelayMode, LanePatch, MachineKind};
 use serde::{Deserialize, Serialize};
 
-use crate::capture::Take;
+use crate::capture::{Take, MAX_CAPTURE_FRAMES};
+use crate::kit::{Kit, KitSample};
+use crate::pcm;
 use crate::lane_mix::LaneMix;
 use crate::wav::{sample_peaks, DecodedWav};
 
 pub const PATTERN_BANK_CAPACITY: usize = 16;
-const PROJECT_VERSION: u32 = 1;
+const PROJECT_VERSION: u32 = 2;
 const MAX_PROJECT_BYTES: u64 = 8 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustomShader {
@@ -46,6 +49,8 @@ pub struct Project {
 pub struct InstrumentSettings {
     pub routing: RackRouting,
     pub take: Option<Arc<Take>>,
+    pub kit: Kit,
+    pub echo: echo::Params,
 }
 
 impl Project {
@@ -95,19 +100,211 @@ struct ProjectFile {
 struct InstrumentFile {
     routing: RackRouting,
     take: Option<CaptureFile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kit: Option<KitFile>,
+    #[serde(default, with = "EchoParamsDef")]
+    echo: echo::Params,
 }
 
 impl InstrumentFile {
     fn is_default(&self) -> bool {
-        self.routing == RackRouting::default() && self.take.is_none()
+        self.routing == RackRouting::default()
+            && self.take.is_none() && self.kit.is_none() && self.echo == echo::Params::default()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum CaptureFile {
+    Compact { rate: u32, frame_count: usize, pcm_s16le: String },
+    Legacy { rate: u32, frames: Vec<[i16; 2]> },
+}
+
+impl<'de> Deserialize<'de> for CaptureFile {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Stored {
+            rate: u32,
+            frame_count: Option<usize>,
+            pcm_s16le: Option<String>,
+            frames: Option<LegacyPcm>,
+        }
+
+        let stored = Stored::deserialize(deserializer)?;
+        match (stored.frame_count, stored.pcm_s16le, stored.frames) {
+            (Some(frame_count), Some(pcm_s16le), None) => Ok(Self::Compact {
+                rate: stored.rate,
+                frame_count,
+                pcm_s16le,
+            }),
+            (None, None, Some(LegacyPcm(frames))) => Ok(Self::Legacy {
+                rate: stored.rate,
+                frames,
+            }),
+            _ => Err(serde::de::Error::custom("Invalid capture PCM fields")),
+        }
+    }
+}
+
+struct LegacyPcm(Vec<[i16; 2]>);
+
+impl<'de> Deserialize<'de> for LegacyPcm {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Frames;
+        impl<'de> serde::de::Visitor<'de> for Frames {
+            type Value = LegacyPcm;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("stereo PCM within the capture frame budget")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let limit_error = || serde::de::Error::custom("Capture exceeds its frame budget");
+                let known_size = seq.size_hint().unwrap_or(0);
+                if known_size > MAX_CAPTURE_FRAMES {
+                    return Err(limit_error());
+                }
+                let mut frames = Vec::with_capacity(known_size);
+                while let Some(frame) = seq.next_element()? {
+                    if frames.len() == MAX_CAPTURE_FRAMES {
+                        return Err(limit_error());
+                    }
+                    if frames.len() == frames.capacity() {
+                        let extra = frames.capacity().max(1024).min(MAX_CAPTURE_FRAMES - frames.len());
+                        frames.reserve_exact(extra);
+                    }
+                    frames.push(frame);
+                }
+                Ok(LegacyPcm(frames))
+            }
+        }
+        deserializer.deserialize_seq(Frames)
+    }
+}
+
+impl CaptureFile {
+    fn decode(self) -> Result<Arc<Take>, String> {
+        let (rate, frames) = match self {
+            Self::Compact { rate, frame_count, pcm_s16le } => {
+                if rate == 0 { return Err("Invalid capture source rate".into()); }
+                (rate, pcm::decode(&pcm_s16le, frame_count, MAX_CAPTURE_FRAMES)?)
+            }
+            Self::Legacy { rate, frames } => (rate, frames),
+        };
+        Take::new(rate, frames).ok_or_else(|| "Invalid capture sample".to_string())
     }
 }
 
 #[derive(Serialize, Deserialize)]
-struct CaptureFile {
-    rate: u32,
-    frames: Vec<[i16; 2]>,
+struct KitFile {
+    samples: [Option<KitSampleFile>; SLOTS],
+    params: [StoredSlot; SLOTS],
+    lanes: [StoredKitLane; NUM_LANES],
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "KitSlot")]
+struct KitSlotDef {
+    tune: f32,
+    decay: f32,
+    level: f32,
+    filter: f32,
+    start: f32,
+    reverse: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "KitLane")]
+struct KitLaneDef {
+    bytebus: bool,
+    clock: u8,
+    drop_samples: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+struct StoredSlot(#[serde(with = "KitSlotDef")] KitSlot);
+
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+struct StoredKitLane(#[serde(with = "KitLaneDef")] KitLane);
+
+#[derive(Serialize, Deserialize)]
+struct KitSampleFile {
+    name: String,
+    rate: u32,
+    frame_count: usize,
+    pcm_s16le: String,
+}
+
+impl KitFile {
+    fn from_kit(kit: &Kit) -> Option<Self> {
+        if kit.samples.iter().all(Option::is_none)
+            && kit.params == [KitSlot::default(); SLOTS] && kit.lanes == [KitLane::default(); NUM_LANES] {
+            return None;
+        }
+        Some(Self {
+            samples: kit.samples.each_ref().map(|slot| slot.as_ref().map(|s| KitSampleFile {
+                name: s.name.clone(),
+                rate: s.rate,
+                frame_count: s.pcm.len(),
+                pcm_s16le: pcm::encode(s.pcm.as_chunks::<1>().0),
+            })),
+            params: kit.params.map(StoredSlot),
+            lanes: kit.lanes.map(StoredKitLane),
+        })
+    }
+
+    fn decode(self) -> Result<Kit, String> {
+        let mut kit = Kit { params: self.params.map(|v| v.0), lanes: self.lanes.map(|v| v.0), ..Kit::default() };
+        let mut count = 0usize;
+        for slot in self.samples.iter().flatten() {
+            count = count.saturating_add(slot.frame_count);
+            if slot.name.is_empty() || slot.name.len() > 256 || !(1_000..=768_000).contains(&slot.rate)
+                || slot.frame_count < 2 || count > MAX_KIT_FRAMES {
+                return Err("OtisKit sample name, rate or frame budget is invalid".into());
+            }
+        }
+        if !kit.is_valid() {
+            return Err("Invalid OtisKit controls".into());
+        }
+        for (dest, file) in kit.samples.iter_mut().zip(self.samples) {
+            if let Some(file) = file {
+                let frames = pcm::decode::<1>(&file.pcm_s16le, file.frame_count, MAX_KIT_FRAMES)?;
+                let pcm = frames.into_iter().map(|[v]| v).collect();
+                *dest = Some(KitSample::new(file.name, file.rate, pcm)?);
+            }
+        }
+        Ok(kit)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "echo::Params")]
+struct EchoParamsDef {
+    echo_mix: f32,
+    space_mix: f32,
+    time: f32,
+    #[serde(with = "EchoSyncDef")]
+    sync: echo::Sync,
+    ratio: u8,
+    feedback: f32,
+    tone: f32,
+    spread: f32,
+    shift_hz: f32,
+    shift_in_loop: bool,
+    #[serde(with = "EspModeDef")]
+    esp: esp::Mode,
+    limit_64k: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "echo::Sync", rename_all = "snake_case")]
+enum EchoSyncDef { Free, Transport, ByteBus }
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "esp::Mode", rename_all = "snake_case")]
+enum EspModeDef { Off, Rate336, Rate224, Rate128 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "DelayMode", rename_all = "snake_case")]
@@ -213,7 +410,7 @@ impl SampleFile {
 
 impl ProjectFile {
     fn into_project(self) -> Result<Project, String> {
-        if self.version != PROJECT_VERSION {
+        if !matches!(self.version, 1 | PROJECT_VERSION) {
             return Err(format!("Unsupported project version {}", self.version));
         }
         if !(40.0..=240.0).contains(&self.bpm) {
@@ -232,14 +429,10 @@ impl ProjectFile {
         if routing.render_order().is_none() {
             return Err("Invalid or cyclic instrument routing".to_string());
         }
-        let take = self
-            .instruments
-            .take
-            .map(|file| {
-                Take::new(file.rate, file.frames)
-                    .ok_or_else(|| "Invalid capture sample".to_string())
-            })
-            .transpose()?;
+        let echo = self.instruments.echo;
+        if !echo.is_valid() { return Err("Invalid BEND Echo or ESP settings".into()); }
+        let kit = self.instruments.kit.map(KitFile::decode).transpose()?.unwrap_or_default();
+        let take = self.instruments.take.map(CaptureFile::decode).transpose()?;
         let mut lane_patches = default_lane_patches();
         if let Some(stored) = &self.lane_patches {
             for (patch, stored) in lane_patches.iter_mut().zip(stored) {
@@ -299,7 +492,7 @@ impl ProjectFile {
             sample_regions,
             custom_shader: self.custom_shader,
             voice_calibration: self.voice_calibration,
-            instruments: InstrumentSettings { routing, take },
+            instruments: InstrumentSettings { routing, take, kit, echo },
         })
     }
 }
@@ -358,6 +551,9 @@ pub fn save(path: &Path, project: Project) -> Result<(), String> {
     if project.instruments.routing.render_order().is_none() {
         return Err("Invalid or cyclic instrument routing".to_string());
     }
+    if !project.instruments.kit.is_valid() || !project.instruments.echo.is_valid() {
+        return Err("Invalid OtisKit or BEND Echo settings".into());
+    }
     let project = ProjectFile {
         version: PROJECT_VERSION,
         bpm: project.bpm,
@@ -379,10 +575,13 @@ pub fn save(path: &Path, project: Project) -> Result<(), String> {
         voice_calibration: project.voice_calibration,
         instruments: InstrumentFile {
             routing: project.instruments.routing,
-            take: project.instruments.take.as_deref().map(|take| CaptureFile {
+            take: project.instruments.take.as_deref().map(|take| CaptureFile::Compact {
                 rate: take.rate,
-                frames: take.frames.clone(),
+                frame_count: take.frames.len(),
+                pcm_s16le: pcm::encode(&take.frames),
             }),
+            kit: KitFile::from_kit(&project.instruments.kit),
+            echo: project.instruments.echo,
         },
     };
     let mut bytes = serde_json::to_vec(&project).map_err(|error| error.to_string())?;
@@ -551,6 +750,92 @@ mod tests {
             restored.c4_rate_hz.to_bits(),
             samples[2].as_ref().unwrap().c4_rate_hz.to_bits()
         );
+    }
+
+    #[test]
+    fn legacy_capture_pcm_decodes_at_the_limit_and_rejects_the_next_frame() {
+        let prefix = r#"{"rate":48000,"frames":["#;
+        let frames = "[100,-200],".repeat(MAX_CAPTURE_FRAMES - 1);
+        let valid = format!("{prefix}{frames}[300,-400]]}}");
+        let capture: CaptureFile = serde_json::from_str(&valid).unwrap();
+        let take = capture.decode().unwrap();
+        assert_eq!(take.rate, 48_000);
+        assert_eq!(take.frames.len(), MAX_CAPTURE_FRAMES);
+        assert_eq!(take.frames[0], [100, -200]);
+        assert_eq!(take.frames[MAX_CAPTURE_FRAMES - 1], [300, -400]);
+        let oversized = format!("{prefix}{frames}[300,-400],[500,-600]]}}");
+        let error = serde_json::from_str::<CaptureFile>(&oversized).err().unwrap();
+        assert!(error.to_string().contains("frame budget"));
+    }
+
+    #[test]
+    fn full_wave8_kit_and_take_share_a_bounded_project_and_reload() {
+        use crate::export::{ExportJob, ExportRequest, ExportSettings};
+        use leviathan_core::NoteCell;
+        use leviathan_core::rack_routing::LaneInput;
+
+        let path = std::env::temp_dir().join(format!("leviathan-wave8-{}.leviathan.json", std::process::id()));
+        let mut patterns = vec![Pattern::default(); PATTERN_BANK_CAPACITY];
+        patterns[0].automation[1].byte_override = true;
+        patterns[0].automation[2].byte_word = 0x80;
+        let mut instruments = InstrumentSettings {
+            take: Take::new(96_000, vec![[i16::MIN, i16::MAX]; MAX_CAPTURE_FRAMES]),
+            echo: echo::Params { esp: esp::Mode::Rate128, sync: echo::Sync::ByteBus, echo_mix: 0.4, ..echo::Params::default() },
+            ..InstrumentSettings::default()
+        };
+        for i in 0..SLOTS {
+            instruments.kit.samples[i] = Some(KitSample::new(format!("Drum {i}"), 44_100 + i as u32, vec![2048 - i as i16; MAX_KIT_FRAMES / SLOTS]).unwrap());
+        }
+        instruments.kit.params[7].reverse = true;
+        instruments.kit.lanes[0].bytebus = true;
+        instruments.routing.inputs[4] = LaneInput::Capture;
+        let mut patches = default_lane_patches();
+        patches[0] = LanePatch::for_machine(MachineKind::OtisKit);
+        patterns[0].length = 1;
+        for lane in [0, 4] {
+            patterns[0].lanes[lane][0] = NoteCell {
+                active: true, midi: 60, velocity: 112, ..NoteCell::default()
+            };
+        }
+        let bank_pcm = vec![i16::MIN; MAX_WAVE_LEN];
+        let bank = DecodedWav {
+            name: "Bank".into(),
+            peaks: sample_peaks(&bank_pcm),
+            samples: bank_pcm.into(),
+            c4_rate_hz: 48_000.0,
+            original_frames: MAX_WAVE_LEN,
+            original_sr: 48_000,
+        };
+        let source = Project {
+            bpm: 120.0, master_send: 0.0, delay_mode: Default::default(), bender_params: Default::default(),
+            lane_mix: LaneMix::default(), lane_patches: patches, patterns, selected_pattern: 0,
+            chain: PatternChain::default(), samples: std::array::from_fn(|_| Some(bank.clone())), sample_regions: Default::default(),
+            custom_shader: None, voice_calibration: false, instruments,
+        };
+        save(&path, source).unwrap();
+        let bytes_on_disk = fs::metadata(&path).unwrap().len();
+        let mut loaded = load(&path).unwrap();
+        assert!(bytes_on_disk < MAX_PROJECT_BYTES);
+        let take = loaded.instruments.take.as_ref().unwrap();
+        assert_eq!(take.frames.len(), MAX_CAPTURE_FRAMES);
+        assert!(take.frames.iter().all(|&frame| frame == [i16::MIN, i16::MAX]));
+        assert_eq!(loaded.instruments.echo.esp, esp::Mode::Rate128);
+        assert_eq!(loaded.patterns[0].automation[1].fixed_byte(), Some(0));
+        assert_eq!(loaded.patterns[0].automation[2].fixed_byte(), Some(0x80));
+        assert_eq!(loaded.instruments.kit.samples[7].as_ref().unwrap().pcm, vec![2041; MAX_KIT_FRAMES / SLOTS]);
+        assert!(loaded.instruments.kit.params[7].reverse && loaded.instruments.kit.lanes[0].bytebus);
+        let old = loaded.instruments.kit.samples[0].as_ref().unwrap().clone();
+        let too_big = KitSample::new("Oversized".into(), 48_000, vec![0; old.pcm.len() + 1]).unwrap();
+        assert!(loaded.instruments.kit.replace(0, too_big).is_err());
+        assert!(Arc::ptr_eq(&old, loaded.instruments.kit.samples[0].as_ref().unwrap()));
+        let bounce = path.with_extension("wav");
+        ExportJob::start(loaded, false, ExportRequest {
+            settings: ExportSettings { tail_seconds: 0.0, ..ExportSettings::default() },
+            destination: bounce.clone(),
+        }).unwrap().finish().unwrap();
+        assert_eq!(fs::metadata(&bounce).unwrap().len(), 44 + 6000 * 4);
+        fs::remove_file(&bounce).unwrap();
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]
