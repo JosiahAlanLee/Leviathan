@@ -25,3 +25,7 @@ Leviathan is authored under the `BSD-3-Clause` license using a clean-room bounda
 5. **Wave 7 DSP Provenance**
    - T28–T30 use the capture, frame scanning, and audio input behavior linked in the roadmap. They reuse Leviathan's clock, mixer, OTIS voices, and VAST algorithms with a new project sample source.
    - T31 uses the clock and reset contract in the [ByteBus Register manual](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/bytebus/docs/MANUAL.md) and the identity and inversion anchors in the [Lookup manual](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/bytebus/docs/LOOKUP.md). The tracker routing and maps are original Rust. Carbon's standalone draft informed the scope review.
+
+6. **Wave 8 DSP Provenance**
+   - Echo and ESP use the behavior linked in the roadmap. The delay, sample-rate converter and number policy are original Rust. They reuse Leviathan's quadrature shifter and Space tank. The ESP rates and echo memory limit model the documented constraints.
+   - OtisKit uses the published one-shot, slot addressing and pitch-rate behaviors, with Leviathan's own tracker note map. The factory kit is generated from original sine and noise envelopes. REWORK uses the documented grain scatter and seam behaviors with a shared grain schedule for stereo.

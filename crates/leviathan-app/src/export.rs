@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use leviathan_core::{EngineConfig, LaunchTarget, SongPlayer, NUM_LANES};
-use leviathan_dsp::{CaptureSamples, LanePatch, StereoDelay, SynthRack};
+use leviathan_dsp::{echo, CaptureSamples, LanePatch, StereoDelay, SynthRack};
 
 use crate::project::Project;
 use crate::wav::{StereoWav, WavEncoding};
@@ -195,9 +195,13 @@ fn render(
     rack.set_routing(project.instruments.routing);
     rack.reset_voices();
     rack.set_bender_params(project.bender_params);
+    rack.set_echo_params(project.instruments.echo);
+    rack.set_tempo(project.bpm);
+    rack.set_kit_controls(project.instruments.kit.params, project.instruments.kit.lanes);
     rack.set_delay_mode(project.delay_mode);
     rack.reset_master(project.master_send);
     let samples = CaptureSamples {
+        kit: Some(&project.instruments.kit),
         current: project
             .instruments
             .take
@@ -206,6 +210,11 @@ fn render(
         ..CaptureSamples::default()
     };
 
+    let mut echo_storage = if project.instruments.echo.echo_mix > 0.0 {
+        vec![[0.0; 2]; echo::capacity(plan.settings.sample_rate as f32)]
+    } else {
+        Vec::new()
+    };
     let mut stems = [[0.0; 2]; NUM_LANES];
     let mut stem_delays: Option<Box<[StereoDelay; NUM_LANES]>> = plan.settings.stems.then(|| {
         std::iter::repeat_with(|| {
@@ -229,9 +238,9 @@ fn render(
             rack.retrigger_gates();
         }
         let ((left, right), wet) = if let Some(delays) = &mut stem_delays {
-            rack.render_session_with_stems(&cv, &samples, &mut stems, delays)
+            rack.render_session_with_echo_stems(&cv, &samples, &mut stems, delays, &mut echo_storage)
         } else {
-            (rack.render_session(&cv, &samples, None).0, [0.0; 2])
+            (rack.render_session_with_echo(&cv, &samples, None, &mut echo_storage).0, [0.0; 2])
         };
         write([left, right], &stems, wet)?;
         if frame & 1023 == 1023 {
@@ -598,5 +607,59 @@ mod tests {
         assert!(legacy.peaks.iter().any(|&peak| peak > 0.01));
         assert!(twin.peaks.iter().any(|&peak| peak > 0.01));
         assert_ne!(legacy.samples, twin.samples);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn wave7_default_echo_and_esp_preserve_the_legacy_pcm() {
+        use crate::capture::Take;
+        use leviathan_core::rack_routing::LaneInput;
+
+        let mut fixture = project();
+        let mut pattern = crate::starter_electro_pattern();
+        pattern.length = 16;
+        pattern.swing = 0.552;
+        fixture.patterns = vec![pattern];
+        fixture.chain = PatternChain::default();
+        fixture.master_send = 0.0;
+        fixture.instruments.routing.inputs[4] = LaneInput::Capture;
+        fixture.instruments.take = Take::new(
+            48_000,
+            (0..2048)
+                .map(|i| [
+                    ((i * 751) % 21_817) as i16 - 10_000,
+                    ((i * 491) % 18_983) as i16 - 9_000,
+                ])
+                .collect(),
+        );
+        fixture.lane_mix.channels[0].0.fx_send = 0.6;
+        fixture.lane_mix.channels[4].0.fx_send = 0.5;
+        fixture.bender_params.shift_norm = 0.613;
+
+        // FNV-1a of stereo PCM rendered at 48 kHz by Wave 7 commit 1641232.
+        let reference = [
+            ("0-kick.wav", 0xb1a9_2c2f_f309_9701),
+            ("1-fm4.wav", 0xb81c_f7e0_daa9_c9ec),
+            ("2-sub.wav", 0x52d2_e653_68f7_58c0),
+            ("3-air.wav", 0x35ca_2c08_1a1d_bdc5),
+            ("4-smpl.wav", 0xdc5c_7d59_8211_96a9),
+            ("5-acid.wav", 0xeb18_d9aa_8050_1a65),
+            ("bend.wav", 0x690a_c3d4_b150_5acf),
+            ("master.wav", 0x09f8_7680_2ce8_24e6),
+        ];
+        let temp = StagingDirectory::new(&std::env::temp_dir().join("leviathan-wave7")).unwrap();
+        let stems = temp.path.join("stems");
+        let settings = ExportSettings { stems: true, ..ExportSettings::default() };
+        let plan = RenderPlan::new(&fixture, settings).unwrap();
+        write_outputs(&fixture, false, plan, &stems, &AtomicU32::new(0)).unwrap();
+        for (name, expected) in reference {
+            let bytes = fs::read(stems.join(name)).unwrap();
+            assert_eq!(&bytes[36..40], b"data");
+            assert_eq!(bytes.len() - 44, plan.frames as usize * 4);
+            let hash = bytes[44..].iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+            });
+            assert_eq!(hash, expected, "{name}");
+        }
     }
 }

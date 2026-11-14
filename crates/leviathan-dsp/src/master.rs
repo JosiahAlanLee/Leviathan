@@ -1,4 +1,6 @@
 use crate::bender::{BenderParams, SpoonBenderBus};
+use crate::{echo, esp};
+use leviathan_core::CvFrame;
 
 const DELAY_WORDS: usize = 16_384;
 const SLAPBACK_FRAMES: usize = DELAY_WORDS / 2;
@@ -121,6 +123,15 @@ impl StereoDelay {
 pub(super) struct MasterBus {
     delay: StereoDelay,
     bender: SpoonBenderBus,
+    bender_params: BenderParams,
+    echo: echo::Echo,
+    echo_params: echo::Params,
+    echo_timing: echo::Timing,
+    echo_clock: echo::Clock,
+    free_seconds: f32,
+    esp: Option<esp::Converter>,
+    rate: f32,
+    bpm: f32,
     send: f32,
     send_target: f32,
     send_step: f32,
@@ -137,6 +148,15 @@ impl MasterBus {
         Self {
             delay: StereoDelay::new(sample_rate),
             bender: SpoonBenderBus::new(sample_rate),
+            bender_params: BenderParams::default(),
+            echo: echo::Echo::new(sample_rate),
+            echo_params: echo::Params::default(),
+            echo_timing: echo::Timing::default(),
+            echo_clock: echo::Clock::default(),
+            free_seconds: echo::Params::default().free_seconds(),
+            esp: None,
+            rate: sample_rate,
+            bpm: 132.0,
             send: 0.0,
             send_target: 0.0,
             send_step: 1.0 / (1.0 + sample_rate * 0.01),
@@ -153,7 +173,60 @@ impl MasterBus {
     }
 
     pub(super) fn set_bender_params(&mut self, params: BenderParams) {
-        self.bender.set_params(params);
+        if params.is_valid() {
+            self.bender_params = params;
+            self.bender.set_params(params);
+        }
+    }
+
+    pub(super) fn set_echo_params(&mut self, params: echo::Params) {
+        if !params.is_valid() {
+            return;
+        }
+        if params.sync != self.echo_params.sync {
+            self.echo_clock.reset();
+        }
+        if params.esp != self.echo_params.esp {
+            self.echo_params = params;
+            self.reset_effects();
+        } else if (params.esp != esp::Mode::Off && params.limit_64k != self.echo_params.limit_64k)
+            || (params.echo_mix > 0.0) != (self.echo_params.echo_mix > 0.0)
+        {
+            self.echo.reset();
+        }
+        if params.shift_in_loop != self.echo_params.shift_in_loop {
+            self.echo.reset_shift();
+        }
+        self.echo_params = params;
+        self.free_seconds = params.free_seconds();
+    }
+
+    pub(super) fn set_tempo(&mut self, bpm: f64) {
+        self.bpm = (bpm as f32).clamp(40.0, 240.0);
+    }
+
+    pub(super) fn echo_timing(&self) -> echo::Timing {
+        self.echo_timing
+    }
+
+    pub(super) fn reset_echo_clock(&mut self) {
+        self.echo_clock.reset();
+    }
+
+    fn reset_effects(&mut self) {
+        let chip_rate = self.echo_params.esp.rate();
+        let effect_rate = chip_rate.unwrap_or(self.rate);
+        // Rate changes reconfigure the fixed state. The long delay itself is
+        // caller-owned and invalidated by its cursor, without clearing its PCM.
+        if self.bender.sample_rate() == effect_rate {
+            self.bender.reset();
+        } else {
+            self.bender.set_sample_rate(effect_rate);
+        }
+        self.bender.set_params(self.bender_params);
+        self.echo = echo::Echo::new(effect_rate);
+        self.esp = chip_rate.map(|chip| esp::Converter::new(self.rate, chip));
+        self.echo_clock.reset();
     }
 
     pub(super) fn set_delay_mode(&mut self, mode: DelayMode) {
@@ -164,7 +237,7 @@ impl MasterBus {
         self.set_send(send);
         self.send = self.send_target;
         self.delay.clear();
-        self.bender.reset();
+        self.reset_effects();
         self.dc_input = [0.0; 2];
         self.dc_output = [0.0; 2];
         self.peaks = MasterPeaks::default();
@@ -182,12 +255,45 @@ impl MasterBus {
 
     pub(super) fn process(
         &mut self,
+        cv: &CvFrame,
         dry: [f32; 2],
         delay_send: [f32; 2],
         fx_send: [f32; 2],
+        echo_storage: &mut [[f32; 2]],
     ) -> ([f32; 2], [f32; 2]) {
         let mix = self.delay.mix(dry.map(finite_sample), delay_send);
-        let wet = self.bender.process(fx_send);
+        let params = self.echo_params;
+        if params.sync == echo::Sync::ByteBus {
+            self.echo_clock.step(cv, self.rate);
+        }
+        self.echo_timing = self.echo_clock.timing(params, self.free_seconds, self.bpm, self.rate);
+        let wet = if params.echo_mix == 0.0 && self.esp.is_none() {
+            let space = self.bender.process(fx_send);
+            if params.space_mix == 1.0 { space } else { space.map(|v| v * params.space_mix) }
+        } else {
+            let time = self.echo_timing.effective_seconds;
+            let echo = &mut self.echo;
+            let bender = &mut self.bender;
+            let fixed = self.esp.is_some();
+            let process = |input| {
+                let echo_wet = if params.echo_mix > 0.0 {
+                    echo.process(input, echo_storage, params, time)
+                } else {
+                    [0.0; 2]
+                };
+                let space_input = core::array::from_fn(|ch| {
+                    esp::node(input[ch] * (1.0 - params.echo_mix) + echo_wet[ch] * params.echo_mix, fixed)
+                });
+                [echo_wet, bender.process_mode(space_input, fixed)]
+            };
+            let [echo, space] = if let Some(converter) = &mut self.esp {
+                converter.step(fx_send, process)
+            } else {
+                let mut process = process;
+                process(fx_send)
+            };
+            core::array::from_fn(|ch| echo[ch] * params.echo_mix * (1.0 - params.space_mix) + space[ch] * params.space_mix)
+        };
         for (channel, sample) in mix.into_iter().enumerate() {
             let sample = sample + wet[channel];
             self.dc_output[channel] = flush_tail(
@@ -243,7 +349,7 @@ mod tests {
 
     fn render(bus: &mut MasterBus, dry: [f32; 2]) -> [f32; 2] {
         let send = bus.next_send();
-        bus.process(dry, dry.map(|sample| sample * send), [0.0; 2]).0
+        bus.process(&CvFrame::default(), dry, dry.map(|sample| sample * send), [0.0; 2], &mut []).0
     }
 
     #[test]

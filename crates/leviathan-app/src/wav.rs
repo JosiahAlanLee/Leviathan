@@ -24,6 +24,31 @@ pub fn load_wav_file(path: &Path) -> Result<DecodedWav, String> {
     decode_wav_bytes(&name, &bytes)
 }
 pub fn decode_wav_bytes(name: &str, bytes: &[u8]) -> Result<DecodedWav, String> {
+    let (sample_rate, mono) = decode_mono(bytes, usize::MAX)?;
+    let num_frames = mono.len();
+    if num_frames < 2 {
+        return Err("WAV contains fewer than 2 sample frames".into());
+    }
+    make_sample_bank(name, sample_rate, mono)
+}
+
+pub fn load_kit_wav(path: &Path) -> Result<(String, u32, Vec<i16>), String> {
+    use std::io::Read;
+    // Bound raw input independently of decoded frame count, including multichannel WAV.
+    const MAX_FILE: u64 = 64 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut bytes))
+        .map_err(|e| format!("Read error: {e}"))?;
+    if bytes.len() as u64 > MAX_FILE {
+        return Err("Kit WAV exceeds 64 MiB".into());
+    }
+    let (rate, mono) = decode_mono(&bytes, leviathan_dsp::otis_kit::MAX_FRAMES)?;
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("sample.wav").to_owned();
+    let pcm = mono.into_iter().map(|s| (s * 32_768.0).round() as i16).collect();
+    Ok((name, rate, pcm))
+}
+
+fn decode_mono(bytes: &[u8], max_frames: usize) -> Result<(u32, Vec<f32>), String> {
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err("Not a valid RIFF/WAVE file".to_string());
     }
@@ -82,6 +107,9 @@ pub fn decode_wav_bytes(name: &str, bytes: &[u8]) -> Result<DecodedWav, String> 
         return Err("WAV contains fewer than 2 sample frames".to_string());
     }
 
+    if num_frames > max_frames {
+        return Err("WAV exceeds the kit frame budget".into());
+    }
     let mut mono = Vec::with_capacity(num_frames);
     let ch_scale = 1.0 / channels as f32;
 
@@ -140,6 +168,11 @@ pub fn decode_wav_bytes(name: &str, bytes: &[u8]) -> Result<DecodedWav, String> 
         mono.push((sum * ch_scale).clamp(-1.0, 1.0));
     }
 
+    Ok((sample_rate, mono))
+}
+
+fn make_sample_bank(name: &str, sample_rate: u32, mono: Vec<f32>) -> Result<DecodedWav, String> {
+    let num_frames = mono.len();
     let (pcm_vec, c4_rate_hz) = if mono.len() <= MAX_WAVE_LEN {
         let pcm: Vec<i16> = mono
             .iter()

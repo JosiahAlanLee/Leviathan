@@ -329,6 +329,23 @@ pub const MACHINE_SPECS: [MachineSpec; MACHINE_COUNT] = [
             ParamSpec::new("PostReso", 0.36),
         ],
     },
+    MachineSpec {
+        kind: MachineKind::OtisKit,
+        id: 17,
+        slug: "okit",
+        badge: "OKIT",
+        name: "OtisKit",
+        params: [
+            ParamSpec::new("Slot offset", 0.5),
+            ParamSpec::new("Tune offset", 0.5),
+            ParamSpec::new("Decay offset", 0.5),
+            ParamSpec::new("Filter offset", 0.5),
+            ParamSpec::new("Start offset", 0.5),
+            ParamSpec::new("Reverse flip", 0.5),
+            ParamSpec::new("Clock offset", 0.5),
+            ParamSpec::new("Level offset", 0.5),
+        ],
+    },
 ];
 
 #[inline]
@@ -395,8 +412,18 @@ impl LanePatch {
     }
 
     #[inline]
+    pub const fn step_base_params(&self, machine: MachineKind) -> [f32; SOUND_PARAMS] {
+        if matches!(machine, MachineKind::OtisKit) && !matches!(self.machine, MachineKind::OtisKit) {
+            machine_spec(machine).default_params()
+        } else {
+            self.params
+        }
+    }
+
+    #[inline]
     pub const fn resolve_lock(&self, step_lock: &SoundLock) -> SoundLock {
-        step_lock.resolved_with_base(self.machine as i16, &self.params)
+        let machine = MachineKind::from_patch_and_lock(self, step_lock);
+        step_lock.resolved_with_base(self.machine as i16, &self.step_base_params(machine))
     }
 }
 

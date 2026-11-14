@@ -1,18 +1,23 @@
 mod audio;
+mod audition;
 mod capture;
 mod export;
 mod export_ui;
 mod gen_ui;
 mod gpu_view;
 mod inspector_ui;
+mod kit;
+mod kit_ui;
 mod lane_mix;
 mod link;
 mod locks_ui;
 mod master_ui;
 mod midi;
 mod mixer_ui;
+mod pcm;
 mod project;
 mod rack_ui;
+mod rework_ui;
 mod sampler_ui;
 mod session_ui;
 mod smf;
@@ -213,6 +218,12 @@ struct LeviathanApp {
     instruments: project::InstrumentSettings,
     capture_port: CapturePort,
     rack_panel: rack_ui::RackPanel,
+    kit_ui: kit_ui::KitUi,
+    rework: rework_ui::ReworkUi,
+    echo_timing: leviathan_dsp::echo::Timing,
+    show_kit: bool,
+    kit_sounding: [u8; NUM_LANES],
+    capture_kit_slot: Option<usize>,
     routed_byte: Option<u8>,
     audio: AudioControl,
     tel_rx: rtrb::Consumer<AudioTelemetry>,
@@ -307,6 +318,12 @@ impl LeviathanApp {
             instruments: project::InstrumentSettings::default(),
             capture_port,
             rack_panel: rack_ui::RackPanel::default(),
+            kit_ui: kit_ui::KitUi::default(),
+            rework: rework_ui::ReworkUi::default(),
+            echo_timing: Default::default(),
+            show_kit: false,
+            kit_sounding: [0; NUM_LANES],
+            capture_kit_slot: None,
             routed_byte: None,
             audio: AudioControl::new(cmd_tx),
             tel_rx,
@@ -684,6 +701,9 @@ impl LeviathanApp {
         if master_ui::draw_bender(ui, &mut self.bender_params) {
             self.send_audio(AudioCommand::SetBenderParams(self.bender_params));
         }
+        if master_ui::draw_echo(ui, &mut self.instruments.echo, self.echo_timing, self.bpm) {
+            self.send_audio(AudioCommand::SetEchoParams(self.instruments.echo));
+        }
     }
 
     fn draw_routing_deck(&mut self, ui: &mut egui::Ui) {
@@ -713,18 +733,22 @@ impl LeviathanApp {
     }
 
     fn draw_samples_deck(&mut self, ui: &mut egui::Ui, hovering_wav: bool) -> Vec<BankAction> {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.show_kit, false, "Capture and Banks");
+            ui.selectable_value(&mut self.show_kit, true, "OtisKit");
+        });
+        let selected = self.show_kit.then_some(self.kit_ui.slot);
         match self.rack_panel.draw_capture(
             ui,
             self.instruments.take.as_deref(),
             self._audio_stream.is_some(),
             self.capture_port.busy(),
             self.playing,
+            if self.capture_port.busy() { self.capture_kit_slot } else { selected },
         ) {
             Some(rack_ui::CaptureAction::Arm(source, beats)) => {
-                if self
-                    .capture_port
-                    .request(self.project_generation, source, beats)
-                {
+                if self.capture_port.request(self.project_generation, source, beats) {
+                    self.capture_kit_slot = selected;
                     self.rack_panel.status = "";
                     self.rack_panel.stage = capture::Stage::Armed;
                     self.rack_panel.beats_left = None;
@@ -735,7 +759,62 @@ impl LeviathanApp {
             None => {}
         }
         ui.separator();
-        self.sampler_ui.draw(ui, hovering_wav)
+        if self.show_kit {
+            let sounding = self.kit_sounding[self.cursor.lane];
+            self.kit_ui.sounding = std::array::from_fn(|slot| sounding & (1 << slot) != 0);
+            let edits = self.kit_ui.draw(ui, &mut self.instruments.kit, self.cursor.lane,
+                self.instruments.take.is_some(), self.capture_port.busy(), self._audio_stream.is_some());
+            if edits.samples {
+                self.publish_kit();
+            } else if edits.controls {
+                self.send_audio(AudioCommand::SetKitControls {
+                    params: self.instruments.kit.params, lanes: self.instruments.kit.lanes,
+                });
+            }
+            if edits.audition {
+                let slot = self.kit_ui.slot;
+                if let Some(sample) = self.instruments.kit.samples[slot].clone() {
+                    let request = rework_ui::kit_audition(sample, self.instruments.kit.params[slot]);
+                    self.send_audio(AudioCommand::Audition(Arc::new(request)));
+                }
+            }
+            if edits.use_capture {
+                if let Some(take) = &self.instruments.take {
+                    match self.instruments.kit.capture_into(self.kit_ui.slot, take) {
+                        Ok(()) => {
+                            self.kit_ui.status = "Capture copied into slot".into();
+                            self.publish_kit();
+                        }
+                        Err(error) => self.kit_ui.status = error,
+                    }
+                }
+            }
+        }
+        let rework = self.rework.draw(
+            ui, self.project_generation, &self.instruments, self.kit_ui.slot, self._audio_stream.is_some(),
+        );
+        if let Some(request) = rework.audition {
+            self.send_audio(AudioCommand::Audition(Arc::new(request)));
+        }
+        if rework.commit && self.rework.commit(self.project_generation, &mut self.instruments) {
+            match self.rework.target() {
+                rework_ui::Target::Take => {
+                    if let Some(take) = &self.instruments.take {
+                        self.send_audio(AudioCommand::InstallTake(take.clone()));
+                    }
+                }
+                rework_ui::Target::Kit(_) => self.publish_kit(),
+            }
+        }
+        if self.show_kit {
+            Vec::new()
+        } else {
+            self.sampler_ui.draw(ui, hovering_wav)
+        }
+    }
+
+    fn publish_kit(&mut self) {
+        self.send_audio(AudioCommand::SetKit(Arc::new(self.instruments.kit.clone())));
     }
 
     fn draw_scene_deck(
@@ -874,6 +953,11 @@ impl LeviathanApp {
         self.voice_calibration = project.voice_calibration;
         self.instruments = project.instruments;
         self.rack_panel.status = "";
+        self.kit_ui.status.clear();
+        self.kit_sounding = [0; NUM_LANES];
+        self.rework.reset();
+        self.echo_timing = Default::default();
+        self.capture_kit_slot = None;
         self.rack_panel.stage = capture::Stage::Idle;
         self.rack_panel.beats_left = None;
         self.rack_panel.routing_error = false;
@@ -934,6 +1018,8 @@ impl eframe::App for LeviathanApp {
                 self.rack_panel.beats_left = telemetry.capture_beats_left;
                 self.transport_position = telemetry.transport_position;
                 self.routed_byte = telemetry.routed_byte;
+                self.echo_timing = telemetry.echo_timing;
+                self.kit_sounding = telemetry.kit_sounding;
                 peaks.merge(telemetry.master);
             }
         }
@@ -942,12 +1028,27 @@ impl eframe::App for LeviathanApp {
             .poll()
             .filter(|result| result.project == self.project_generation)
         {
+            let destination = self.capture_kit_slot.take();
             self.rack_panel.status = match result.outcome {
                 Outcome::Complete(rate) => {
                     if let Some(take) = Take::new(rate, result.frames) {
-                        self.instruments.take = Some(take.clone());
-                        self.send_audio(AudioCommand::InstallTake(take));
-                        "Capture sample ready"
+                        if let Some(slot) = destination {
+                            match self.instruments.kit.capture_into(slot, &take) {
+                                Ok(()) => {
+                                    self.publish_kit();
+                                    self.kit_ui.status = format!("Capture saved to Slot {}", slot + 1);
+                                    "Kit capture ready"
+                                }
+                                Err(error) => {
+                                    self.kit_ui.status = error;
+                                    "Kit capture could not fit"
+                                }
+                            }
+                        } else {
+                            self.instruments.take = Some(take.clone());
+                            self.send_audio(AudioCommand::InstallTake(take));
+                            "Capture sample ready"
+                        }
                     } else {
                         "Capture had no audio frames"
                     }
@@ -956,6 +1057,7 @@ impl eframe::App for LeviathanApp {
                 Outcome::Full => "Capture exceeded 192,000 frames",
             };
         }
+        self.rework.poll(ctx, self.project_generation, &self.instruments);
         let now = ctx.input(|input| input.time);
         self.master_meters.update(peaks, now);
 
@@ -1117,8 +1219,14 @@ impl eframe::App for LeviathanApp {
                 }
                 if self.capture_port.busy() {
                     ui.strong(self.rack_panel.busy_text(self.playing));
+                    if let Some(slot) = self.capture_kit_slot {
+                        ui.small(format!("Kit {}", slot + 1));
+                    }
                 } else if !self.rack_panel.status.is_empty() {
                     ui.small(self.rack_panel.status);
+                }
+                if self.rework.busy() {
+                    ui.small("REWORK processing");
                 }
             });
         });

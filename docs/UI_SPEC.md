@@ -14,9 +14,9 @@ The tracker remains visible while working in a context deck. The deck and the Vo
 |---|---|---|
 | F1 | Grid | Closes the side pane |
 | F2 | Voice / Trig | **Lane Patch** edits the lane's base machine and macros. **Step Lock** shows the effective machine, inherited values and explicit overrides, probability, gate, FILL, nudge and retrigs |
-| F3 | Mixer | Six lane levels, pans and sends, master delay send and mode, BEND shift, feedback, decay and Freeze |
+| F3 | Mixer | Six lane levels, pans and sends, master delay and BEND Space, Echo and ESP |
 | F4 | Routing | Input for the selected lane, take trim and looping, transwave frame size and ByteBus clocking, Register and Lookup |
-| F5 | Samples | Beat-synced lane or BEND capture, four VarSampler banks and their waveform, WAV load and trim |
+| F5 | Samples | Beat-synced lane or BEND capture, the four VarSampler banks, the eight-slot OtisKit editor and REWORK |
 | F6 | Scene | Live feedback, existing WGSL load and hot reload, audio scope and row automation for Z, Roll, Feedback and ByteBus |
 | F7 | Song | Edit, cue or queue the existing chain. Shows the active entry, each pattern's duration, and its starting beat in the chain |
 
@@ -35,17 +35,17 @@ The app uses six lanes, up to 64 rows per pattern, a 16-pattern bank, and a 64-e
 
 ## Wave 8 controls
 
-The [Wave 8 plan](https://github.com/JosiahAlanLee/Leviathan/pull/22) owns the DSP, sample storage and real-time contracts for T32–T35. Confirm the UI against working Echo and OtisKit sessions after those controls exist.
+The [Wave 8 roadmap](../ROADMAP.md#wave-8-t32t35--otiskit-seeded-rework-and-spoonbender-echo--esp) describes the DSP, sample storage and real-time contracts for T32–T35. The Mixer and Samples decks provide the first controls. Use the desktop workflow below to review them on an integrated GPU and audio device.
 
-| Deck | Proposed workflow | Acceptance |
+| Deck | Workflow | Desktop check |
 |---|---|---|
-| Mixer | Show `Input → Echo → Space → Return`. Put source, ratio and effective echo time together, including when a time cap applies. Use **LOOP** for shifting inside feedback and **POST** for shifting each outgoing echo once. Keep Space Freeze, ESP mode and rates close to the stages they affect | Compare `1×` on transport and default ByteBus at 120 BPM (500 ms and 125 ms). Check the clamp, Freeze, BEND capture and exported return |
-| Routing | Show the existing single-source selection per destination as a patch matrix once it fits the pane. Use separate sections for audio and clocked ByteBus. Mark unavailable routes and explain a rejected cycle | Trace a take into SMPL, OTIS, OT2 and VAST, plus a lane into VAST. Trace the raw tracker word through Register and Lookup to BBUS or the frame clock. Add pins as their signal paths land |
-| Samples | Group banks, the captured take and kit slots. Show source, current target, trim/loop, transwave frame size and the take or slot currently assigned. Use an eight-row kit editor for Tune, Decay, Level, Filter, Start and Reverse. Preview REWORK dry/wet before applying | Capture to a named target, audition and replace it, and observe armed, recording and processing states. Check that a stale REWORK result leaves the newer sample intact and that save/reopen restores the committed PCM |
+| Mixer | Shows `Send → Echo → Space → Return`. Source, ratio and effective time are grouped with the memory cap. Uses **LOOP** inside feedback and **POST** on outgoing repeats, with separate controls for Space and Freeze | Compare `1×` on transport and default ByteBus at 120 BPM (500 ms and 125 ms). Check the clamp, Freeze, BEND capture and exported return |
+| Routing | The selected lane shows its current input and the shared capture and ByteBus controls. A patch matrix with separate audio and clocked ByteBus sections remains a UI prototype | Trace a take into SMPL, OTIS, OT2 and VAST, plus a lane into VAST. Trace the raw tracker word through Register and Lookup to BBUS, OtisKit or the frame clock |
+| Samples | The Capture and Banks tab preserves the stereo take workflow. The OtisKit tab captures directly into the selected slot and marks playing slots for the current lane. The eight-row editor shows Tune, Decay, Level, Filter, Start and Reverse. REWORK provides a waveform comparison and monitor audition before committing PCM | Capture to a named target, audition and replace it, and observe armed, recording and processing states. Check that a stale REWORK result leaves the newer sample intact and that save/reopen restores the committed PCM |
 
 Prototype a “Slice take to Kit” action after slot addressing and region ownership are defined. Derive waveforms from peaks cached per sample generation, and add a frame-grid overlay for OTIS/OT2 where it helps select transwave regions. Keep the full-resolution PCM on the host side of the publication boundary.
 
-Before the Wave 8 sample editors depend on project storage, follow the roadmap's compact, versioned PCM representation and decoded-frame budgets for a full kit plus a stereo take. Keep loading v1 numeric PCM with source rates, trims, routing, chain, lane and step patches and custom WGSL. The v1 file cap is 8 MiB. Measure the largest supported combination by serializing, loading and exporting it. A 128-pattern × 128-row expansion of the *Trace Current* fixture alone takes about 21 MiB as expanded v1 JSON. Set a storage and migration budget before expanding the grid.
+Version 2 saves the kit and stereo take as base64 signed 16-bit PCM with frame counts and source rates. The project cap stays at 8 MiB. An automated check saves, reloads and exports a project with a full kit, stereo take, four banks and sixteen patterns. The loader also accepts v1 numeric capture PCM. A 128-pattern × 128-row expansion of the *Trace Current* fixture alone takes about 21 MiB as expanded v1 JSON. Set a storage and migration budget before expanding the grid.
 
 ## Grid and arrangement prototypes
 

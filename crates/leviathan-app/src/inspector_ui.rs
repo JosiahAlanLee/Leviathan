@@ -160,9 +160,10 @@ pub fn draw_step(
     cell_dirty |= previous != edit_cell.lock.machine;
 
     let spec = MachineKind::from_patch_and_lock(lane_patch, &edit_cell.lock).spec();
+    let base_params = lane_patch.step_base_params(spec.kind);
     for (slot, param) in spec.params.iter().enumerate() {
         ui.horizontal_wrapped(|ui| {
-            let base = lane_patch.params[slot];
+            let base = base_params[slot];
             let mut locked = ((edit_cell.lock.mask >> slot) & 1) != 0;
             if ui
                 .checkbox(&mut locked, "")
@@ -188,7 +189,7 @@ pub fn draw_step(
                         .clamping(egui::SliderClamping::Edits)
                         .text(format!("P{slot} {}", param.name)),
                 )
-                .on_hover_text(format!("Lane value: {base:.3}"))
+                .on_hover_text(format!("Unlocked value · {base:.3}"))
                 .changed()
             {
                 edit_cell.lock.mask |= 1 << slot;

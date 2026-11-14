@@ -59,7 +59,7 @@ struct Quadrature {
 
 impl Quadrature {
     #[inline]
-    fn step(&mut self, input: f32) -> [f32; 2] {
+    fn step(&mut self, input: f32, fixed: bool) -> [f32; 2] {
         // Six-pole paths with three z^-2 allpasses apiece, plus a one-sample Q
         // delay. Coefficients were fitted to a +90 degree I/Q phase difference
         // over 0.0014..0.4986 cycles/sample using the allpass transfer function
@@ -72,8 +72,9 @@ impl Quadrature {
         for (branch, coefficients) in COEFFICIENTS.into_iter().enumerate() {
             for (stage, a) in coefficients.into_iter().enumerate() {
                 let history = &mut self.state[branch][stage][self.parity];
-                let y = *history - a * out[branch];
-                *history = flush(out[branch] + a * y);
+                let a = crate::esp::coefficient(a, fixed);
+                let y = crate::esp::node(*history - a * out[branch], fixed);
+                *history = flush(crate::esp::node(out[branch] + a * y, fixed));
                 out[branch] = y;
             }
         }
@@ -83,7 +84,7 @@ impl Quadrature {
 }
 
 #[derive(Default)]
-struct FrequencyShifter {
+pub(super) struct FrequencyShifter {
     phase: f32,
     channels: [Quadrature; 2],
 }
@@ -91,12 +92,17 @@ struct FrequencyShifter {
 impl FrequencyShifter {
     #[inline]
     fn step(&mut self, input: [f32; 2], shift_hz: f32, rate: f32) -> [f32; 2] {
+        self.step_mode(input, shift_hz, rate, false)
+    }
+
+    #[inline]
+    pub(super) fn step_mode(&mut self, input: [f32; 2], shift_hz: f32, rate: f32, fixed: bool) -> [f32; 2] {
         self.phase = wrap_turns(self.phase + shift_hz / rate);
         let cosine = cosine(self.phase);
         let sine = sine(self.phase);
         core::array::from_fn(|channel| {
-            let [i, q] = self.channels[channel].step(input[channel]);
-            i * cosine - q * sine
+            let [i, q] = self.channels[channel].step(input[channel], fixed);
+            crate::esp::node(i * cosine - q * sine, fixed)
         })
     }
 }
@@ -116,10 +122,11 @@ impl Diffuser {
         }
     }
 
-    fn step(&mut self, input: f32) -> f32 {
+    fn step(&mut self, input: f32, fixed: bool) -> f32 {
         let delayed = self.buffer[self.position];
-        let output = delayed - 0.55 * input;
-        self.buffer[self.position] = flush(input + 0.55 * output);
+        let gain = crate::esp::coefficient(0.55, fixed);
+        let output = crate::esp::node(delayed - gain * input, fixed);
+        self.buffer[self.position] = flush(crate::esp::memory(input + gain * output, fixed));
         self.position += 1;
         if self.position == self.length {
             self.position = 0;
@@ -173,22 +180,25 @@ impl Tank {
     }
 
     #[inline]
-    fn step(&mut self, input: [f32; 2], feedback: f32, damping: f32, frozen: f32) -> [f32; 2] {
+    fn step(&mut self, input: [f32; 2], feedback: f32, damping: f32, frozen: f32, fixed: bool) -> [f32; 2] {
         let read: [f32; 4] =
             core::array::from_fn(|i| self.memory[self.offsets[i] + self.cursors[i]]);
         let loss = 1.0 - frozen;
+        let quantize_loop = fixed && frozen < 1.0;
+        let node = |value| crate::esp::node(value, quantize_loop);
+        let damping = crate::esp::coefficient(damping, quantize_loop);
         let filtered = core::array::from_fn(|i| {
-            self.lows[i] = flush(self.lows[i] + damping * (read[i] - self.lows[i]));
-            read[i] + loss * (self.lows[i] - read[i])
+            self.lows[i] = flush(node(self.lows[i] + damping * (read[i] - self.lows[i])));
+            node(read[i] + loss * (self.lows[i] - read[i]))
         });
-        let gain = feedback + frozen * (1.0 - feedback);
-        let feedback = hadamard(filtered);
+        let gain = crate::esp::coefficient(feedback + frozen * (1.0 - feedback), quantize_loop);
+        let feedback = hadamard(filtered).map(node);
         let [l, r] = input.map(|v| 0.5 * loss * v);
         // Use two orthogonal Hadamard columns for the stereo input and return.
         let injection = [l + r, l - r, l + r, l - r];
         for i in 0..4 {
             self.memory[self.offsets[i] + self.cursors[i]] =
-                flush(gain * feedback[i] + injection[i]);
+                flush(crate::esp::memory(node(gain * feedback[i] + injection[i]), quantize_loop));
             self.cursors[i] += 1;
             if self.cursors[i] == self.lengths[i] {
                 self.cursors[i] = 0;
@@ -196,7 +206,7 @@ impl Tank {
         }
         let even = read[0] + read[2];
         let odd = read[1] + read[3];
-        [0.5 * (even + odd), 0.5 * (even - odd)]
+        [0.5 * (even + odd), 0.5 * (even - odd)].map(|v| crate::esp::node(v, fixed))
     }
 }
 
@@ -270,6 +280,27 @@ impl SpoonBenderBus {
         }
     }
 
+    pub(super) fn sample_rate(&self) -> f32 {
+        self.rate
+    }
+
+    pub(super) fn set_sample_rate(&mut self, rate: f32) {
+        self.rate = rate;
+        for (diffuser, seconds) in self.diffusers.iter_mut().zip([0.0013, 0.0017]) {
+            diffuser.length = ((rate * seconds + 0.5) as usize).clamp(1, DIFFUSER_SAMPLES);
+        }
+        let mut offset = 0;
+        for i in 0..4 {
+            let length = delay_frames(rate.min(MAX_TANK_RATE), DELAY_SECONDS[i]);
+            self.tank.lengths[i] = length;
+            self.tank.offsets[i] = offset;
+            offset += length;
+        }
+        self.control_step = 1.0 / (1.0 + 0.012 * rate);
+        self.freeze_step = 1.0 / (0.025 * rate);
+        self.reset();
+    }
+
     pub fn set_params(&mut self, params: BenderParams) {
         if params.is_valid() {
             self.shift_target = params.shift_hz();
@@ -302,6 +333,10 @@ impl SpoonBenderBus {
 
     #[inline]
     pub(crate) fn process(&mut self, input: [f32; 2]) -> [f32; 2] {
+        self.process_mode(input, false)
+    }
+
+    pub(crate) fn process_mode(&mut self, input: [f32; 2], fixed: bool) -> [f32; 2] {
         let excitation = input.map(|v| if v.is_finite() { v } else { 0.0 });
         if self.quiet_frames == u32::MAX && excitation == [0.0; 2] {
             return [0.0; 2];
@@ -315,11 +350,11 @@ impl SpoonBenderBus {
         } else {
             (self.freeze - self.freeze_step).max(0.0)
         };
-        let shifted = self.shifter.step(excitation, self.shift, self.rate);
-        let diffused = core::array::from_fn(|i| self.diffusers[i].step(shifted[i]));
+        let shifted = if fixed { self.shifter.step_mode(excitation, self.shift, self.rate, true) } else { self.shifter.step(excitation, self.shift, self.rate) };
+        let diffused = core::array::from_fn(|i| self.diffusers[i].step(shifted[i], fixed));
         let output = self
             .tank
-            .step(diffused, self.feedback, self.damping, self.freeze);
+            .step(diffused, self.feedback, self.damping, self.freeze, fixed);
         if excitation == [0.0; 2] && output.iter().all(|s| s.abs() < 1e-10) && self.freeze == 0.0 {
             // A sparse delay network can be silent between echoes.
             self.quiet_frames = self.quiet_frames.saturating_add(1);
@@ -379,6 +414,40 @@ mod tests {
                         "{rate} {shift} channel {channel}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn esp_frozen_space_retains_quiet_and_loud_tails() {
+        let rate = 48_000.0;
+        for mode in crate::esp::Mode::ALL.into_iter().skip(1) {
+            let chip_rate = mode.rate().unwrap();
+            for excitation in [0.3, 0.003, 0.0003] {
+                let mut bus = SpoonBenderBus::new(chip_rate);
+                let mut converter = crate::esp::Converter::new(rate, chip_rate);
+                let mut step = |bus: &mut SpoonBenderBus, input| {
+                    converter.step(input, |input| [[0.0; 2], bus.process_mode(input, true)])[1]
+                };
+                for n in 0..12_000 {
+                    let tone = excitation * sine(n as f32 * 440.0 / rate % 1.0);
+                    step(&mut bus, [tone, -0.6 * tone]);
+                }
+                bus.set_params(BenderParams { freeze: true, ..BenderParams::default() });
+                for _ in 0..4_800 { step(&mut bus, [0.0; 2]); }
+                assert_eq!(bus.freeze, 1.0);
+                let power = |bus: &mut SpoonBenderBus, step: &mut dyn FnMut(&mut SpoonBenderBus, [f32; 2]) -> [f32; 2]| {
+                    (0..24_000).map(|_| {
+                        let [left, right] = step(bus, [0.0; 2]).map(f64::from);
+                        left * left + right * right
+                    }).sum::<f64>()
+                };
+                let initial = power(&mut bus, &mut step);
+                assert!(initial > 1e-10, "{mode:?} {excitation}");
+                for _ in 0..(rate as usize * 30) { step(&mut bus, [0.0; 2]); }
+                let final_power = power(&mut bus, &mut step);
+                assert!((0.8912..=1.1221).contains(&(final_power / initial)),
+                    "{mode:?} {excitation} {initial} -> {final_power}");
             }
         }
     }
