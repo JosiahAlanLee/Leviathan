@@ -19,6 +19,7 @@ mod smf;
 mod tracker_edit;
 mod tracker_keys;
 mod wav;
+mod workflow_ui;
 
 use std::sync::Arc;
 
@@ -26,11 +27,10 @@ use eframe::egui;
 use export_ui::ExportUi;
 use gen_ui::{GenUi, MidiDestination, MidiFileAction};
 use gpu_view::FeedbackViewport;
-use inspector_ui::InspectorEdits;
 use lane_mix::LaneMix;
 use leviathan_core::{
-    CvFrame, EngineConfig, FillCondition, LaunchTarget, NoteCell, Pattern, PatternChain,
-    SongPlayer, SongStatus, SoundLock, NUM_LANES, ROWS_PER_PATTERN,
+    CvFrame, EngineConfig, FillCondition, NoteCell, Pattern, PatternChain, SongPlayer, SongStatus,
+    SoundLock, NUM_LANES, ROWS_PER_PATTERN,
 };
 use leviathan_dsp::{default_lane_patches, BenderParams, DelayMode, LanePatch, MachineKind, MasterPeaks};
 use link::SoundLinkBridge;
@@ -44,6 +44,9 @@ use sampler_ui::{BankAction, SamplerBankUi};
 use session_ui::{ArrangementAction, ProjectAction, ProjectUi};
 use tracker_edit::EditHistory;
 use tracker_keys::{PatternSync, SubColumn, TrackerCursor};
+use workflow_ui::{Deck, TransportShortcut};
+
+const OFFLINE_CLOCK_HZ: f64 = 60.0;
 
 fn starter_electro_pattern() -> Pattern {
     let mut pat = Pattern::default();
@@ -187,6 +190,10 @@ struct LeviathanApp {
     project_generation: u64,
     voice_calibration: bool,
     inspector_drag_recorded: bool,
+    deck: Deck,
+    edit_lane_patch: bool,
+    follow_playback: bool,
+    followed_row: Option<(usize, usize)>,
     playing: bool,
     fill_active: bool,
     bpm: f64,
@@ -200,6 +207,7 @@ struct LeviathanApp {
     midi: MidiControls,
     midi_target: MidiTarget,
     play_request: u64,
+    applied_play_request: u64,
     cursor: TrackerCursor,
     sampler_ui: SamplerBankUi,
     instruments: project::InstrumentSettings,
@@ -209,10 +217,12 @@ struct LeviathanApp {
     audio: AudioControl,
     tel_rx: rtrb::Consumer<AudioTelemetry>,
     offline_player: Option<SongPlayer>,
+    offline_clock: Option<f64>,
     audio_status: String,
     latest_cv: CvFrame,
-        latest_scope: leviathan_gpu::AudioScopeSnapshot,
+    latest_scope: leviathan_gpu::AudioScopeSnapshot,
     latest_song: SongStatus,
+    transport_position: (f64, usize),
     viewport: FeedbackViewport,
 }
 
@@ -252,7 +262,7 @@ impl LeviathanApp {
             Err(label) => (
                 None,
                 Some(SongPlayer::new(EngineConfig {
-                    sample_rate: 60.0,
+                    sample_rate: OFFLINE_CLOCK_HZ,
                     ..EngineConfig::default()
                 })),
                 label,
@@ -274,6 +284,10 @@ impl LeviathanApp {
             project_generation: 0,
             voice_calibration: false,
             inspector_drag_recorded: false,
+            deck: Deck::default(),
+            edit_lane_patch: false,
+            follow_playback: false,
+            followed_row: None,
             playing: false,
             fill_active: false,
             bpm: 132.0,
@@ -287,6 +301,7 @@ impl LeviathanApp {
             midi,
             midi_target: MidiTarget::default(),
             play_request: 0,
+            applied_play_request: 0,
             cursor,
             sampler_ui: SamplerBankUi::default(),
             instruments: project::InstrumentSettings::default(),
@@ -296,10 +311,12 @@ impl LeviathanApp {
             audio: AudioControl::new(cmd_tx),
             tel_rx,
             offline_player,
+            offline_clock: None,
             audio_status,
             latest_cv: CvFrame::default(),
             latest_scope: leviathan_gpu::AudioScopeSnapshot::default(),
             latest_song: SongStatus::default(),
+            transport_position: (0.0, 0),
             viewport,
         };
         app.sync_midi_target();
@@ -308,8 +325,16 @@ impl LeviathanApp {
 
     fn send_audio(&mut self, command: AudioCommand) {
         if let Some(player) = &mut self.offline_player {
-            command.apply_transport(player, self.patterns.len());
+            command.apply_transport(player, &self.patterns);
             self.latest_song = player.status();
+            self.transport_position = player.cursor_position(&self.patterns);
+            if matches!(
+                command,
+                AudioCommand::SetPlaying { .. } | AudioCommand::PlayFromRow { .. }
+            ) {
+                self.offline_clock = None;
+                self.applied_play_request = self.play_request;
+            }
         } else {
             self.audio.send(command);
         }
@@ -322,6 +347,46 @@ impl LeviathanApp {
             playing: self.playing,
             request: self.play_request,
         });
+    }
+
+    fn play_from_cursor(&mut self) {
+        self.playing = true;
+        self.play_request = self.play_request.wrapping_add(1);
+        self.send_audio(AudioCommand::PlayFromRow {
+            pattern: self.selected_pattern,
+            row: self.cursor.row,
+            request: self.play_request,
+        });
+    }
+
+    fn advance_offline_transport(&mut self, now: f64) {
+        let Some(player) = self.offline_player.as_mut() else {
+            return;
+        };
+        if player.evaluator.playing {
+            let clock = self
+                .offline_clock
+                .get_or_insert(now - 1.0 / OFFLINE_CLOCK_HZ);
+            let elapsed = ((now - *clock) * OFFLINE_CLOCK_HZ + 1e-7).floor();
+            // Bound work after a suspended window. This fallback only clocks the UI.
+            let steps = elapsed.clamp(0.0, 15.0) as usize;
+            for _ in 0..steps {
+                self.latest_cv = player.step_sample(&self.patterns).0;
+            }
+            *clock = if elapsed > 15.0 {
+                now
+            } else {
+                *clock + steps as f64 / OFFLINE_CLOCK_HZ
+            };
+            if steps > 0 {
+                self.transport_position = (self.latest_cv.beat, self.latest_cv.row);
+            }
+        } else {
+            self.offline_clock = None;
+            self.latest_cv = player.step_sample(&self.patterns).0;
+            self.transport_position = player.cursor_position(&self.patterns);
+        }
+        self.latest_song = player.status();
     }
 
     fn sync_midi_target(&mut self) {
@@ -520,8 +585,186 @@ impl LeviathanApp {
         self.cursor.anchor = None;
         self.cursor.moved_this_frame = true;
         self.inspector_drag_recorded = false;
-        if !self.playing {
-            self.send_audio(AudioCommand::Launch(LaunchTarget::Pattern(index)));
+    }
+
+    fn follow_row(&mut self, ctx: &egui::Context, modal_open: bool) -> Option<usize> {
+        if !self.follow_playback || !self.playing {
+            self.followed_row = None;
+            return None;
+        }
+        if modal_open
+            || self.applied_play_request != self.play_request
+            || self.cursor.moved_this_frame
+        {
+            return None;
+        }
+        if ctx.wants_keyboard_input()
+            || ctx.memory(|m| m.any_popup_open())
+            || ctx.input(|i| i.pointer.any_down() || i.pointer.any_released())
+        {
+            return None;
+        }
+        let (pattern, row) = (self.latest_song.pattern, self.transport_position.1);
+        if pattern >= self.patterns.len() || self.followed_row == Some((pattern, row)) {
+            return None;
+        }
+        self.select_pattern(pattern);
+        self.cursor.moved_this_frame = false;
+        self.followed_row = Some((pattern, row));
+        Some(row)
+    }
+
+    fn draw_voice_deck(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.edit_lane_patch, false, "Step Lock");
+            ui.selectable_value(&mut self.edit_lane_patch, true, "Lane Patch");
+        });
+        ui.separator();
+        let (lane, row, pattern) = (self.cursor.lane, self.cursor.row, self.selected_pattern);
+        if self.edit_lane_patch {
+            if ui
+                .checkbox(&mut self.voice_calibration, "Voice calibration")
+                .on_hover_text("Use calibrated voice levels and tuning. Switching restarts active voices. Reset a lane patch to load its calibrated defaults.")
+                .changed()
+            {
+                self.send_audio(AudioCommand::SetVoiceCalibration(self.voice_calibration));
+            }
+            if draw_lane_patch_inspector(
+                ui,
+                lane,
+                &mut self.lane_patches[lane],
+                self.voice_calibration,
+            ) {
+                self.send_audio(AudioCommand::SetLanePatch {
+                    lane,
+                    patch: self.lane_patches[lane],
+                });
+            }
+        } else if let Some(cell) = inspector_ui::draw_step(
+            ui,
+            lane,
+            row,
+            self.patterns[pattern].lanes[lane][row],
+            &self.lane_patches[lane],
+        ) {
+            self.record_inspector_undo_once(ui.ctx(), pattern);
+            self.patterns[pattern].lanes[lane][row] = cell;
+            self.send_audio(AudioCommand::SetCell {
+                pattern,
+                lane,
+                row,
+                cell,
+            });
+        }
+    }
+
+    fn draw_mixer_deck(&mut self, ui: &mut egui::Ui) {
+        mixer_ui::draw(ui, &mut self.lane_mix, &self.lane_patches);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Master delay send");
+            let mut percent = self.master_send * 100.0;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut percent)
+                        .range(0.0..=100.0)
+                        .speed(0.5)
+                        .suffix("%"),
+                )
+                .changed()
+                && percent.is_finite()
+            {
+                self.master_send = (percent / 100.0).clamp(0.0, 1.0);
+                self.send_audio(AudioCommand::SetMasterSend(self.master_send));
+            }
+        });
+        if master_ui::draw_delay_mode(ui, &mut self.delay_mode) {
+            self.send_audio(AudioCommand::SetDelayMode(self.delay_mode));
+        }
+        if master_ui::draw_bender(ui, &mut self.bender_params) {
+            self.send_audio(AudioCommand::SetBenderParams(self.bender_params));
+        }
+    }
+
+    fn draw_routing_deck(&mut self, ui: &mut egui::Ui) {
+        let lane = self.cursor.lane;
+        ui.heading(format!(
+            "Lane {} · {}",
+            lane + 1,
+            self.lane_patches[lane].machine.short_name()
+        ));
+        let mut routing = self.instruments.routing;
+        rack_ui::draw_routing(
+            ui,
+            &mut routing,
+            lane,
+            self.lane_patches[lane],
+            self.instruments.take.is_some(),
+            self.routed_byte,
+            self.rack_panel.routing_error,
+        );
+        if routing != self.instruments.routing {
+            self.rack_panel.routing_error = routing.render_order().is_none();
+            if !self.rack_panel.routing_error {
+                self.instruments.routing = routing;
+                self.send_audio(AudioCommand::SetRackRouting(routing));
+            }
+        }
+    }
+
+    fn draw_samples_deck(&mut self, ui: &mut egui::Ui, hovering_wav: bool) -> Vec<BankAction> {
+        match self.rack_panel.draw_capture(
+            ui,
+            self.instruments.take.as_deref(),
+            self._audio_stream.is_some(),
+            self.capture_port.busy(),
+            self.playing,
+        ) {
+            Some(rack_ui::CaptureAction::Arm(source, beats)) => {
+                if self
+                    .capture_port
+                    .request(self.project_generation, source, beats)
+                {
+                    self.rack_panel.status = "";
+                    self.rack_panel.stage = capture::Stage::Armed;
+                    self.rack_panel.beats_left = None;
+                    self.send_audio(AudioCommand::ArmCapture);
+                }
+            }
+            Some(rack_ui::CaptureAction::Cancel) => self.send_audio(AudioCommand::CancelCapture),
+            None => {}
+        }
+        ui.separator();
+        self.sampler_ui.draw(ui, hovering_wav)
+    }
+
+    fn draw_scene_deck(
+        &mut self,
+        ui: &mut egui::Ui,
+        preview: egui::TextureId,
+        hovering_wgsl: bool,
+    ) {
+        ui.heading("Feedback");
+        let width = ui.available_width();
+        ui.image((preview, egui::vec2(width, width * 9.0 / 16.0)));
+        ui.small(self.viewport.status_label());
+        ui.monospace(format!(
+            "Z {:.2} V · Roll {:+.2} V · Feedback {:.2} V",
+            self.latest_cv.z_v, self.latest_cv.roll_v, self.latest_cv.feedback_v
+        ));
+        self.viewport.draw_shader_controls(ui, hovering_wgsl);
+        ui.separator();
+        let (pattern, row) = (self.selected_pattern, self.cursor.row);
+        if let Some(automation) =
+            inspector_ui::draw_automation(ui, row, self.patterns[pattern].automation[row])
+        {
+            self.record_inspector_undo_once(ui.ctx(), pattern);
+            self.patterns[pattern].automation[row] = automation;
+            self.send_audio(AudioCommand::SetAutomation {
+                pattern,
+                row,
+                automation,
+            });
         }
     }
 
@@ -534,66 +777,15 @@ impl LeviathanApp {
         }
     }
 
-    fn apply_inspector_edits(
-        &mut self,
-        ctx: &egui::Context,
-        selected: usize,
-        lane: usize,
-        row: usize,
-        edits: InspectorEdits,
-    ) {
-        if edits.cell.is_none()
-            && edits.automation.is_none()
-            && edits.pattern_length.is_none()
-            && edits.pattern_rate.is_none()
-        {
-            return;
-        }
-        self.record_inspector_undo_once(ctx, selected);
-
-        let mut full_sync = false;
-        if let Some(len) = edits.pattern_length {
-            self.patterns[selected].length = len.clamp(1, ROWS_PER_PATTERN);
-            if self.cursor.row >= self.patterns[selected].length {
-                self.cursor.row = self.patterns[selected].length - 1;
-            }
-            full_sync = true;
-        }
-        if let Some(rate) = edits.pattern_rate {
-            self.patterns[selected].rate = rate;
-            full_sync = true;
-        }
-        if let Some(cell) = edits.cell {
-            self.patterns[selected].lanes[lane][row] = cell;
-            if !full_sync {
-                self.send_audio(AudioCommand::SetCell {
-                    pattern: selected,
-                    lane,
-                    row,
-                    cell,
-                });
-            }
-        }
-        if let Some(automation) = edits.automation {
-            self.patterns[selected].automation[row] = automation;
-            if !full_sync {
-                self.send_audio(AudioCommand::SetAutomation {
-                    pattern: selected,
-                    row,
-                    automation,
-                });
-            }
-        }
-        if full_sync {
-            self.push_full_pattern(selected);
-        }
-    }
-
     fn apply_arrangement_action(&mut self, ctx: &egui::Context, action: ArrangementAction) {
         let index = self.selected_pattern;
         match action {
-            ArrangementAction::Select(index) => self.select_pattern(index),
+            ArrangementAction::Select(index) => {
+                self.follow_playback = false;
+                self.select_pattern(index);
+            }
             ArrangementAction::AddPattern { clone } => {
+                self.follow_playback = false;
                 let pattern = if clone {
                     self.patterns[index].clone()
                 } else {
@@ -604,6 +796,12 @@ impl LeviathanApp {
                 self.histories.push(EditHistory::default());
                 self.push_full_pattern(next);
                 self.select_pattern(next);
+            }
+            ArrangementAction::SetLength(length) => {
+                self.record_inspector_undo_once(ctx, index);
+                self.patterns[index].length = length;
+                self.cursor.row = self.cursor.row.min(length - 1);
+                self.push_full_pattern(index);
             }
             ArrangementAction::SetRate(rate) => {
                 let pattern = &mut self.patterns[index];
@@ -676,6 +874,8 @@ impl LeviathanApp {
         self.voice_calibration = project.voice_calibration;
         self.instruments = project.instruments;
         self.rack_panel.status = "";
+        self.rack_panel.stage = capture::Stage::Idle;
+        self.rack_panel.beats_left = None;
         self.rack_panel.routing_error = false;
         self.routed_byte = None;
         self.master_meters = MasterMeters::default();
@@ -695,7 +895,10 @@ impl LeviathanApp {
         self.inspector_drag_recorded = false;
         self.cursor = TrackerCursor::default();
         self.latest_cv = CvFrame::default();
-        self.latest_scope = leviathan_gpu::AudioScopeSnapshot::default();        
+        self.latest_scope = leviathan_gpu::AudioScopeSnapshot::default();
+        self.offline_clock = None;
+        self.transport_position = (0.0, 0);
+        self.followed_row = None;
         self.latest_song = SongStatus {
             pattern: self.selected_pattern,
             ..SongStatus::default()
@@ -715,6 +918,7 @@ impl eframe::App for LeviathanApp {
             if telemetry.generation == self.project_generation {
                 if telemetry.play_request == self.play_request {
                     self.playing = telemetry.playing;
+                    self.applied_play_request = telemetry.play_request;
                 }
                 if telemetry.cv.gate_v != self.latest_cv.gate_v || telemetry.cv.retrigger_mask != 0
                 {
@@ -727,6 +931,8 @@ impl eframe::App for LeviathanApp {
                 self.latest_scope = telemetry.scope;
                 self.latest_song = telemetry.song;
                 self.rack_panel.stage = telemetry.capture_stage;
+                self.rack_panel.beats_left = telemetry.capture_beats_left;
+                self.transport_position = telemetry.transport_position;
                 self.routed_byte = telemetry.routed_byte;
                 peaks.merge(telemetry.master);
             }
@@ -756,12 +962,10 @@ impl eframe::App for LeviathanApp {
         let (file, arrangement) = egui::TopBottomPanel::top("project_and_patterns")
             .show(ctx, |ui| {
                 let file = self.project_ui.toolbar(ui, &mut self.export_ui);
-                let arrangement = session_ui::draw_arrangement(
+                let arrangement = session_ui::draw_pattern_bar(
                     ui,
                     &self.patterns,
                     self.selected_pattern,
-                    &self.chain,
-                    self.latest_song,
                     self.playing,
                 );
                 (file, arrangement)
@@ -784,21 +988,24 @@ impl eframe::App for LeviathanApp {
             self.export_ui.start(ctx, snapshot, self.fill_active, request);
         }
 
+        let pattern_changed = self.cursor.moved_this_frame;
+        self.cursor.moved_this_frame = false;
         let selected = self.selected_pattern;
         let previous_audible = self.lane_mix.audible_mask();
         let previous_channels = self.lane_mix.channels;
-        if !modal_open && !ctx.wants_keyboard_input() {
+        let editor_has_keys =
+            !modal_open && !ctx.wants_keyboard_input() && !ctx.memory(|m| m.any_popup_open());
+        if editor_has_keys {
+            self.deck.read_shortcuts(ctx);
             tracker_keys::apply_lane_mix_shortcuts(ctx, &mut self.lane_mix);
+            match TransportShortcut::read(ctx) {
+                Some(TransportShortcut::Toggle) => self.toggle_playing(),
+                Some(TransportShortcut::FromCursor) => self.play_from_cursor(),
+                None => {}
+            }
         }
 
-        if !modal_open
-            && !ctx.wants_keyboard_input()
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space))
-        {
-            self.toggle_playing();
-        }
-
-        if !modal_open {
+        if editor_has_keys {
             match self.cursor.handle_input(
                 ctx,
                 &mut self.patterns[selected],
@@ -819,16 +1026,13 @@ impl eframe::App for LeviathanApp {
             }
         }
 
+        self.cursor.moved_this_frame |= pattern_changed;
         self.read_midi(ctx, modal_open);
         self.sync_midi_target();
         let (hovering_wav, mut bank_actions) = self.sampler_ui.poll_drag_and_drop(ctx);
         let hovering_wgsl = self.viewport.poll_shader_drop(ctx);
-        let now_secs = ctx.input(|i| i.time);
-        self.viewport.poll_hot_reload(now_secs);
-        if let Some(player) = self.offline_player.as_mut() {
-            self.latest_cv = player.step_sample(&self.patterns).0;
-            self.latest_song = player.status();
-        }
+        self.viewport.poll_hot_reload(now);
+        self.advance_offline_transport(now);
 
         self.sound_link.emit_frame(&self.latest_cv, self.playing);
         let mut visual_cv = self.latest_cv;
@@ -837,19 +1041,27 @@ impl eframe::App for LeviathanApp {
                 *gate = gate.max(peak);
             }
         }
-                let tex_id = self.viewport.render_frame(ctx, &visual_cv, &self.latest_scope);
+        let preview = self
+            .viewport
+            .render_frame(ctx, now, &visual_cv, &self.latest_scope);
 
         egui::TopBottomPanel::top("transport_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("LEVIATHAN");
                 ui.separator();
-                let play_label = if self.playing {
-                    "Stop [Space]"
+                let (label, tip) = if self.playing {
+                    ("Pause", "Pause transport at its current position (Space)")
                 } else {
-                    "Play [Space]"
+                    ("Play", "Continue from the transport position (Space)")
                 };
-                if ui.button(play_label).clicked() {
+                if ui.button(label).on_hover_text(tip).clicked() {
                     self.toggle_playing();
+                }
+                if ui.button("Play from cursor")
+                    .on_hover_text("Audition the edited pattern from the selected row (Shift+Space). Leaves chain playback and clears queued launches.")
+                    .clicked()
+                {
+                    self.play_from_cursor();
                 }
                 if ui.button("Reset").clicked() {
                     self.send_audio(AudioCommand::Reset);
@@ -867,145 +1079,93 @@ impl eframe::App for LeviathanApp {
                     self.send_audio(AudioCommand::SetBpm(self.bpm));
                 }
                 ui.separator();
-                ui.label("Delay send");
-                let mut send_percent = self.master_send * 100.0;
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut send_percent)
-                            .range(0.0..=100.0)
-                            .speed(0.5_f64)
-                            .suffix("%"),
-                    )
-                    .changed()
-                    && send_percent.is_finite()
-                {
-                    self.master_send = (send_percent / 100.0).clamp(0.0, 1.0);
-                    self.send_audio(AudioCommand::SetMasterSend(self.master_send));
-                }
-                self.master_meters.draw(ui, now);
-                ui.separator();
-                self.sound_link.draw_controls(ui);
-                ui.separator();
-                ui.monospace(format!(
-                    "Oct:{} [-/=] | Step:{} [[/]] | Col:{} | Beat {:06.2} Row {:02X}",
-                    self.cursor.base_octave,
-                    self.cursor.edit_step,
-                    self.cursor.column.label(),
-                    self.latest_cv.beat,
-                    self.latest_cv.row
-                ));
+                self.midi.draw(ui);
                 ui.separator();
                 ui.small(&self.audio_status);
-                ui.separator();
-                ui.small(self.viewport.status_label());
-                ui.separator();
-                self.midi.draw(ui);
             });
         });
 
-        let (sel_lane, sel_row) = (self.cursor.lane, self.cursor.row);
-        let cur_cell = self.patterns[selected].lanes[sel_lane][sel_row];
-        let cur_auto = self.patterns[selected].automation[sel_row];
-        let cur_len = self.patterns[selected].length;
-        let cur_rate = self.patterns[selected].rate;
-        let mut inspector_edits = InspectorEdits::default();
-
-        egui::SidePanel::right("visual_and_bus_panel")
-            .min_width(376.0)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("Live Feedback Surface");
-                    ui.image((tex_id, egui::vec2(348.0, 196.0)));
-                    ui.monospace(format!(
-                        "Z: {:4.2} V | Roll: {:+5.2} V | Fbk: {:4.2} V",
-                        self.latest_cv.z_v, self.latest_cv.roll_v, self.latest_cv.feedback_v
-                    ));
-                    ui.horizontal(|ui| {
-                        for bit in 0..9 {
-                            let high = self.latest_cv.bytebus_v[bit] > 5.0;
-                            let tag = if bit < 8 {
-                                format!("B{bit}")
-                            } else {
-                                "CLK".to_string()
-                            };
-                            let _ = ui.selectable_label(high, tag);
-                        }
-                    });
-
-                    ui.separator();
-                    self.viewport.draw_shader_controls(ui, hovering_wgsl);
-                    mixer_ui::draw(ui, &mut self.lane_mix, &self.lane_patches);
-                    if master_ui::draw_delay_mode(ui, &mut self.delay_mode) {
-                        self.send_audio(AudioCommand::SetDelayMode(self.delay_mode));
-                    }
-                    if master_ui::draw_bender(ui, &mut self.bender_params) {
-                        self.send_audio(AudioCommand::SetBenderParams(self.bender_params));
-                    }
-                    let safe_lane = sel_lane.min(NUM_LANES - 1);
-                    if ui
-                        .checkbox(&mut self.voice_calibration, "Voice calibration")
-                        .on_hover_text(
-                            "Use calibrated voice levels and tuning. Switching restarts active voices. Reset a lane patch to load its calibrated defaults.",
-                        )
-                        .changed()
-                    {
-                        self.send_audio(AudioCommand::SetVoiceCalibration(self.voice_calibration));
-                    }
-                    if draw_lane_patch_inspector(
-                        ui,
-                        safe_lane,
-                        &mut self.lane_patches[safe_lane],
-                        self.voice_calibration,
-                    ) {
-                        self.send_audio(AudioCommand::SetLanePatch {
-                            lane: safe_lane,
-                            patch: self.lane_patches[safe_lane],
-                        });
-                    }
-                    bank_actions.extend(self.sampler_ui.draw(ui, hovering_wav));
-                    match self.rack_panel.draw_capture(
-                        ui, self.instruments.take.as_deref(), self._audio_stream.is_some(), self.capture_port.busy(),
-                    ) {
-                        Some(rack_ui::CaptureAction::Arm(source, beats)) => {
-                            if self.capture_port.request(self.project_generation, source, beats) {
-                                self.rack_panel.status = "";
-                                self.send_audio(AudioCommand::ArmCapture);
-                            }
-                        }
-                        Some(rack_ui::CaptureAction::Cancel) => self.send_audio(AudioCommand::CancelCapture),
-                        None => {}
-                    }
-                    let mut routing = self.instruments.routing;
-                    rack_ui::draw_routing(
-                        ui, &mut routing, safe_lane, self.lane_patches[safe_lane],
-                        self.instruments.take.is_some(), self.routed_byte,
-                        self.rack_panel.routing_error,
-                    );
-                    if routing != self.instruments.routing {
-                        if routing.render_order().is_some() {
-                            self.instruments.routing = routing;
-                            self.rack_panel.routing_error = false;
-                            self.send_audio(AudioCommand::SetRackRouting(routing));
-                        } else {
-                            self.rack_panel.routing_error = true;
-                        }
-                    }
-
-                    ui.separator();
-                    inspector_edits = inspector_ui::draw(
-                ui,
-                sel_lane,
-                sel_row,
-                cur_cell,
-                cur_auto,
-                cur_len,
-                cur_rate,
-                &self.lane_patches[sel_lane.min(NUM_LANES - 1)],
-            );
+        let follow_row = self.follow_row(ctx, modal_open);
+        let selected = self.selected_pattern;
+        egui::TopBottomPanel::top("telemetry").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                workflow_ui::transport_status(
+                    ui,
+                    selected,
+                    self.latest_song,
+                    self.playing,
+                    self.transport_position,
+                );
+                ui.separator();
+                self.master_meters.draw(ui, now);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    workflow_ui::bytebus_status(ui, &self.latest_cv, self.routed_byte)
                 });
+                ui.separator();
+                self.sound_link.draw_controls(ui);
+                ui.separator();
+                if ui
+                    .add(
+                        egui::Image::new((preview, egui::vec2(48.0, 27.0)))
+                            .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text("Open Scene (F6)")
+                    .clicked()
+                {
+                    self.deck = Deck::Scene;
+                }
+                if self.capture_port.busy() {
+                    ui.strong(self.rack_panel.busy_text(self.playing));
+                } else if !self.rack_panel.status.is_empty() {
+                    ui.small(self.rack_panel.status);
+                }
             });
+        });
 
-        self.apply_inspector_edits(ctx, selected, sel_lane, sel_row, inspector_edits);
+        egui::TopBottomPanel::top("deck_bar").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                self.deck.draw_tabs(ui);
+                ui.separator();
+                ui.checkbox(&mut self.follow_playback, "Follow playback")
+                    .on_hover_text("Show the playing pattern and keep its row visible. The edit cursor stays on its own lane and row.");
+                ui.separator();
+                ui.monospace(format!("Oct {} · Step {}", self.cursor.base_octave, self.cursor.edit_step))
+                    .on_hover_text("Change octave with - or =, and edit step with [ or ]");
+            });
+        });
+
+        let mut song_action = None;
+        if self.deck != Deck::Grid {
+            let width = (ctx.screen_rect().width() * 0.35).clamp(320.0, 420.0);
+            egui::SidePanel::right("workflow_deck")
+                .resizable(false)
+                .exact_width(width)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt((self.deck, self.deck == Deck::Voice && self.edit_lane_patch))
+                        .show(ui, |ui| match self.deck {
+                            Deck::Grid => {}
+                            Deck::Voice => self.draw_voice_deck(ui),
+                            Deck::Mixer => self.draw_mixer_deck(ui),
+                            Deck::Routing => self.draw_routing_deck(ui),
+                            Deck::Samples => {
+                                bank_actions.extend(self.draw_samples_deck(ui, hovering_wav))
+                            }
+                            Deck::Scene => self.draw_scene_deck(ui, preview, hovering_wgsl),
+                            Deck::Song => {
+                                song_action = session_ui::draw_song(
+                                    ui,
+                                    &self.patterns,
+                                    selected,
+                                    &self.chain,
+                                    self.latest_song,
+                                    self.playing,
+                                );
+                            }
+                        });
+                });
+        }
         if !ctx.input(|i| i.pointer.any_down()) {
             self.inspector_drag_recorded = false;
         }
@@ -1107,30 +1267,31 @@ impl eframe::App for LeviathanApp {
                 }
                 ui.separator();
                 let (bw, bh) = self.cursor.active_rect().dimensions();
-                ui.monospace(format!("Sel:{bw}x{bh} | {}", self.cursor.last_edit_msg));
+                ui.monospace(format!("{bw}×{bh} · {}", self.cursor.last_edit_msg))
+                    .on_hover_text(self.cursor.column.label());
             });
             ui.separator();
 
             let cur_lane = self.cursor.lane;
             let cur_row = self.cursor.row;
             let cur_col = self.cursor.column;
-            let scroll_to_cursor = self.cursor.moved_this_frame;
+            let scroll_to_cursor = std::mem::take(&mut self.cursor.moved_this_frame);
             let sel_rect = self.cursor.active_rect();
             let pat_len = self.patterns[selected].length;
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::ScrollArea::both().id_salt("tracker_scroll").show(ui, |ui| {
                 egui::Grid::new("score_v3_grid")
                     .striped(true)
-                    .min_col_width(82.0)
+                    .min_col_width(75.0)
                     .show(ui, |ui| {
                         ui.monospace("ROW");
                         for (lane, patch) in self.lane_patches.iter().enumerate() {
-                            let name = format!("{lane} {}", patch.machine.short_name());
+                            let name = format!("{} {}", lane + 1, patch.machine.short_name());
                             self.lane_mix.header(ui, &name, lane);
                         }
                         ui.end_row();
 
-                        let active_row = self.latest_cv.row;
+                        let active_row = self.transport_position.1;
                         for row in 0..ROWS_PER_PATTERN {
                             let row_prefix = if self.playing
                                 && self.latest_song.pattern == selected
@@ -1144,7 +1305,17 @@ impl eframe::App for LeviathanApp {
                             if row >= pat_len {
                                 row_rt = row_rt.color(egui::Color32::from_rgb(90, 95, 105));
                             }
-                            ui.label(row_rt);
+                            let row_label = ui.label(row_rt);
+                            if !scroll_to_cursor && follow_row == Some(row) {
+                                let x = ui.clip_rect().center().x;
+                                ui.scroll_to_rect(
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(x, row_label.rect.top()),
+                                        egui::pos2(x, row_label.rect.bottom()),
+                                    ),
+                                    None,
+                                );
+                            }
 
                             for lane in 0..NUM_LANES {
                                 let cell = self.patterns[selected].lanes[lane][row];
@@ -1164,16 +1335,18 @@ impl eframe::App for LeviathanApp {
                                     "--".to_string()
                                 };
 
-                                let is_note_cur =
-                                    cur_lane == lane && cur_row == row && cur_col == SubColumn::Note;
+                                let is_note_cur = cur_lane == lane
+                                    && cur_row == row
+                                    && cur_col == SubColumn::Note;
                                 let is_vel_cur = cur_lane == lane
                                     && cur_row == row
                                     && cur_col == SubColumn::Velocity;
                                 let in_block =
                                     sel_rect.is_multi_cell() && sel_rect.contains(lane, row);
 
-                                let mut note_rt = egui::RichText::new(note_str).monospace().color(
-                                    if in_block {
+                                let mut note_rt = egui::RichText::new(note_str)
+                                    .monospace()
+                                    .color(if in_block {
                                         egui::Color32::from_rgb(245, 250, 255)
                                     } else if row >= pat_len {
                                         egui::Color32::from_rgb(90, 95, 105)
@@ -1181,10 +1354,10 @@ impl eframe::App for LeviathanApp {
                                         egui::Color32::from_rgb(220, 235, 255)
                                     } else {
                                         egui::Color32::from_rgb(125, 130, 140)
-                                    },
-                                );
-                                let mut vel_rt = egui::RichText::new(vel_str).monospace().color(
-                                    if in_block {
+                                    });
+                                let mut vel_rt = egui::RichText::new(vel_str)
+                                    .monospace()
+                                    .color(if in_block {
                                         egui::Color32::from_rgb(175, 240, 205)
                                     } else if row >= pat_len {
                                         egui::Color32::from_rgb(80, 85, 95)
@@ -1192,11 +1365,11 @@ impl eframe::App for LeviathanApp {
                                         egui::Color32::from_rgb(130, 215, 175)
                                     } else {
                                         egui::Color32::from_rgb(105, 110, 120)
-                                    },
-                                );
+                                    });
                                 if in_block {
-                                    let block_bg =
-                                        egui::Color32::from_rgba_unmultiplied(45, 105, 180, 110);
+                                    let block_bg = egui::Color32::from_rgba_unmultiplied(
+                                        45, 105, 180, 110,
+                                    );
                                     note_rt = note_rt.background_color(block_bg);
                                     vel_rt = vel_rt.background_color(block_bg);
                                 }
@@ -1206,12 +1379,18 @@ impl eframe::App for LeviathanApp {
                                     let shift_held = ui.input(|i| i.modifiers.shift);
                                     let r_note = ui.selectable_label(is_note_cur, note_rt);
                                     if r_note.clicked() {
-                                        self.cursor.select(lane, row, SubColumn::Note, shift_held);
+                                        self.cursor.select(
+                                            lane,
+                                            row,
+                                            SubColumn::Note,
+                                            shift_held,
+                                        );
                                     }
                                     if r_note.double_clicked() {
                                         self.histories[selected]
                                             .record_before_edit(&self.patterns[selected]);
-                                        let target = &mut self.patterns[selected].lanes[lane][row];
+                                        let target =
+                                            &mut self.patterns[selected].lanes[lane][row];
                                         target.active = !target.active;
                                         let updated = *target;
                                         self.send_audio(AudioCommand::SetCell {
@@ -1227,8 +1406,12 @@ impl eframe::App for LeviathanApp {
 
                                     let r_vel = ui.selectable_label(is_vel_cur, vel_rt);
                                     if r_vel.clicked() {
-                                        self.cursor
-                                            .select(lane, row, SubColumn::Velocity, shift_held);
+                                        self.cursor.select(
+                                            lane,
+                                            row,
+                                            SubColumn::Velocity,
+                                            shift_held,
+                                        );
                                     }
                                     if is_vel_cur && scroll_to_cursor {
                                         r_vel.scroll_to_me(None);
@@ -1246,6 +1429,13 @@ impl eframe::App for LeviathanApp {
             ctx.request_repaint();
         }
 
+        if !modal_open {
+            if let Some(action) = song_action {
+                self.apply_arrangement_action(ctx, action);
+                ctx.request_repaint();
+            }
+        }
+
         let audible = self.lane_mix.audible_mask();
         if audible != previous_audible {
             self.send_audio(AudioCommand::SetLaneAudibleMask(audible));
@@ -1254,12 +1444,15 @@ impl eframe::App for LeviathanApp {
             self.send_audio(AudioCommand::SetLaneChannels(self.lane_mix.dsp_channels()));
         }
         self.sync_midi_target();
+        if self.audio.has_pending() {
+            ctx.request_repaint();
+        }
         if self.playing
-            || self.audio.has_pending()
+            || self.applied_play_request != self.play_request
             || self.capture_port.busy()
             || self.master_meters.is_active(now)
         {
-            ctx.request_repaint();
+            self.viewport.request_next_frame(ctx, now);
         }
     }
 }
@@ -1294,6 +1487,15 @@ mod tests {
         }
     }
 
+    fn tap(key_code: Key, modifiers: Modifiers) -> Vec<Event> {
+        let press = key(key_code, modifiers);
+        let mut release = press.clone();
+        if let Event::Key { pressed, .. } = &mut release {
+            *pressed = false;
+        }
+        vec![press, release]
+    }
+
     fn frame(ctx: &egui::Context, app: &mut LeviathanApp, events: Vec<Event>) {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1311,6 +1513,89 @@ mod tests {
     fn offline_app(ctx: &egui::Context) -> LeviathanApp {
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
         LeviathanApp::with_audio(&cc, |_, _, _, _, _| Err("Offline test clock".to_string()))
+    }
+
+    #[test]
+    fn selecting_and_editing_patterns_keeps_the_deck_and_pause_position() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        app.apply_arrangement_action(&ctx, ArrangementAction::AddPattern { clone: true });
+        frame(&ctx, &mut app, vec![key(Key::F7, Modifiers::NONE)]);
+        assert_eq!(app.deck, Deck::Song);
+        frame(&ctx, &mut app, vec![key(Key::ArrowDown, Modifiers::NONE)]);
+        assert_eq!(app.deck, Deck::Song);
+        assert_eq!(app.cursor.row, 1);
+        assert!(!app.follow_playback);
+        assert_eq!(app.latest_song.pattern, 0);
+        assert_eq!(app.selected_pattern, 1);
+
+        frame(&ctx, &mut app, tap(Key::Space, Modifiers::SHIFT));
+        assert!(app.playing);
+        assert_eq!(app.latest_song.pattern, 1);
+        assert_eq!(app.transport_position, (0.25, 1));
+        frame(&ctx, &mut app, tap(Key::Space, Modifiers::NONE));
+        assert!(!app.playing);
+        let paused = app.transport_position;
+        app.apply_arrangement_action(&ctx, ArrangementAction::Select(0));
+        frame(&ctx, &mut app, tap(Key::Space, Modifiers::NONE));
+        assert!(app.playing);
+        assert_eq!(app.transport_position, paused);
+        assert_eq!(app.latest_song.pattern, 1);
+        assert_eq!(app.selected_pattern, 0);
+    }
+
+    #[test]
+    fn playback_follow_preserves_the_lane_row_and_deck() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        app.apply_arrangement_action(&ctx, ArrangementAction::AddPattern { clone: true });
+        frame(&ctx, &mut app, vec![key(Key::F4, Modifiers::NONE)]);
+        frame(&ctx, &mut app, vec![key(Key::Space, Modifiers::NONE)]);
+        assert_eq!(app.selected_pattern, 1);
+        app.follow_playback = true;
+        frame(&ctx, &mut app, vec![key(Key::ArrowDown, Modifiers::NONE)]);
+        assert_eq!(app.selected_pattern, 1);
+        let edit = (app.cursor.lane, app.cursor.row);
+        frame(&ctx, &mut app, Vec::new());
+        assert_eq!(app.selected_pattern, 0);
+        assert_eq!((app.cursor.lane, app.cursor.row), edit);
+        assert_eq!(app.deck, Deck::Routing);
+
+        app.apply_arrangement_action(&ctx, ArrangementAction::Select(1));
+        frame(&ctx, &mut app, Vec::new());
+        assert_eq!(app.selected_pattern, 1);
+        assert!(!app.follow_playback);
+    }
+
+    #[test]
+    fn offline_clock_advances_with_time_instead_of_egui_passes() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        app.toggle_playing();
+        app.advance_offline_transport(1.0);
+        let first = app.transport_position;
+        app.advance_offline_transport(1.0 + 1.0 / 120.0);
+        assert_eq!(app.transport_position, first);
+        app.advance_offline_transport(1.1);
+        assert!((app.transport_position.0 - 0.22).abs() < 1e-9);
+    }
+
+    #[test]
+    fn opening_decks_preserves_unsnapped_project_values() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        app.patterns[0].swing = 0.552;
+        app.bender_params.shift_norm = 0.513;
+        app.patterns[0].lanes[0][0].lock.mask = 1;
+        app.patterns[0].lanes[0][0].lock.values[0] = 1.25;
+        app.cursor.select(0, 0, SubColumn::Note, false);
+        let before = app.patterns[0].lanes[0][0];
+        frame(&ctx, &mut app, tap(Key::F2, Modifiers::NONE));
+        frame(&ctx, &mut app, tap(Key::F3, Modifiers::NONE));
+        assert_eq!(app.patterns[0].swing, 0.552);
+        assert_eq!(app.bender_params.shift_norm, 0.513);
+        assert_eq!(app.patterns[0].lanes[0][0], before);
+        assert_eq!(app.histories[0].undo_len(), 0);
     }
 
     #[test]

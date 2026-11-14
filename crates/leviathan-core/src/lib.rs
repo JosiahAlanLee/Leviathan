@@ -281,6 +281,19 @@ impl PatternTiming {
                 0.0
             }
     }
+
+    fn position_at(self, beats: f64) -> (u64, f64, usize, usize) {
+        let total_rows = beats.max(0.0) * self.rate.rows_per_beat();
+        let cycle = total_rows as u64 / self.rows as u64;
+        let position = total_rows - (cycle * self.rows as u64) as f64;
+        let grid_row = (position as usize).min(self.rows - 1);
+        let row = if position < self.row_start(grid_row) {
+            grid_row.saturating_sub(1)
+        } else {
+            grid_row
+        };
+        (cycle, position, row, grid_row)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -502,15 +515,7 @@ impl TrackerEvaluator {
             0.0
         };
 
-        let total_rows = (beat - pattern_start_beat).max(0.0) * timing.rate.rows_per_beat();
-        let cycle = total_rows as u64 / timing.rows as u64;
-        let position = total_rows - (cycle * timing.rows as u64) as f64;
-        let grid_row = (position as usize).min(timing.rows - 1);
-        let row = if position < timing.row_start(grid_row) {
-            grid_row.saturating_sub(1)
-        } else {
-            grid_row
-        };
+        let (cycle, position, row, grid_row) = timing.position_at(beat - pattern_start_beat);
         let bar_count = previous_plays.wrapping_add(cycle as u32);
         let sample_rows =
             self.config.bpm * timing.rate.rows_per_beat() / (60.0 * self.config.sample_rate);

@@ -533,24 +533,16 @@ impl TrackerCursor {
                 self.anchor = None;
                 return;
             }
-            if i.consume_key(Modifiers::NONE, Key::F1)
-                || i.consume_key(Modifiers::NONE, Key::Minus)
-            {
+            if i.consume_key(Modifiers::NONE, Key::Minus) {
                 self.base_octave = (self.base_octave - 1).clamp(1, 6);
             }
-            if i.consume_key(Modifiers::NONE, Key::F2)
-                || i.consume_key(Modifiers::NONE, Key::Equals)
-            {
+            if i.consume_key(Modifiers::NONE, Key::Equals) {
                 self.base_octave = (self.base_octave + 1).clamp(1, 6);
             }
-            if i.consume_key(Modifiers::NONE, Key::F3)
-                || i.consume_key(Modifiers::NONE, Key::OpenBracket)
-            {
+            if i.consume_key(Modifiers::NONE, Key::OpenBracket) {
                 self.edit_step = self.edit_step.saturating_sub(1);
             }
-            if i.consume_key(Modifiers::NONE, Key::F4)
-                || i.consume_key(Modifiers::NONE, Key::CloseBracket)
-            {
+            if i.consume_key(Modifiers::NONE, Key::CloseBracket) {
                 self.edit_step = (self.edit_step + 1).min(16);
             }
 

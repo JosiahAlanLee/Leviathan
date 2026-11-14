@@ -261,7 +261,7 @@ impl SamplerBankUi {
         let trim = region.frames(meta.frames);
         egui::Frame::canvas(ui.style()).show(ui, |ui| {
             let (resp, painter) =
-                ui.allocate_painter(egui::vec2(340.0, 38.0), egui::Sense::hover());
+                ui.allocate_painter(egui::vec2(ui.available_width(), 38.0), egui::Sense::hover());
             let rect = resp.rect;
             let mid_y = rect.center().y;
             let half_h = rect.height() * 0.44;
@@ -293,10 +293,11 @@ impl SamplerBankUi {
             }
         });
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            let path_width = (ui.available_width() - 80.0).max(120.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.path_input)
-                    .desired_width(248.0)
+                    .desired_width(path_width)
                     .hint_text("/path/to/sample.wav"),
             );
             if ui.button("Load WAV").clicked() {

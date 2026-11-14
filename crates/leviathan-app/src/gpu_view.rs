@@ -3,10 +3,10 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use eframe::{egui, egui_wgpu, wgpu};
-use leviathan_core::CvFrame;
+use leviathan_core::{CvFrame, NUM_LANES};
 use leviathan_gpu::{
     is_wgsl_filename, validate_wgsl_contract, AudioScopeSnapshot, FeedbackSurface, VisualUniforms,
     AUDIO_TEX_BYTES, AUDIO_TEX_HEIGHT, AUDIO_TEX_WIDTH, FEEDBACK_SHADER_WGSL,
@@ -20,6 +20,7 @@ const GPU_HEIGHT: u32 = 360;
 const CPU_FALLBACK_WIDTH: usize = 160;
 const CPU_FALLBACK_HEIGHT: usize = 90;
 const HOT_RELOAD_POLL_SECS: f64 = 0.5;
+const FRAME_PERIOD: f64 = 1.0 / 60.0;
 const DEFAULT_STARTER_PATH: &str = "custom_feedback.wgsl";
 
 fn is_wgsl_drop(name: &str, path: Option<&Path>) -> bool {
@@ -443,6 +444,8 @@ enum Backend {
 pub struct FeedbackViewport {
     backend: Backend,
     frame_index: u32,
+    preview: Option<(f64, egui::TextureId)>,
+    pending_gates: [f32; NUM_LANES],
     status_label: String,
     active_shader: Option<CustomShader>,
     watched_path: Option<PathBuf>,
@@ -460,6 +463,8 @@ impl FeedbackViewport {
         Self {
             backend,
             frame_index: 0,
+            preview: None,
+            pending_gates: [0.0; NUM_LANES],
             status_label,
             active_shader: None,
             watched_path: None,
@@ -678,7 +683,7 @@ impl FeedbackViewport {
     fn draw_audio_scope_canvas(&self, ui: &mut egui::Ui) {
         egui::Frame::canvas(ui.style()).show(ui, |ui| {
             let (resp, painter) =
-                ui.allocate_painter(egui::vec2(340.0, 42.0), egui::Sense::hover());
+                ui.allocate_painter(egui::vec2(ui.available_width(), 42.0), egui::Sense::hover());
             let rect = resp.rect;
             let band_w = rect.width() * 0.25;
             for (b_idx, &lvl) in self.latest_scope.bands.iter().enumerate() {
@@ -743,10 +748,11 @@ impl FeedbackViewport {
             );
         }
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            let path_width = (ui.available_width() - 80.0).max(120.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.shader_path_input)
-                    .desired_width(248.0)
+                    .desired_width(path_width)
                     .hint_text(DEFAULT_STARTER_PATH),
             );
             if ui.button("Load .wgsl").clicked() {
@@ -799,16 +805,37 @@ impl FeedbackViewport {
     pub fn render_frame(
         &mut self,
         ctx: &egui::Context,
+        now: f64,
         cv: &CvFrame,
         scope: &AudioScopeSnapshot,
     ) -> egui::TextureId {
         self.latest_scope = *scope;
+        if self.watched_path.is_some() {
+            ctx.request_repaint_after(Duration::from_secs_f64(HOT_RELOAD_POLL_SECS));
+        }
+        for (pending, gate) in self.pending_gates.iter_mut().zip(cv.gate_v) {
+            *pending = pending.max(gate);
+        }
+        let mut next = now + FRAME_PERIOD;
+        if let Some((deadline, id)) = self.preview {
+            let elapsed = now - deadline;
+            if elapsed < -1e-9 {
+                return id;
+            }
+            // Skip missed slots while retaining phase. A slow repaint gets one feedback pass.
+            next = deadline + ((elapsed.max(0.0) / FRAME_PERIOD).floor() + 1.0) * FRAME_PERIOD;
+            if next - now < 1e-9 {
+                next += FRAME_PERIOD;
+            }
+        }
+        let mut cv = *cv;
+        cv.gate_v = std::mem::take(&mut self.pending_gates);
         let frame = self.frame_index;
         self.frame_index = self.frame_index.wrapping_add(1);
 
-        match &mut self.backend {
+        let id = match &mut self.backend {
             Backend::Hardware(gpu) => {
-                let uniforms = VisualUniforms::from_cv(cv, frame, gpu.width, gpu.height);
+                let uniforms = VisualUniforms::from_cv(&cv, frame, gpu.width, gpu.height);
                 gpu.step(&uniforms, scope)
             }
             Backend::Software {
@@ -817,7 +844,7 @@ impl FeedbackViewport {
             } => {
                 let surf_w = surface.width;
                 let surf_h = surface.height;
-                let uniforms = VisualUniforms::from_cv(cv, frame, surf_w as u32, surf_h as u32);
+                let uniforms = VisualUniforms::from_cv(&cv, frame, surf_w as u32, surf_h as u32);
                 let rgba = surface.step(&uniforms);
                 let color_img = egui::ColorImage::from_rgba_unmultiplied([surf_w, surf_h], rgba);
                 let tex = preview_tex.get_or_insert_with(|| {
@@ -830,6 +857,14 @@ impl FeedbackViewport {
                 tex.set(color_img, egui::TextureOptions::LINEAR);
                 tex.id()
             }
+        };
+        self.preview = Some((next, id));
+        id
+    }
+
+    pub fn request_next_frame(&self, ctx: &egui::Context, now: f64) {
+        if let Some((deadline, _)) = self.preview {
+            ctx.request_repaint_after(Duration::from_secs_f64((deadline - now).max(0.0)));
         }
     }
 }
@@ -853,8 +888,8 @@ mod tests {
         scope.wave_l[0] = 240;
         scope.bands = [0.85, 0.4, 0.2, 0.1];
 
-        let id0 = vp.render_frame(&ctx, &cv, &scope);
-        let id1 = vp.render_frame(&ctx, &cv, &scope);
+        let id0 = vp.render_frame(&ctx, 0.0, &cv, &scope);
+        let id1 = vp.render_frame(&ctx, FRAME_PERIOD, &cv, &scope);
         assert_eq!(id0, id1);
         assert_eq!(vp.latest_scope, scope);
 
@@ -879,6 +914,31 @@ mod tests {
             None,
         )
         .expect("T13 @group(0)+@group(1) shader must load");
+    }
+
+    #[test]
+    fn feedback_steps_at_most_once_per_slot_and_retains_short_gates() {
+        let ctx = egui::Context::default();
+        let mut vp = FeedbackViewport::new_software();
+        let scope = AudioScopeSnapshot::default();
+        let silent = CvFrame::default();
+        let mut hit = silent;
+        hit.gate_v[0] = 10.0;
+        let first = vp.render_frame(&ctx, 0.0, &silent, &scope);
+        assert_eq!(
+            vp.render_frame(&ctx, FRAME_PERIOD / 2.0, &hit, &scope),
+            first
+        );
+        assert_eq!(vp.frame_index, 1);
+        assert_eq!(vp.pending_gates[0], 10.0);
+        vp.render_frame(&ctx, FRAME_PERIOD, &silent, &scope);
+        assert_eq!(vp.frame_index, 2);
+        assert_eq!(vp.pending_gates[0], 0.0);
+
+        vp.render_frame(&ctx, 12.0, &silent, &scope);
+        vp.render_frame(&ctx, 12.0, &silent, &scope);
+        assert_eq!(vp.frame_index, 3);
+        assert!((vp.preview.unwrap().0 - 12.0 - FRAME_PERIOD).abs() < 1e-9);
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use eframe::egui::{self, Key, Modifiers};
 use leviathan_core::{
     LaunchTarget, Pattern, PatternChain, PlaybackRate, SongStatus, MAX_CHAIN_ENTRIES,
+    ROWS_PER_PATTERN,
 };
 
 use crate::export_ui::ExportUi;
@@ -161,6 +162,7 @@ impl ProjectUi {
 pub enum ArrangementAction {
     Select(usize),
     AddPattern { clone: bool },
+    SetLength(usize),
     SetRate(PlaybackRate),
     SetSwing(f32),
     Launch(LaunchTarget),
@@ -180,12 +182,10 @@ fn rate_label(rate: PlaybackRate) -> &'static str {
     }
 }
 
-pub fn draw_arrangement(
+pub fn draw_pattern_bar(
     ui: &mut egui::Ui,
     patterns: &[Pattern],
     selected: usize,
-    chain: &PatternChain,
-    status: SongStatus,
     playing: bool,
 ) -> Option<ArrangementAction> {
     let mut action = None;
@@ -224,6 +224,18 @@ pub fn draw_arrangement(
         if ui.add_enabled(room, egui::Button::new("Clone")).clicked() {
             action = Some(ArrangementAction::AddPattern { clone: true });
         }
+        let mut rows = patterns[selected].length;
+        if ui
+            .add(
+                egui::DragValue::new(&mut rows)
+                    .range(1..=ROWS_PER_PATTERN)
+                    .prefix("Rows "),
+            )
+            .on_hover_text("Active rows in the selected pattern")
+            .changed()
+        {
+            action = Some(ArrangementAction::SetLength(rows));
+        }
         let current_rate = patterns[selected].rate;
         egui::ComboBox::from_id_salt("pattern_rate")
             .selected_text(format!("Rate {}", rate_label(current_rate)))
@@ -249,6 +261,7 @@ pub fn draw_arrangement(
         if ui
             .add(
                 egui::Slider::new(&mut swing, 50.0..=leviathan_core::MAX_SWING * 100.0)
+                    .clamping(egui::SliderClamping::Edits)
                     .step_by(0.5)
                     .suffix("%")
                     .text("Swing"),
@@ -266,22 +279,36 @@ pub fn draw_arrangement(
         if ui.button(launch).clicked() {
             action = Some(ArrangementAction::Launch(LaunchTarget::Pattern(selected)));
         }
-        ui.separator();
-        ui.monospace(format!("Playback {:02X}", status.pattern));
-        if let Some(target) = status.queued {
-            match target {
-                LaunchTarget::Pattern(index) => ui.monospace(format!("Queued {index:02X}")),
-                LaunchTarget::Chain => ui.monospace("Queued chain"),
-            };
-        }
     });
+    action
+}
+
+pub fn draw_song(
+    ui: &mut egui::Ui,
+    patterns: &[Pattern],
+    selected: usize,
+    chain: &PatternChain,
+    status: SongStatus,
+    playing: bool,
+) -> Option<ArrangementAction> {
+    let entries = chain.as_slice();
+    let mut action = None;
+    ui.heading("Song chain");
     ui.horizontal_wrapped(|ui| {
-        let entries = chain.as_slice();
-        ui.label("Chain");
+        let launch = if playing { "Queue Chain" } else { "Cue Chain" };
+        if ui
+            .add_enabled(!entries.is_empty(), egui::Button::new(launch))
+            .on_hover_text(
+                "Start at the first chain entry, or queue it at the next pattern boundary",
+            )
+            .clicked()
+        {
+            action = Some(ArrangementAction::Launch(LaunchTarget::Chain));
+        }
         if ui
             .add_enabled(
                 entries.len() < MAX_CHAIN_ENTRIES,
-                egui::Button::new("Add Pattern"),
+                egui::Button::new(format!("Add {selected:02X}")),
             )
             .clicked()
         {
@@ -299,27 +326,45 @@ pub fn draw_arrangement(
         {
             action = Some(ArrangementAction::ClearChain);
         }
-        let launch = if playing { "Queue Chain" } else { "Cue Chain" };
-        if ui
-            .add_enabled(!entries.is_empty(), egui::Button::new(launch))
-            .clicked()
-        {
-            action = Some(ArrangementAction::Launch(LaunchTarget::Chain));
-        }
-        egui::ScrollArea::horizontal()
-            .id_salt("song_chain")
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    for (entry, id) in entries.iter().enumerate() {
-                        let label = egui::RichText::new(format!("{id:02X}")).monospace();
-                        ui.label(if status.chain_entry == Some(entry) {
-                            label.strong().color(ui.visuals().selection.stroke.color)
-                        } else {
-                            label
-                        });
-                    }
-                });
-            });
     });
+    if entries.is_empty() {
+        ui.label("Add a pattern to start the chain.");
+        return action;
+    }
+    let mut total = 0.0;
+    egui::Grid::new("song_entries")
+        .striped(true)
+        .show(ui, |ui| {
+            ui.strong("Entry");
+            ui.strong("Pattern");
+            ui.strong("Starts (beat)");
+            ui.strong("Beats");
+            ui.end_row();
+            for (entry, &id) in entries.iter().enumerate() {
+                let index = usize::from(id);
+                let Some(pattern) = patterns.get(index) else {
+                    continue;
+                };
+                let current = status.chain_entry == Some(entry);
+                ui.monospace(format!(
+                    "{}{:02}",
+                    if current { "▶ " } else { "  " },
+                    entry + 1
+                ));
+                if ui
+                    .selectable_label(index == selected, format!("{id:02X}"))
+                    .on_hover_text("Select this pattern for editing")
+                    .clicked()
+                {
+                    action = Some(ArrangementAction::Select(index));
+                }
+                ui.monospace(format!("{total:.2}"));
+                let length = pattern.duration_beats();
+                ui.monospace(format!("{length:.2}"));
+                ui.end_row();
+                total += length;
+            }
+        });
+    ui.small(format!("{} entries · {total:.2} beats", entries.len()));
     action
 }

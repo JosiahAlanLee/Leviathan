@@ -5,7 +5,7 @@ use leviathan_dsp::LanePatch;
 use crate::lane_mix::LaneMix;
 
 pub fn draw(ui: &mut egui::Ui, mix: &mut LaneMix, patches: &[LanePatch; NUM_LANES]) {
-    egui::CollapsingHeader::new("Lane Mixer").show(ui, |ui| {
+    egui::CollapsingHeader::new("Lane Mixer").default_open(true).show(ui, |ui| {
         egui::Grid::new("lane_mixer").striped(true).show(ui, |ui| {
             for label in ["Lane", "Level", "Pan", "Delay Send", "BEND Send"] {
                 ui.strong(label);
