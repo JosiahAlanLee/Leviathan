@@ -1,3 +1,4 @@
+use crate::captured::{FrameSource, Scan};
 use crate::voice::{approach, choice, sine_cycle};
 use crate::wrap_turns;
 use leviathan_core::SOUND_PARAMS;
@@ -102,6 +103,7 @@ pub(super) struct Voice {
     filtered: [f32; 2],
     held_sample: f32,
     hold: u8,
+    scan_sample: Scan,
 }
 
 const _: () = assert!(core::mem::size_of::<Voice>() <= 128);
@@ -116,9 +118,11 @@ impl Voice {
         trigger: Option<f32>,
         params: &[f32; SOUND_PARAMS],
         calibrated: bool,
+        source: Option<FrameSource<'_>>,
     ) -> f32 {
         let [decay, table, position, depth, k1, k2, grit, loop_mode] = *params;
         if let Some(velocity) = trigger {
+            self.scan_sample = Scan::new();
             self.amp = velocity;
             self.phase = 0;
             self.scan = 0.0;
@@ -156,7 +160,17 @@ impl Voice {
             let discarded = (grit * 12.0) as u32;
             let phase = (self.phase >> discarded) << discarded;
             let frame = (self.frame * ((FRAMES - 1) as u32 * FRACTION) as f32 + 0.5) as u32;
-            self.held_sample = scan_sample(choice(table, TABLES), frame, phase) * (1.0 / 32_768.0);
+            self.held_sample = if let Some(source) = source {
+                self.scan_sample.read_mono(
+                    source,
+                    self.frame,
+                    phase as f32 / CYCLE as f32,
+                    sample_rate / (f32::from(self.hold) + 1.0),
+                    false,
+                )
+            } else {
+                scan_sample(choice(table, TABLES), frame, phase) * (1.0 / 32_768.0)
+            };
         } else {
             self.hold -= 1;
         }
@@ -171,6 +185,10 @@ impl Voice {
             self.filtered[1]
         };
         (sample * self.amp).clamp(-1.0, 1.0)
+    }
+
+    pub(super) fn is_silent(&self) -> bool {
+        self.amp == 0.0
     }
 }
 
@@ -254,7 +272,14 @@ mod tests {
             let mut voice = Voice::default();
             let mut energy = 0.0;
             for i in 0..48_000 {
-                let sample = voice.step(440.0, 48_000.0, (i == 0).then_some(1.0), &params, false);
+                let sample = voice.step(
+                    440.0,
+                    48_000.0,
+                    (i == 0).then_some(1.0),
+                    &params,
+                    false,
+                    None,
+                );
                 assert!((-1.0..=1.0).contains(&sample));
                 energy += sample * sample;
             }

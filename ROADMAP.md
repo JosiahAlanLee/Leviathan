@@ -272,7 +272,7 @@ Use the public behavioral references and original Rust under the [clean-room pol
 
 ### `T28` – Beat-Synced Capture to a Project Sample Slot
 
-- **Status** — Proposed first.
+- **Status** — Implemented in [`00e3af3c9`](https://github.com/JosiahAlanLee/Leviathan/commit/00e3af3c95d7384d22b5087faf6789b992f94cf3). Adds `ArmCapture`, `CancelCapture`, and `InstallTake` to `AudioCommand`.
 - **Capture** — Choose a lane's stereo signal after mute, level and pan, or the stereo BEND return before the master limiter. Arm for a transport beat boundary and record a bounded number of beats using the sample-clock transport. Take each source from the same render pass as the master.
 - **Playback and persistence** — A completed take becomes a project sample with its channel count and original sample rate. Make it selectable in `SMPL` and addressable across its full length. The first hit after publication plays the new take. Any hit already sounding retains its original audio and region until it ends or retriggers. Preserve the four existing WAV banks and their saved mappings. Make new slot selection opt-in so existing step locks resolve as before.
 - **Real-time path** — Size and allocate capture storage before arming. Publish completed takes as one state change and reclaim retired storage away from the callback. Keep file I/O and bulk PCM copies off the callback. Cancel an incomplete take on a transport stop, seek, project change, or capacity failure. Keep the previous take available.
@@ -281,21 +281,21 @@ Use the public behavioral references and original Rust under the [clean-room pol
 
 ### `T29` – Scan Transwaves from Project Samples
 
-- **Status** — Proposed after T28.
+- **Status** — Implemented in [`00e3af3c9`](https://github.com/JosiahAlanLee/Leviathan/commit/00e3af3c95d7384d22b5087faf6789b992f94cf3). `SetRackRouting` selects the capture source, trim, and frame length.
 - **Scope** — Divide a selected sample region into equal-length frames and make it a source for the OTIS family alongside the generated tables. Select frames with position and, when T31 lands, a clocked byte. Retain the playback phase across frame changes and provide a short blend between equal-length frames.
 - **Acceptance** — Use a captured sample with distinguishable frames to check first and last frame selection, incomplete trailing frames, and switching without phase reset. Verify project round-trip and live/WAV parity. Keep existing OTIS and OT2 patches compatible.
 - **Behavioral reference** — [OTIS window scanning and ByteBus frame selection](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/otislab/docs/MANUAL.md#window-scanning-and-frame-stepping)
 
 ### `T30` – Vastish Sample and Audio Processing
 
-- **Status** — Proposed after T28. Sequence with T29 where they share sample playback code.
+- **Status** — Implemented in [`00e3af3c9`](https://github.com/JosiahAlanLee/Leviathan/commit/00e3af3c95d7384d22b5087faf6789b992f94cf3). `SetRackRouting` selects a gated sample or gate-free lane input for VAST's four algorithms.
 - **Scope** — Let a VAST processor read a project sample or a routed lane and process it through selectable blocks. Start with one source and one processor per route. A sample uses the note gate. A continuous audio route can run gate-free. Three independently configured Vastish stages, the full block catalog and patchable modulation outputs are follow-ups.
 - **Acceptance** — Feed the same take into `SMPL` and the VAST processor. Check gated and gate-free rendering, route validation for cycles, and export through the same routing used for playback.
 - **Behavioral references** — [Vastish audio input](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/vastish/docs/AUDIO_IN.md) · [Vastish chain](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/vastish/docs/CHAIN.md)
 
 ### `T31` – Route ByteBus Words Through Register and Lookup
 
-- **Status** — Proposed. The first destination is `BBUS`.
+- **Status** — Implemented in [`00e3af3c9`](https://github.com/JosiahAlanLee/Leviathan/commit/00e3af3c95d7384d22b5087faf6789b992f94cf3). `SetRackRouting` enables either destination and selects one of four Lookup maps and a reset seed.
 - **Scope** — Route the tracker hit mask or fixed row byte through a clocked Register and a one-input Lookup. Add the OTIS frame destination once T29 is available. Expose clock and reset behavior and treat `00` as valid data. The existing DSP clocked receiver can supply a clocked word when an input path is added.
 - **Acceptance** — Compare bypass with existing BBUS playback and test latch timing, reset, a fixed zero word, repeated clock strobes, and project save/reload. Compare the routed words and audio in live playback and offline export.
 - **Behavioral reference** — [ByteBusLab modules and clock contracts](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/bytebus/README.md)

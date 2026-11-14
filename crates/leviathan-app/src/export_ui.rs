@@ -240,7 +240,8 @@ mod tests {
     fn opening_export_dialog_blocks_midi_step_recording_but_keeps_transport() {
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-        let mut app = LeviathanApp::with_audio(&cc, |_, _, _, _| Err("Offline test clock".into()));
+        let mut app =
+            LeviathanApp::with_audio(&cc, |_, _, _, _, _| Err("Offline test clock".into()));
         app.export_ui.dialog = true;
         app.midi.record_armed = true;
         let (lane, row) = (app.cursor.lane, app.cursor.row);

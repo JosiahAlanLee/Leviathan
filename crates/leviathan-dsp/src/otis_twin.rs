@@ -1,3 +1,4 @@
+use crate::captured::{FrameSource, Scan};
 use crate::voice::{approach, choice};
 use crate::{fast_tanh, wrap_turns};
 use leviathan_core::SOUND_PARAMS;
@@ -254,6 +255,7 @@ pub(super) struct TwinVoice {
     lp: [f32; 4],
     hp_lp: [f32; 2],
     decim_counter: u8,
+    sample_frames: [Scan; 2],
 }
 
 const _: () = assert!(core::mem::size_of::<TwinVoice>() <= 96);
@@ -284,6 +286,7 @@ impl TwinVoice {
             lp: [0.0; 4],
             hp_lp: [0.0; 2],
             decim_counter: 0,
+            sample_frames: [Scan::new(); 2],
         }
     }
 
@@ -330,6 +333,7 @@ impl TwinVoice {
         trigger: Option<f32>,
         params: &[f32; SOUND_PARAMS],
         calibrated: bool,
+        source: Option<FrameSource<'_>>,
     ) -> f32 {
         let sr = sample_rate.max(8_000.0);
         let root = hz.clamp(8.0, sr * 0.45);
@@ -346,6 +350,7 @@ impl TwinVoice {
         };
 
         if let Some(velocity) = trigger {
+            self.sample_frames = [Scan::new(); 2];
             let cold_start = self.amp_env == 0.0;
             self.amp_env = velocity;
             self.scan_env = 1.0;
@@ -414,12 +419,26 @@ impl TwinVoice {
             let frac_mask = u32::MAX << discard;
 
             let addr_a = phase_to_q20_12(self.phase_a) & frac_mask;
-            let osc_a = sample_twin_rom_q20_12(table, self.frame_a, addr_a);
+            let scan_rate = sr / (f32::from(self.decim_counter) + 1.0);
+            let read = |scan: &mut Scan, frame, address, invert_bus| {
+                if let Some(source) = source {
+                    scan.read_mono(
+                        source,
+                        frame / (FRAMES - 1) as f32,
+                        address as f32 / (SAMPLES as u32 * FRACTION) as f32,
+                        scan_rate,
+                        invert_bus,
+                    )
+                } else {
+                    sample_twin_rom_q20_12(table, frame, address)
+                }
+            };
+            let osc_a = read(&mut self.sample_frames[0], self.frame_a, addr_a, false);
 
             let mix_b = self.mix_b;
             let mut s = if mix_b > 1e-5 {
                 let addr_b = phase_to_q20_12(self.phase_b) & frac_mask;
-                let osc_b = sample_twin_rom_q20_12(table, self.frame_b, addr_b);
+                let osc_b = read(&mut self.sample_frames[1], self.frame_b, addr_b, true);
                 let norm_gain = 1.0 / (1.0 + 0.55 * mix_b);
                 (osc_a + mix_b * osc_b) * norm_gain
             } else {
@@ -437,6 +456,10 @@ impl TwinVoice {
         }
 
         self.filter(self.held_wave, f1, f2, sr, calibrated) * self.amp_env
+    }
+
+    pub(super) fn is_silent(&self) -> bool {
+        self.amp_env == 0.0
     }
 
     fn filter(&mut self, input: f32, f1: f32, f2: f32, rate: f32, calibrated: bool) -> f32 {
@@ -527,16 +550,16 @@ mod tests {
         p[6] = 0.45; // Twin unison active
         p[7] = 0.50; // Bidir zone
 
-        let _ = v.step(220.0, 48_000.0, true, Some(0.95), &p, false);
+        let _ = v.step(220.0, 48_000.0, true, Some(0.95), &p, false, None);
 
         // Advance into the rising half of `Bidir` (`scan_phase` ~ 0.15 .. 0.35)
         for _ in 0..2_200 {
-            let _ = v.step(220.0, 48_000.0, true, None, &p, false);
+            let _ = v.step(220.0, 48_000.0, true, None, &p, false, None);
         }
         let fa_0 = v.frame_a;
         let fb_0 = v.frame_b;
         for _ in 0..2_000 {
-            let _ = v.step(220.0, 48_000.0, true, None, &p, false);
+            let _ = v.step(220.0, 48_000.0, true, None, &p, false, None);
         }
         let d_rise_a = v.frame_a - fa_0;
         let d_rise_b = v.frame_b - fb_0;
@@ -548,12 +571,12 @@ mod tests {
 
         // Advance into the falling half of `Bidir` (`scan_phase` ~ 0.65 .. 0.85)
         for _ in 0..5_000 {
-            let _ = v.step(220.0, 48_000.0, true, None, &p, false);
+            let _ = v.step(220.0, 48_000.0, true, None, &p, false, None);
         }
         let fa_1 = v.frame_a;
         let fb_1 = v.frame_b;
         for _ in 0..2_000 {
-            let _ = v.step(220.0, 48_000.0, true, None, &p, false);
+            let _ = v.step(220.0, 48_000.0, true, None, &p, false, None);
         }
         let d_fall_a = v.frame_a - fa_1;
         let d_fall_b = v.frame_b - fb_1;
@@ -580,7 +603,15 @@ mod tests {
         let increment = |frequency| (f64::from(frequency) / f64::from(rate) * PHASE_TURNS) as u64;
         let (step_a, step_b) = (increment(hz), increment(hz_b));
         for sample in 1..=128_000 {
-            let out = voice.step(hz, rate, true, (sample == 1).then_some(0.95), &params, false);
+            let out = voice.step(
+                hz,
+                rate,
+                true,
+                (sample == 1).then_some(0.95),
+                &params,
+                false,
+                None,
+            );
             assert!(out.is_finite());
             assert!(out.abs() <= 1.0);
             let phase_a = (sample * step_a) as u32;
@@ -628,7 +659,15 @@ mod tests {
         let after_one_second = |rate| {
             let mut voice = TwinVoice::new();
             for sample in 0..rate as usize {
-                voice.step(220.0, rate, true, (sample == 0).then_some(1.0), &params, false);
+                voice.step(
+                    220.0,
+                    rate,
+                    true,
+                    (sample == 0).then_some(1.0),
+                    &params,
+                    false,
+                    None,
+                );
             }
             (voice.amp_env, voice.scan_env)
         };
@@ -650,7 +689,7 @@ mod tests {
         p[6] = 0.45;
         p[7] = 0.70; // Clean FwdWrap
 
-        let mut prev = v.step(165.0, 48_000.0, true, Some(0.90), &p, false);
+        let mut prev = v.step(165.0, 48_000.0, true, Some(0.90), &p, false, None);
         let mut max_step_delta = 0.0_f32;
 
         for i in 1..24_000 {
@@ -665,7 +704,7 @@ mod tests {
                 p[7] = 0.70; // Back to FwdWrap across wraparound boundary
                 p[6] = 0.00; // Smoothly close back to single-reader
             }
-            let cur = v.step(165.0, 48_000.0, true, None, &p, false);
+            let cur = v.step(165.0, 48_000.0, true, None, &p, false, None);
             let d = f32::abs(cur - prev);
             if d > max_step_delta {
                 max_step_delta = d;
@@ -686,16 +725,19 @@ mod tests {
         p[2] = 0.0;
         p[6] = 0.0;
         p[7] = 0.67;
-        assert_eq!(voice.step(220.0, 48_000.0, true, Some(0.0), &p, false), 0.0);
-        voice.step(220.0, 48_000.0, true, Some(0.95), &p, false);
+        assert_eq!(
+            voice.step(220.0, 48_000.0, true, Some(0.0), &p, false, None),
+            0.0
+        );
+        voice.step(220.0, 48_000.0, true, Some(0.95), &p, false, None);
         assert_eq!(voice.mix_b, 0.0);
         assert!(voice.frame_b > 14.99);
         p[6] = 0.85;
-        voice.step(220.0, 48_000.0, true, None, &p, false);
+        voice.step(220.0, 48_000.0, true, None, &p, false, None);
         assert!((0.0..0.01).contains(&voice.mix_b));
         assert!((1.0..1.01).contains(&voice.ratio_b));
         for _ in 0..4_800 {
-            voice.step(220.0, 48_000.0, true, None, &p, false);
+            voice.step(220.0, 48_000.0, true, None, &p, false, None);
         }
         assert!(voice.mix_b > 0.75);
         assert!(voice.ratio_b > 2.0);

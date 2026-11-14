@@ -6,6 +6,13 @@ const COMB_SAMPLES: usize = 256;
 const ALGORITHM_COUNT: usize = 4;
 const EQUATION_COUNT: usize = 5;
 
+#[derive(Clone, Copy)]
+pub(super) enum Input {
+    Oscillator,
+    Gated(f32),
+    Through(f32),
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Voice {
     phase: f32,
@@ -64,6 +71,18 @@ impl Voice {
         trigger: Option<f32>,
         params: &[f32; SOUND_PARAMS],
     ) -> f32 {
+        self.step_input(hz, sample_rate, trigger, params, Input::Oscillator)
+    }
+
+    #[inline]
+    pub(super) fn step_input(
+        &mut self,
+        hz: f32,
+        sample_rate: f32,
+        trigger: Option<f32>,
+        params: &[f32; SOUND_PARAMS],
+        input: Input,
+    ) -> f32 {
         let [algorithm, warp, equation, depth, lfo_rate, cutoff, resonance, decay] = *params;
         let algorithm = choice(algorithm, ALGORITHM_COUNT);
         if self.algorithm != algorithm {
@@ -87,22 +106,34 @@ impl Voice {
         if trigger.is_some() || next_lfo >= 1.0 {
             self.held = (0.5 + 7.0 * lfo * self.amp) as u32 as f32 / 7.0;
         }
-        let modulation = fun(choice(equation, EQUATION_COUNT), self.amp, lfo, self.held);
+        let gain = match input {
+            Input::Through(_) => 1.0,
+            _ => self.amp,
+        };
+        let modulation = fun(choice(equation, EQUATION_COUNT), gain, lfo, self.held);
         let warp = (warp + depth * (modulation - 0.5)).clamp(0.0, 1.0);
         let step = phase_step(hz, sample_rate);
         self.phase = wrap_turns(self.phase + step);
 
+        let source = |oscillator| match input {
+            Input::Oscillator => oscillator,
+            Input::Gated(sample) | Input::Through(sample) => sample.clamp(-1.0, 1.0),
+        };
         let drive = 1.0 + 4.0 * warp;
         let shaped = match algorithm {
-            0 => 2.0 * wrap_turns(0.5 + 0.5 * drive * sine(self.phase)) - 1.0,
-            1 => fold(triangle(self.phase, step) * drive),
+            0 => 2.0 * wrap_turns(0.5 + 0.5 * drive * source(sine(self.phase))) - 1.0,
+            1 => fold(source(triangle(self.phase, step)) * drive),
             2 => {
                 let steps = (32 - (29.0 * warp) as u32) as f32;
-                let level = (0.5 + (0.5 + 0.5 * saw(self.phase, step)) * steps) as u32;
-                2.0 * level as f32 / steps - 1.0
+                let level = |sample| (0.5 + (0.5 + 0.5 * sample) * steps) as u32 as f32;
+                let quantized = 2.0 * level(source(saw(self.phase, step))) / steps - 1.0;
+                match input {
+                    Input::Oscillator => quantized,
+                    _ => quantized - (2.0 * level(0.0) / steps - 1.0),
+                }
             }
             _ => {
-                let osc = pulse(self.phase, step, 0.45) * self.amp;
+                let osc = source(pulse(self.phase, step, 0.45)) * gain;
                 let delay = 8 + (warp * (COMB_SAMPLES - 8) as f32) as usize;
                 self.allpass_comb(osc, delay, 0.35 + 0.45 * warp)
             }
@@ -113,7 +144,7 @@ impl Voice {
         let input = if algorithm == 3 {
             shaped
         } else {
-            shaped * self.amp
+            shaped * gain
         };
         let filtered = self.filter.step(input, g, damping, 0.0);
         let output = match algorithm {
@@ -162,6 +193,44 @@ fn fun(equation: usize, a: f32, b: f32, held: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::MachineKind;
+
+    #[test]
+    fn sample_input_triggers_an_envelope_and_lane_input_runs_without_a_gate() {
+        for algorithm in 0..ALGORITHM_COUNT {
+            let mut params = MachineKind::VastFunSynth.spec().default_params();
+            params[0] = (algorithm as f32 + 0.5) / ALGORITHM_COUNT as f32;
+            let mut voice = Voice::default();
+            for _ in 0..256 {
+                assert_eq!(
+                    voice.step_input(261.625_58, 48_000.0, None, &params, Input::Gated(0.25)),
+                    0.0
+                );
+                assert_eq!(
+                    voice.step_input(261.625_58, 48_000.0, None, &params, Input::Through(0.0)),
+                    0.0
+                );
+            }
+            let signal = |gated| {
+                let mut voice = Voice::default();
+                (0..256)
+                    .map(|i| {
+                        let sample = if i % 19 < 8 { 0.20 } else { -0.33 };
+                        let input = if gated {
+                            Input::Gated(sample)
+                        } else {
+                            Input::Through(sample)
+                        };
+                        let trigger = (gated && i == 0).then_some(0.8);
+                        voice
+                            .step_input(261.625_58, 48_000.0, trigger, &params, input)
+                            .abs()
+                    })
+                    .sum::<f32>()
+            };
+            assert!(signal(true) > 0.1);
+            assert!(signal(false) > 0.1);
+        }
+    }
 
     #[test]
     fn algorithms_and_equations_change_the_rendered_signal() {
