@@ -24,11 +24,12 @@ pub fn draw_delay_mode(ui: &mut egui::Ui, mode: &mut DelayMode) -> bool {
 
 pub fn draw_bender(ui: &mut egui::Ui, params: &mut BenderParams) -> bool {
     let before = *params;
-    egui::CollapsingHeader::new("BEND").show(ui, |ui| {
+    egui::CollapsingHeader::new("BEND").default_open(true).show(ui, |ui| {
         let mut shift_hz = params.shift_hz();
         if ui
             .add(
                 egui::Slider::new(&mut shift_hz, -BENDER_MAX_SHIFT_HZ..=BENDER_MAX_SHIFT_HZ)
+                    .clamping(egui::SliderClamping::Edits)
                     .step_by(1.0)
                     .suffix(" Hz")
                     .text("Shift"),

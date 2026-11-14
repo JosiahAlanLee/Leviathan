@@ -211,6 +211,10 @@ impl Recorder {
         }
     }
 
+    pub fn beats_left(&self, beat: f64) -> Option<f64> {
+        self.end_beat.or(self.start_beat).map(|target| (target - beat).max(0.0))
+    }
+
     pub fn tap(
         &mut self,
         beat: f64,

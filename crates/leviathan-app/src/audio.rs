@@ -22,6 +22,11 @@ pub enum AudioCommand {
         playing: bool,
         request: u64,
     },
+    PlayFromRow {
+        pattern: usize,
+        row: usize,
+        request: u64,
+    },
     SetFill(bool),
     SetBpm(f64),
     SetMasterSend(f32),
@@ -71,9 +76,13 @@ pub enum AudioCommand {
 }
 
 impl AudioCommand {
-    pub fn apply_transport(&self, player: &mut SongPlayer, pattern_count: usize) {
+    pub fn apply_transport(&self, player: &mut SongPlayer, patterns: &[Pattern]) {
+        let pattern_count = patterns.len();
         match self {
             Self::SetPlaying { playing, .. } => player.evaluator.playing = *playing,
+            Self::PlayFromRow { pattern, row, .. } => {
+                player.start_pattern_at_row(patterns, *pattern, *row);
+            }
             Self::SetFill(fill) => player.evaluator.fill_active = *fill,
             Self::SetBpm(bpm) => player.evaluator.config.bpm = bpm.clamp(40.0, 240.0),
             Self::Reset => player.reset_transport(pattern_count),
@@ -238,6 +247,8 @@ pub struct AudioTelemetry {
     pub playing: bool,
     pub play_request: u64,
     pub capture_stage: Stage,
+    pub capture_beats_left: Option<f64>,
+    pub transport_position: (f64, usize),
     pub routed_byte: Option<u8>,
 }
 
@@ -312,7 +323,7 @@ impl RtAudioWorker {
             let Ok(command) = self.cmd_rx.pop() else {
                 break;
             };
-            command.apply_transport(&mut self.player, self.pattern_count);
+            command.apply_transport(&mut self.player, &self.patterns[..self.pattern_count]);
             match command {
                 AudioCommand::SetMasterSend(send) => self.synth.set_master_send(send),
                 AudioCommand::SetDelayMode(mode) => self.synth.set_delay_mode(mode),
@@ -415,10 +426,19 @@ impl RtAudioWorker {
                 }
                 AudioCommand::SetPlaying { request, playing } => {
                     self.play_request = request;
+                    self.tel_divider = 255;
                     if !playing {
                         self.cancel_capture();
                         self.last_playing_beat = None;
                     }
+                }
+                AudioCommand::PlayFromRow {
+                    pattern, request, ..
+                } if pattern < self.pattern_count => {
+                    self.play_request = request;
+                    self.cancel_capture();
+                    self.last_playing_beat = None;
+                    self.synth.reset_byte_route();
                 }
                 AudioCommand::SetMidiTarget(target) => self.midi_target = target,
                 _ => {}
@@ -571,6 +591,16 @@ impl RtAudioWorker {
                 playing: self.player.evaluator.playing,
                 play_request: self.play_request,
                 capture_stage: self.recorder.as_ref().map_or(Stage::Idle, Recorder::stage),
+                capture_beats_left: self
+                    .recorder
+                    .as_ref()
+                    .and_then(|recorder| recorder.beats_left(cv.beat)),
+                transport_position: if self.player.evaluator.playing {
+                    (cv.beat, cv.row)
+                } else {
+                    self.player
+                        .cursor_position(&self.patterns[..self.pattern_count])
+                },
                 routed_byte: self.synth.routed_byte(),
             };
             // Carry the interval's peaks forward if the UI hasn't drained its ring yet.
@@ -1979,5 +2009,43 @@ mod tests {
         let started = tel_rx.pop().unwrap();
         assert!(started.playing);
         assert_eq!((started.cv.beat, started.cv.row), (0.0, 0));
+    }
+
+    #[test]
+    fn play_from_row_reports_the_seek_and_cancels_an_active_capture() {
+        let (tx, rx) = rtrb::RingBuffer::new(8);
+        let (tel_tx, mut tel_rx) = rtrb::RingBuffer::new(8);
+        let (mut port, recorder) = Recorder::channel();
+        let mut audio = AudioControl::new(tx);
+        let mut worker = RtAudioWorker::new(Pattern::default(), 48_000.0, rx, tel_tx, None);
+        worker.recorder = Some(recorder);
+        assert!(port.request(0, leviathan_dsp::CaptureTap::Bend, 4));
+        audio.send(AudioCommand::ArmCapture);
+        audio.send(AudioCommand::SetPlaying {
+            playing: true,
+            request: 1,
+        });
+        worker.drain_commands();
+        worker.next_stereo();
+        let capture = tel_rx.pop().unwrap();
+        assert_eq!(capture.capture_stage, Stage::Recording);
+        assert_eq!(capture.capture_beats_left, Some(4.0));
+
+        audio.send(AudioCommand::PlayFromRow {
+            pattern: 0,
+            row: 12,
+            request: 2,
+        });
+        worker.drain_commands();
+        worker.next_stereo();
+        let seek = tel_rx.pop().unwrap();
+        assert_eq!(seek.play_request, 2);
+        assert!(seek.playing);
+        assert_eq!(seek.transport_position, (3.0, 12));
+        assert_eq!(seek.capture_stage, Stage::Idle);
+        assert!(matches!(
+            port.poll().unwrap().outcome,
+            crate::capture::Outcome::Cancelled
+        ));
     }
 }

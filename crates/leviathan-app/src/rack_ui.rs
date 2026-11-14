@@ -9,6 +9,7 @@ pub struct RackPanel {
     source: CaptureTap,
     beats: u8,
     pub stage: Stage,
+    pub beats_left: Option<f64>,
     pub status: &'static str,
     pub routing_error: bool,
 }
@@ -19,6 +20,7 @@ impl Default for RackPanel {
             source: CaptureTap::Lane(0),
             beats: 4,
             stage: Stage::Idle,
+            beats_left: None,
             status: "",
             routing_error: false,
         }
@@ -31,14 +33,26 @@ pub enum CaptureAction {
 }
 
 impl RackPanel {
+    pub fn busy_text(&self, playing: bool) -> String {
+        match (self.stage, self.beats_left, playing) {
+            (Stage::Recording, Some(beats), _) => format!("Recording · {beats:.1} beats left"),
+            (Stage::Recording, None, _) => "Recording".into(),
+            (_, Some(beats), true) => format!("Armed · starts in {beats:.1} beats"),
+            (_, None, true) => "Armed for next beat".into(),
+            _ => "Armed · waiting for Play".into(),
+        }
+    }
+
     pub fn draw_capture(
         &mut self,
         ui: &mut egui::Ui,
         take: Option<&Take>,
         has_audio: bool,
         busy: bool,
+        playing: bool,
     ) -> Option<CaptureAction> {
         egui::CollapsingHeader::new("Capture sample")
+            .default_open(true)
             .show(ui, |ui| {
                 ui.add_enabled_ui(!busy, |ui| {
                     egui::ComboBox::from_label("Capture source")
@@ -64,11 +78,7 @@ impl RackPanel {
                     ));
                 }
                 if busy {
-                    ui.label(if self.stage == Stage::Recording {
-                        "Recording"
-                    } else {
-                        "Armed for next beat"
-                    });
+                    ui.label(self.busy_text(playing));
                     if ui.button("Cancel capture").clicked() {
                         return Some(CaptureAction::Cancel);
                     }
@@ -104,7 +114,7 @@ pub fn draw_routing(
     live_word: Option<u8>,
     routing_error: bool,
 ) {
-    egui::CollapsingHeader::new("Sample and ByteBus routing").show(ui, |ui| {
+    egui::CollapsingHeader::new("Sample and ByteBus routing").default_open(true).show(ui, |ui| {
         let input = &mut routing.inputs[lane];
         egui::ComboBox::from_id_salt(("routing-input", lane))
             .selected_text(match *input {

@@ -1,18 +1,8 @@
 use eframe::egui;
 use leviathan_core::{
-    AutomationRow, FillCondition, NoteCell, PlaybackRate, SoundLock, MAX_NUDGE, MAX_RETRIG,
-    NUM_LANES, ROWS_PER_PATTERN,
+    AutomationRow, FillCondition, NoteCell, SoundLock, MAX_NUDGE, MAX_RETRIG, NUM_LANES,
 };
 use leviathan_dsp::{LanePatch, MachineKind, MACHINE_SPECS};
-
-const ALL_RATES: [(PlaybackRate, &str); 6] = [
-    (PlaybackRate::Quarter, "1/4x"),
-    (PlaybackRate::Half, "1/2x"),
-    (PlaybackRate::OneX, "1x"),
-    (PlaybackRate::TwoX, "2x"),
-    (PlaybackRate::FourX, "4x"),
-    (PlaybackRate::EightX, "8x"),
-];
 
 const ALL_FILLS: [(FillCondition, &str, &str); 3] = [
     (
@@ -44,61 +34,28 @@ pub fn step_marker(cell: &NoteCell) -> char {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct InspectorEdits {
-    pub cell: Option<NoteCell>,
-    pub automation: Option<AutomationRow>,
-    pub pattern_length: Option<usize>,
-    pub pattern_rate: Option<PlaybackRate>,
-}
-
-pub fn draw(
+pub fn draw_step(
     ui: &mut egui::Ui,
     lane: usize,
     row: usize,
     current_cell: NoteCell,
-    current_auto: AutomationRow,
-    current_length: usize,
-    current_rate: PlaybackRate,
     lane_patch: &LanePatch,
-) -> InspectorEdits {
-    let mut edits = InspectorEdits::default();
-    let safe_lane = lane.min(NUM_LANES - 1);
-    let safe_row = row.min(ROWS_PER_PATTERN - 1);
-
-    ui.heading("Pattern Timing");
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Rows");
-        let mut len = current_length.clamp(1, ROWS_PER_PATTERN);
-        if ui
-            .add(egui::DragValue::new(&mut len).range(1..=ROWS_PER_PATTERN))
-            .on_hover_text("Active pattern step count (1..=64)")
-            .changed()
-        {
-            edits.pattern_length = Some(len);
-        }
-        ui.separator();
-        for (rate, label) in ALL_RATES {
-            if ui.selectable_label(current_rate == rate, label).clicked() && rate != current_rate {
-                edits.pattern_rate = Some(rate);
-            }
-        }
-    });
-
-    ui.separator();
-
+) -> Option<NoteCell> {
     let mut edit_cell = current_cell;
     let mut cell_dirty = false;
     let eff_machine = MachineKind::from_patch_and_lock(lane_patch, &edit_cell.lock);
 
     ui.heading(format!(
-        "Step Lock -- {} {} Row {:02X} ({})",
-        safe_lane,
-        lane_patch.machine.short_name(),
-        safe_row,
-        eff_machine.short_name()
+        "Lane {} · Row {row:02X} · {}",
+        lane.min(NUM_LANES - 1) + 1,
+        eff_machine.short_name(),
     ));
-    ui.small("Shift+Arrows/Click select; Ctrl+Z/Y undo/redo; Ctrl+C/X/V; Ctrl+Up/Dn transpose.");
+    if edit_cell.lock.machine >= 0 {
+        ui.small(format!(
+            "Step machine override · Lane patch {}",
+            lane_patch.machine.short_name()
+        ));
+    }
 
     ui.horizontal(|ui| {
         if ui.checkbox(&mut edit_cell.active, "On").changed() {
@@ -109,14 +66,14 @@ pub fn draw(
         }
         ui.label("MIDI");
         if ui
-            .add(egui::DragValue::new(&mut edit_cell.midi).range(12..=108))
+            .add(egui::DragValue::new(&mut edit_cell.midi).range(0..=127))
             .changed()
         {
             cell_dirty = true;
         }
         ui.label("Vel");
         if ui
-            .add(egui::DragValue::new(&mut edit_cell.velocity).range(1..=127))
+            .add(egui::DragValue::new(&mut edit_cell.velocity).range(0..=127))
             .changed()
         {
             cell_dirty = true;
@@ -147,7 +104,7 @@ pub fn draw(
         }
     });
 
-    ui.horizontal_wrapped(|ui| {
+    ui.vertical(|ui| {
         cell_dirty |= ui
             .add(
                 egui::Slider::new(&mut edit_cell.micro_offset, -MAX_NUDGE..=MAX_NUDGE)
@@ -186,64 +143,72 @@ pub fn draw(
         }
     });
 
-    ui.horizontal_wrapped(|ui| {
-        if ui
-            .selectable_label(edit_cell.lock.machine < 0, "Lane")
-            .clicked()
-            && edit_cell.lock.machine != -1
-        {
-            edit_cell.lock.machine = -1;
-            cell_dirty = true;
-        }
-        for spec in &MACHINE_SPECS {
-            let code = i16::from(spec.id);
-            if ui
-                .selectable_label(edit_cell.lock.machine == code, spec.badge)
-                .on_hover_text(spec.name)
-                .clicked()
-                && edit_cell.lock.machine != code
-            {
-                edit_cell.lock.machine = code;
-                cell_dirty = true;
+    let previous = edit_cell.lock.machine;
+    let machine_label = if previous < 0 {
+        "Inherit lane"
+    } else {
+        eff_machine.display_name()
+    };
+    egui::ComboBox::from_id_salt("step_machine")
+        .selected_text(machine_label)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut edit_cell.lock.machine, -1, "Inherit lane");
+            for spec in &MACHINE_SPECS {
+                ui.selectable_value(&mut edit_cell.lock.machine, i16::from(spec.id), spec.name);
             }
-        }
-    });
+        });
+    cell_dirty |= previous != edit_cell.lock.machine;
 
     let spec = MachineKind::from_patch_and_lock(lane_patch, &edit_cell.lock).spec();
     for (slot, param) in spec.params.iter().enumerate() {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            let base = lane_patch.params[slot];
             let mut locked = ((edit_cell.lock.mask >> slot) & 1) != 0;
-            if ui.checkbox(&mut locked, "").changed() {
+            if ui
+                .checkbox(&mut locked, "")
+                .on_hover_text("Override this parameter on this step")
+                .changed()
+            {
                 if locked {
                     edit_cell.lock.mask |= 1 << slot;
+                    edit_cell.lock.values[slot] = base;
                 } else {
                     edit_cell.lock.mask &= !(1 << slot);
                 }
                 cell_dirty = true;
             }
+            let mut value = if locked {
+                edit_cell.lock.values[slot]
+            } else {
+                base
+            };
             if ui
                 .add(
-                    egui::Slider::new(&mut edit_cell.lock.values[slot], 0.0..=1.0)
+                    egui::Slider::new(&mut value, 0.0..=1.0)
+                        .clamping(egui::SliderClamping::Edits)
                         .text(format!("P{slot} {}", param.name)),
                 )
+                .on_hover_text(format!("Lane value: {base:.3}"))
                 .changed()
             {
                 edit_cell.lock.mask |= 1 << slot;
+                edit_cell.lock.values[slot] = value;
                 cell_dirty = true;
             }
         });
     }
+    cell_dirty.then_some(edit_cell)
+}
 
-    if cell_dirty {
-        edits.cell = Some(edit_cell);
-    }
-
-    ui.separator();
-
+pub fn draw_automation(
+    ui: &mut egui::Ui,
+    row: usize,
+    current_auto: AutomationRow,
+) -> Option<AutomationRow> {
     let mut edit_auto = current_auto;
     let mut auto_dirty = false;
 
-    ui.heading(format!("Visual Automation -- Row {:02X}", safe_row));
+    ui.heading(format!("Row {row:02X} automation"));
     if ui
         .add(egui::Slider::new(&mut edit_auto.z, 0.0..=1.0).text("Z Zoom"))
         .on_hover_text("Shader zoom CV (0..=10V normalized)")
@@ -304,11 +269,7 @@ pub fn draw(
         });
     });
 
-    if auto_dirty {
-        edits.automation = Some(edit_auto);
-    }
-
-    edits
+    auto_dirty.then_some(edit_auto)
 }
 
 #[cfg(test)]
@@ -334,21 +295,16 @@ mod tests {
     #[test]
     fn inspector_renders_headlessly_without_spurious_edits() {
         let ctx = egui::Context::default();
-        let mut captured = InspectorEdits::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                captured = draw(
-                    ui,
-                    1,
-                    4,
-                    NoteCell::default(),
-                    AutomationRow::default(),
-                    64,
-                    PlaybackRate::OneX,
-                    &LanePatch::default(),
-                );
+                let cell = NoteCell {
+                    midi: 1,
+                    velocity: 0,
+                    ..NoteCell::default()
+                };
+                assert!(draw_step(ui, 1, 4, cell, &LanePatch::default()).is_none());
+                assert!(draw_automation(ui, 4, AutomationRow::default()).is_none());
             });
         });
-        assert_eq!(captured, InspectorEdits::default());
     }
 }

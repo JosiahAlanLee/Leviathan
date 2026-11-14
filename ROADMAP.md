@@ -2,6 +2,8 @@
 
 Read [AGENTS.md](AGENTS.md) before picking up a ticket for `#![no_std]`, lock-free audio, and `BSD-3-Clause` clean-room invariants.
 
+The [UI specification](docs/UI_SPEC.md) records the desktop workflow pass and the decisions to validate for future grid, sample, and performance controls.
+
 ## Completed Baseline (M1–M9 — Commit `27f1057`)
 
 - [x] **M1–M2**: Cargo workspace, `BSD-3-Clause` [CLEANROOM.md](CLEANROOM.md), and Linux/macOS/Windows GitHub Actions CI (`0` warnings).

@@ -84,6 +84,15 @@ impl SongPlayer {
         }
     }
 
+    /// Get the transport beat and pattern-local row even while CV output is stopped.
+    pub fn cursor_position(&self, patterns: &[Pattern]) -> (f64, usize) {
+        let beat = self.evaluator.clock.beat();
+        let row = patterns.get(self.evaluator.active_pattern).map_or(0, |pattern| {
+            pattern.timing().position_at(beat - self.pattern_start_beat).2
+        });
+        (beat, row)
+    }
+
     pub fn set_chain(&mut self, chain: PatternChain) {
         self.chain = chain;
         if chain.as_slice().is_empty() {
@@ -141,6 +150,21 @@ impl SongPlayer {
         self.evaluator.reset_transport();
         self.queued = None;
         self.select(pattern, entry, 0.0);
+    }
+
+    /// Start a fresh pattern audition at the grid row's scheduled time.
+    pub fn start_pattern_at_row(&mut self, patterns: &[Pattern], index: usize, row: usize) {
+        let Some(pattern) = patterns.get(index) else {
+            return;
+        };
+        let timing = pattern.timing();
+        let beat = timing.row_start(row.min(timing.rows - 1)) / timing.rate.rows_per_beat();
+        self.evaluator.reset_transport();
+        self.evaluator.clock.anchor_beat = beat;
+        self.evaluator.cycle_start_beat = beat;
+        self.evaluator.playing = true;
+        self.queued = None;
+        self.select(index, None, 0.0);
     }
 
     fn next_pattern(&mut self, pattern_count: usize) -> (usize, Option<usize>) {
@@ -222,6 +246,50 @@ mod tests {
         });
         player.evaluator.playing = true;
         player
+    }
+
+    #[test]
+    fn audition_seeks_to_the_swung_row_and_leaves_the_chain() {
+        let mut pattern = Pattern {
+            length: 5,
+            rate: PlaybackRate::TwoX,
+            swing: 0.75,
+            ..Pattern::default()
+        };
+        pattern.lanes[0][3].active = true;
+        pattern.automation[3].byte_override = true;
+        pattern.automation[3].byte_word = 0;
+        let patterns = [pattern, Pattern::default()];
+        let mut player = groove_player();
+        let mut chain = PatternChain::default();
+        chain.push(1);
+        player.set_chain(chain);
+        player.evaluator.playing = false;
+        player.launch(LaunchTarget::Chain, patterns.len());
+        player.evaluator.playing = true;
+        player.launch(LaunchTarget::Pattern(1), patterns.len());
+        assert_eq!(player.status().chain_entry, Some(0));
+        assert_eq!(player.status().queued, Some(LaunchTarget::Pattern(1)));
+
+        player.start_pattern_at_row(&patterns, 0, 3);
+        let (cv, retrigger) = player.step_sample(&patterns);
+        assert!(retrigger && cv.gate_v[0] > 0.0 && cv.reset_v > 0.0);
+        assert_eq!((cv.beat, cv.row), (3.5 / 8.0, 3));
+        assert_eq!(cv.bytebus_v[0], 0.0);
+        assert_eq!(player.status(), SongStatus::default());
+
+        let position = player.cursor_position(&patterns);
+        player.evaluator.playing = false;
+        assert_eq!(player.step_sample(&patterns).0.gate_v[0], 0.0);
+        assert_eq!(player.cursor_position(&patterns), position);
+        player.evaluator.playing = true;
+        let resumed = player.step_sample(&patterns).0;
+        assert_eq!((resumed.beat, resumed.row), position);
+        for _ in 0..40 {
+            player.step_sample(&patterns);
+        }
+        assert_eq!(player.status(), SongStatus::default());
+        assert_eq!(chain.as_slice(), &[1]);
     }
 
     #[test]
