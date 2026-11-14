@@ -4,6 +4,8 @@ use leviathan_core::{
 };
 use leviathan_dsp::{LanePatch, MachineKind, MACHINE_SPECS};
 
+use crate::param_ui;
+
 const ALL_FILLS: [(FillCondition, &str, &str); 3] = [
     (
         FillCondition::Always,
@@ -160,14 +162,25 @@ pub fn draw_step(
     cell_dirty |= previous != edit_cell.lock.machine;
 
     let spec = MachineKind::from_patch_and_lock(lane_patch, &edit_cell.lock).spec();
+    if spec.kind == MachineKind::OtisKit {
+        cell_dirty |= ui
+            .push_id((lane, row), |ui| {
+                param_ui::draw_kit_velocity(ui, &mut edit_cell.velocity)
+            })
+            .inner;
+    }
     let base_params = lane_patch.step_base_params(spec.kind);
-    for (slot, param) in spec.params.iter().enumerate() {
+    for (slot, &base) in base_params.iter().enumerate() {
         ui.horizontal_wrapped(|ui| {
-            let base = base_params[slot];
-            let mut locked = ((edit_cell.lock.mask >> slot) & 1) != 0;
+            let mut locked = edit_cell.lock.has_param(slot);
+            let tip = if spec.kind == MachineKind::OtisTwin && slot == param_ui::MODE_GRIT_SLOT {
+                "Scan mode and grit share this step lock. Clear it to inherit both."
+            } else {
+                "Override this parameter on this step"
+            };
             if ui
                 .checkbox(&mut locked, "")
-                .on_hover_text("Override this parameter on this step")
+                .on_hover_text(tip)
                 .changed()
             {
                 if locked {
@@ -183,15 +196,7 @@ pub fn draw_step(
             } else {
                 base
             };
-            if ui
-                .add(
-                    egui::Slider::new(&mut value, 0.0..=1.0)
-                        .clamping(egui::SliderClamping::Edits)
-                        .text(format!("P{slot} {}", param.name)),
-                )
-                .on_hover_text(format!("Unlocked value · {base:.3}"))
-                .changed()
-            {
+            if param_ui::draw_macro(ui, spec, slot, &mut value, Some(base)) {
                 edit_cell.lock.mask |= 1 << slot;
                 edit_cell.lock.values[slot] = value;
                 cell_dirty = true;
@@ -304,6 +309,20 @@ mod tests {
                     ..NoteCell::default()
                 };
                 assert!(draw_step(ui, 1, 4, cell, &LanePatch::default()).is_none());
+                let mut patch = LanePatch::for_machine(MachineKind::OtisTwin);
+                patch.params[param_ui::MODE_GRIT_SLOT] = 0.28;
+                let saved = patch;
+                assert!(!crate::locks_ui::draw_lane_patch_inspector(ui, 2, &mut patch, false));
+                assert_eq!(patch, saved);
+                assert!(draw_step(ui, 1, 4, cell, &patch).is_none());
+                let mut locked = cell;
+                locked.lock.machine = MachineKind::OtisTwin as i16;
+                locked.lock.mask = 1 << param_ui::MODE_GRIT_SLOT;
+                locked.lock.values[param_ui::MODE_GRIT_SLOT] = 0.669_999_96;
+                assert!(draw_step(ui, 2, 5, locked, &LanePatch::default()).is_none());
+                locked.lock.machine = MachineKind::OtisKit as i16;
+                locked.velocity = 110;
+                assert!(draw_step(ui, 2, 6, locked, &LanePatch::default()).is_none());
                 assert!(draw_automation(ui, 4, AutomationRow::default()).is_none());
             });
         });

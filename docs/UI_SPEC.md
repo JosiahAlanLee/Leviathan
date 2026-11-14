@@ -47,6 +47,10 @@ Prototype a “Slice take to Kit” action after slot addressing and region owne
 
 Version 2 saves the kit and stereo take as base64 signed 16-bit PCM with frame counts and source rates. The project cap stays at 8 MiB. An automated check saves, reloads and exports a project with a full kit, stereo take, four banks and sixteen patterns. The loader also accepts v1 numeric capture PCM. A 128-pattern × 128-row expansion of the *Trace Current* fixture alone takes about 21 MiB as expanded v1 JSON. Set a storage and migration budget before expanding the grid.
 
+In Voice / Trig (F2), OTIS Twin shows **Scan mode** and **Grit** in both Lane Patch and Step Lock. The controls edit the same stored parameter 7. Changing either control preserves the other, and clearing its step lock restores both inherited values. A stored value of `0.28` shows One shot and 82.35% grit.
+
+When a step plays OtisKit, **Kit velocity gain** edits the stored MIDI velocity in dB and selects the nearest available hit gain. For example, velocity 110 gives −9.75 dB and velocity 94 gives −18.75 dB. The reference is a hit at velocity 127, before slot level and mixer gain. Enter **Silent** for velocity zero. The tracker velocity tooltip uses the effective step machine, including a machine lock.
+
 ## Grid and arrangement prototypes
 
 Test the current desktop workflow at 1280×840 and 1024×720 using *Trace Current* and *Water Table*. Run from opening a project through selecting and playing the chain, tweaking a machine lock, arming a take, checking its route and exporting stems. Use the same sequence with OtisKit, REWORK and BEND Echo after Wave 8. Record which tasks lose focus, force scrolling or obscure the current pattern or sample target. Evaluate keyboard focus on Linux, macOS and Windows.

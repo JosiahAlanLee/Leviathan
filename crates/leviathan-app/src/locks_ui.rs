@@ -2,6 +2,8 @@ use eframe::egui;
 use leviathan_core::SOUND_PARAMS;
 use leviathan_dsp::{LanePatch, MACHINE_SPECS};
 
+use crate::param_ui;
+
 pub fn draw_lane_patch_inspector(
     ui: &mut egui::Ui,
     lane: usize,
@@ -41,12 +43,7 @@ pub fn draw_lane_patch_inspector(
     });
     let spec = patch.machine.spec();
     for slot in 0..SOUND_PARAMS {
-        dirty |= ui
-            .add(
-                egui::Slider::new(&mut patch.params[slot], 0.0..=1.0)
-                    .text(format!("P{slot} {}", spec.params[slot].name)),
-            )
-            .changed();
+        dirty |= param_ui::draw_macro(ui, spec, slot, &mut patch.params[slot], None);
     }
     dirty
 }

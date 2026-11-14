@@ -334,6 +334,8 @@ The Song, Samples and Mixer decks rendered offscreen at 1280×840 and 1024×720.
 
 Use what the walkthrough shows about panel order, keyboard navigation, and playback feedback to decide where the new controls belong.
 
+The Copper Relay walkthrough identified two display gaps addressed in the Voice / Trig deck. OTIS Twin's stored Mode/Grit value is decoded into scan mode and grit percentage. OtisKit shows the hit's velocity gain in dB alongside its MIDI velocity. Output peak checks measure clipping at the output. Use isolated stems to review deliberate voice coloration and changes in balance across sections.
+
 ### `T32` – SpoonBender Clock-Ratio Stereo Echo and Dual Mix
 
 - **Status** — Implemented in [11168fe](https://github.com/JosiahAlanLee/Leviathan/commit/11168fe5e50df66c0cbe5590f385df102cc083d5). The Mixer sends `SetEchoParams`. Reset and seek clear the measured ByteBus period.

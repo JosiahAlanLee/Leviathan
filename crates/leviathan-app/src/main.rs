@@ -14,6 +14,7 @@ mod locks_ui;
 mod master_ui;
 mod midi;
 mod mixer_ui;
+mod param_ui;
 mod pcm;
 mod project;
 mod rack_ui;
@@ -1512,7 +1513,22 @@ impl eframe::App for LeviathanApp {
                                         r_note.scroll_to_me(None);
                                     }
 
-                                    let r_vel = ui.selectable_label(is_vel_cur, vel_rt);
+                                    let mut r_vel = ui.selectable_label(is_vel_cur, vel_rt);
+                                    if cell.active {
+                                        r_vel = r_vel.on_hover_ui(|ui| {
+                                            ui.label(format!("MIDI velocity {}", cell.velocity));
+                                            let machine = MachineKind::from_patch_and_lock(
+                                                &self.lane_patches[lane],
+                                                &cell.lock,
+                                            );
+                                            if machine == MachineKind::OtisKit {
+                                                ui.label(format!(
+                                                    "Kit hit gain · {}",
+                                                    param_ui::format_kit_velocity(cell.velocity)
+                                                ));
+                                            }
+                                        });
+                                    }
                                     if r_vel.clicked() {
                                         self.cursor.select(
                                             lane,
@@ -1604,7 +1620,7 @@ mod tests {
         vec![press, release]
     }
 
-    fn frame(ctx: &egui::Context, app: &mut LeviathanApp, events: Vec<Event>) {
+    fn frame(ctx: &egui::Context, app: &mut LeviathanApp, events: Vec<Event>) -> egui::FullOutput {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -1613,14 +1629,96 @@ mod tests {
             events,
             ..egui::RawInput::default()
         };
-        let _ = ctx.run(input, |ctx| {
+        ctx.run(input, |ctx| {
             eframe::App::update(app, ctx, &mut eframe::Frame::_new_kittest());
-        });
+        })
     }
 
     fn offline_app(ctx: &egui::Context) -> LeviathanApp {
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
         LeviathanApp::with_audio(&cc, |_, _, _, _, _| Err("Offline test clock".to_string()))
+    }
+
+    fn click_text(ctx: &egui::Context, app: &mut LeviathanApp, label: &str) {
+        let output = frame(ctx, app, Vec::new());
+        let position = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("Visible control {label:?}"));
+        let pointer = |pressed| Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        frame(ctx, app, vec![Event::PointerMoved(position), pointer(true)]);
+        frame(ctx, app, vec![pointer(false)]);
+    }
+
+    #[test]
+    fn editing_kit_gain_commits_the_velocity_and_undoes_in_one_step() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        let (lane, row) = (app.cursor.lane, app.cursor.row);
+        let step = &mut app.patterns[0].lanes[lane][row];
+        step.active = true;
+        step.lock.machine = MachineKind::OtisKit as i16;
+        step.velocity = 110;
+
+        frame(&ctx, &mut app, tap(Key::F2, Modifiers::NONE));
+        click_text(&ctx, &mut app, "-9.75 dB");
+        frame(&ctx, &mut app, vec![Event::Text("-18".into())]);
+        assert_eq!(app.patterns[0].lanes[lane][row].velocity, 110);
+        frame(&ctx, &mut app, vec![Event::Text(".75 dB".into())]);
+        frame(&ctx, &mut app, tap(Key::Enter, Modifiers::NONE));
+        assert_eq!(app.patterns[0].lanes[lane][row].velocity, 94);
+        frame(&ctx, &mut app, tap(Key::Z, Modifiers::COMMAND));
+        assert_eq!(app.patterns[0].lanes[lane][row].velocity, 110);
+    }
+
+    #[test]
+    fn twin_step_controls_share_a_lock_and_inherit_the_original_after_clearing() {
+        use leviathan_dsp::TwinLoopMode;
+
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        let (lane, row) = (app.cursor.lane, app.cursor.row);
+        let slot = param_ui::MODE_GRIT_SLOT;
+        app.lane_patches[lane] = LanePatch::for_machine(MachineKind::OtisTwin);
+        app.lane_patches[lane].params[slot] = 0.28;
+        app.patterns[0].lanes[lane][row].lock = SoundLock::default();
+        frame(&ctx, &mut app, tap(Key::F2, Modifiers::NONE));
+
+        click_text(&ctx, &mut app, "82.35%");
+        frame(&ctx, &mut app, tap(Key::Enter, Modifiers::NONE));
+        assert!(!app.patterns[0].lanes[lane][row].lock.has_param(slot));
+
+        click_text(&ctx, &mut app, "One shot");
+        click_text(&ctx, &mut app, "Bidirectional");
+        let lock = app.patterns[0].lanes[lane][row].lock;
+        assert_eq!(lock.mask, 1 << slot);
+        let (mode, grit) = TwinLoopMode::decode(lock.values[slot]);
+        assert_eq!(mode, TwinLoopMode::Bidir);
+        assert!((grit - TwinLoopMode::decode(0.28).1).abs() < 1e-6);
+
+        click_text(&ctx, &mut app, "82.35%");
+        frame(&ctx, &mut app, vec![Event::Text("100".into())]);
+        frame(&ctx, &mut app, tap(Key::Enter, Modifiers::NONE));
+        let raw = app.patterns[0].lanes[lane][row].lock.values[slot];
+        let (mode, grit) = TwinLoopMode::decode(raw);
+        assert_eq!(mode, TwinLoopMode::Bidir);
+        assert!((grit - 1.0).abs() < 1e-6);
+
+        click_text(&ctx, &mut app, "Clear Locks");
+        let lock = app.patterns[0].lanes[lane][row].lock;
+        assert_eq!(lock.mask, 0);
+        assert_eq!(app.lane_patches[lane].resolve_lock(&lock).values[slot], 0.28);
     }
 
     #[test]
