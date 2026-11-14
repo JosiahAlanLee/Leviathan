@@ -4,6 +4,7 @@ use eframe::egui;
 use leviathan_dsp::otis_kit::{CHIP_RATES, SLOTS};
 
 use crate::kit::Kit;
+use crate::param_ui::format_kit_velocity;
 
 #[derive(Default)]
 pub struct KitUi {
@@ -33,6 +34,12 @@ impl KitUi {
     ) -> Edits {
         let mut edits = Edits::default();
         ui.heading("OtisKit");
+        ui.small(format!(
+            "Velocity gain · 110 gives {} · 94 gives {}",
+            format_kit_velocity(110),
+            format_kit_velocity(94),
+        ))
+        .on_hover_text("Step Lock can edit this gain directly in dB. Slot level and mixer gain are separate.");
         let settings = &mut kit.lanes[lane];
         let old = *settings;
         ui.horizontal_wrapped(|ui| {

@@ -87,13 +87,19 @@ fn exp2(octaves: f32) -> f32 {
     part * part * part
 }
 
-fn log_velocity(velocity: f32) -> f32 {
+/// Relative gain in dB for a normalized hit velocity. Silence has no finite gain.
+#[inline]
+pub fn velocity_gain_db(velocity: f32) -> Option<f32> {
     if !velocity.is_finite() || velocity <= 0.0 {
-        0.0
+        None
     } else {
         let steps = (192.0 * (1.0 - velocity.clamp(0.0, 1.0)) + 0.5) as u32;
-        exp2(-0.375 * steps as f32 / 6.020_6)
+        Some(-0.375 * steps as f32)
     }
+}
+
+fn log_velocity(velocity: f32) -> f32 {
+    velocity_gain_db(velocity).map_or(0.0, |db| exp2(db / 6.020_6))
 }
 
 impl Hit {
@@ -332,6 +338,26 @@ fn addressing(pitch: f32, offset: f32, byte: Option<u8>) -> (usize, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn velocity_readout_matches_the_existing_hit_gain() {
+        for midi in 0..=127 {
+            let velocity = f32::from(midi as u8) / 127.0;
+            let steps = (192.0 * (1.0 - velocity) + 0.5) as u32;
+            let before = if midi == 0 {
+                0.0
+            } else {
+                exp2(-0.375 * steps as f32 / 6.020_6)
+            };
+            assert_eq!(log_velocity(velocity).to_bits(), before.to_bits());
+        }
+        assert_eq!(velocity_gain_db(0.0), None);
+        assert_eq!(velocity_gain_db(1.0), Some(0.0));
+        assert_eq!(velocity_gain_db(110.0 / 127.0), Some(-9.75));
+        assert_eq!(velocity_gain_db(94.0 / 127.0), Some(-18.75));
+        let gain_delta = log_velocity(94.0 / 127.0) / log_velocity(110.0 / 127.0);
+        assert!((20.0 * f64::from(gain_delta).log10() + 9.0).abs() < 0.01);
+    }
 
     struct Bank {
         current: Sample<'static>,

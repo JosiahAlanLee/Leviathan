@@ -162,23 +162,39 @@ const fn table_phase(sample: usize) -> u32 {
     sample as u32 * 65_536 / SAMPLES as u32
 }
 
-#[derive(Clone, Copy)]
-enum TwinLoopMode {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TwinLoopMode {
     OneShot,
     Bidir,
     FwdWrap,
 }
 
+const ONE_SHOT_END: f32 = 0.34;
+const BIDIR_END: f32 = 0.67;
+const LOOP_WIDTH: f32 = 0.33;
+
 impl TwinLoopMode {
+    /// Decode the stored Mode/Grit macro into the scan mode and its local grit.
     #[inline]
-    fn decode(v: f32) -> (Self, f32) {
+    pub fn decode(v: f32) -> (Self, f32) {
         let v = v.clamp(0.0, 1.0);
-        if v < 0.34 {
-            (Self::OneShot, (v * (1.0 / 0.34)).clamp(0.0, 1.0))
-        } else if v < 0.67 {
-            (Self::Bidir, ((v - 0.34) * (1.0 / 0.33)).clamp(0.0, 1.0))
+        if v < ONE_SHOT_END {
+            (Self::OneShot, (v * (1.0 / ONE_SHOT_END)).clamp(0.0, 1.0))
+        } else if v < BIDIR_END {
+            (Self::Bidir, ((v - ONE_SHOT_END) * (1.0 / LOOP_WIDTH)).clamp(0.0, 1.0))
         } else {
-            (Self::FwdWrap, ((v - 0.67) * (1.0 / 0.33)).clamp(0.0, 1.0))
+            (Self::FwdWrap, ((v - BIDIR_END) * (1.0 / LOOP_WIDTH)).clamp(0.0, 1.0))
+        }
+    }
+
+    /// Encode both controls into the existing normalized parameter slot.
+    pub fn encode(self, grit: f32) -> f32 {
+        let grit = if grit.is_nan() { 0.0 } else { grit.clamp(0.0, 1.0) };
+        match self {
+            // The first two bands end at the preceding representable value.
+            Self::OneShot => (ONE_SHOT_END * grit).min(ONE_SHOT_END.next_down()),
+            Self::Bidir => (ONE_SHOT_END + LOOP_WIDTH * grit).min(BIDIR_END.next_down()),
+            Self::FwdWrap => (BIDIR_END + LOOP_WIDTH * grit).min(1.0),
         }
     }
 }
@@ -505,6 +521,29 @@ impl TwinVoice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mode_grit_round_trips_without_crossing_a_band_boundary() {
+        use TwinLoopMode::{Bidir, FwdWrap, OneShot};
+
+        let (mode, grit) = TwinLoopMode::decode(0.28);
+        assert_eq!(mode, OneShot);
+        assert!((grit - 0.28 / 0.34).abs() < 1e-6);
+        assert_eq!(TwinLoopMode::decode(0.34), (Bidir, 0.0));
+        assert_eq!(TwinLoopMode::decode(0.67), (FwdWrap, 0.0));
+        assert_eq!(TwinLoopMode::decode(0.34_f32.next_down()).0, OneShot);
+        assert_eq!(TwinLoopMode::decode(0.67_f32.next_down()).0, Bidir);
+        for scan in [OneShot, Bidir, FwdWrap] {
+            for percent in 0..=100 {
+                let grit = percent as f32 / 100.0;
+                let (decoded_mode, decoded_grit) = TwinLoopMode::decode(scan.encode(grit));
+                assert_eq!(decoded_mode, scan);
+                assert!((decoded_grit - grit).abs() < 1e-6);
+            }
+            let (_, moved_grit) = TwinLoopMode::decode(scan.encode(grit));
+            assert!((moved_grit - grit).abs() < 1e-6);
+        }
+    }
 
     const DEFAULTS: [f32; SOUND_PARAMS] = crate::MachineKind::OtisTwin.spec().default_params();
 
