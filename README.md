@@ -87,6 +87,15 @@ In **Voice / Trig** (F2), **Lane Patch** shows timbre options for the lane's bas
 - **REWORK** previews the capture's trim region or an OtisKit slot from Start to its end. Set the seed, fineness and amount, listen to A and B, and commit the result. A replacement or project reload invalidates a stale preview. Export includes committed audio. Preview audition plays from the monitor and stays outside the recorded and exported signal.
 - Projects save as version 2 in the same `.leviathan.json` file. The new version stores the stereo take and mono kit slots as base64 little-endian signed 16-bit PCM with explicit rate and frame count. Version 1 files with numeric PCM still load.
 
+## Clocked shader return
+
+1. Put **OT2** on a lane as its patch or a step lock. In **Scene** (F6), select that lane under **Shader return to OT2**, then play. The return controls **FramePos** for both the built-in tables and captured frames.
+2. Turn **Probes** to rotate eight numbered points on the feedback surface, and adjust **Threshold** until their bits respond. The filled markers show the last latched byte. **Routing** (F4) shows the input and held return for the destination lane. Custom WGSL uses the existing `byte_mask` uniform, and the CPU fallback uses the built-in field.
+3. On each ByteBus edge, the tracker word goes through the **Lookup** selected in F4. Enable **Return → Lookup** to feed the held byte back through that lookup. The route starts from the lookup reset word in feedback mode. **Clear field** clears the visual history and releases the held frame address on the next edge.
+4. **Record return from start** restarts the currently cued pattern or chain and records the word the audio engine holds on each pulse. **Keep take** or **Pause** finishes the capture. Save the project, then choose the corresponding pattern or chain in **WAV export**. A recorded take applies to its original destination lane, and the export holds its last setting past the recorded pulses.
+
+The audio clock latches a probe result only on the next ByteBus edge, including when the transport follows MIDI clock. A late or missing result holds the last word, with the missed count shown in Scene. An on-time result takes one sixteenth note at the default four pulses per beat, or 125 ms at 120 BPM. The GPU copies eight texels asynchronously from its feedback target. WAV and stem export use the recorded clocked values.
+
 ## Custom WGSL Shaders & SoundLink UDP
 
 - Drop any `.wgsl` file onto the window (or use **Load .wgsl** in **Scene** (F6)) to run custom ping-pong fragment shaders driven by Leviathan's 64-byte `VisualUniforms` and `prev_tex` feedback buffer.

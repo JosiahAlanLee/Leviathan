@@ -18,6 +18,8 @@ pub struct CaptureSamples<'a> {
     pub current: Option<CaptureSample<'a>>,
     pub kit: Option<&'a dyn crate::otis_kit::Memory>,
     pub previous: [Option<CaptureSample<'a>>; NUM_LANES],
+    /// Clocked frame address for one OT2 lane, from the host or a saved take.
+    pub ot2_frame: Option<(usize, u8)>,
 }
 
 impl<'a> CaptureSamples<'a> {

@@ -86,6 +86,7 @@ impl TakeBank {
                 .previous
                 .each_ref()
                 .map(|take| take.as_deref().map(Take::sample)),
+            ot2_frame: None,
         }
     }
 }

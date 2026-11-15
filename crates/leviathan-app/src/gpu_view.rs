@@ -1,7 +1,7 @@
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, SystemTime};
 
@@ -53,13 +53,95 @@ fn block_on_wgpu_error(
     }
 }
 
+struct ProbeReadback {
+    buffer: wgpu::Buffer,
+    pending: Option<(
+        crate::shader_bus::Probe,
+        mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    )>,
+}
+
+impl ProbeReadback {
+    fn new(device: &wgpu::Device) -> Self {
+        Self {
+            buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("shader bus probes"),
+                size: 32,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }),
+            pending: None,
+        }
+    }
+
+    fn copy(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        texture: &wgpu::Texture,
+        probe: crate::shader_bus::Probe,
+    ) {
+        for (bit, (x, y)) in probe
+            .positions(texture.width(), texture.height())
+            .into_iter()
+            .enumerate()
+        {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    ..texture.as_image_copy()
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &self.buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: (4 * bit) as u64,
+                        bytes_per_row: None,
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+
+    fn map(&mut self, probe: crate::shader_bus::Probe) {
+        let (send, receive) = mpsc::channel();
+        self.buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = send.send(result);
+            });
+        self.pending = Some((probe, receive));
+    }
+
+    fn poll(&mut self, device: &wgpu::Device) -> Option<crate::shader_bus::Reply> {
+        let (probe, receive) = self.pending.as_ref()?;
+        let _ = device.poll(wgpu::Maintain::Poll);
+        let result = receive.try_recv();
+        if matches!(result, Err(mpsc::TryRecvError::Empty)) {
+            return None;
+        }
+        let probe = *probe;
+        self.pending = None;
+        result.ok()?.ok()?;
+        let mapped = self.buffer.slice(..).get_mapped_range();
+        let reply = probe.reply(mapped.as_chunks::<4>().0);
+        drop(mapped);
+        self.buffer.unmap();
+        Some(reply)
+    }
+}
+
 struct GpuPingPong {
     render_state: egui_wgpu::RenderState,
     pipeline_layout: wgpu::PipelineLayout,
     tex_format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
     uniform_buf: wgpu::Buffer,
-    _textures: [wgpu::Texture; 2],
+    textures: [wgpu::Texture; 2],
     views: [wgpu::TextureView; 2],
     bind_groups: [wgpu::BindGroup; 2],
     audio_tex: wgpu::Texture,
@@ -69,6 +151,7 @@ struct GpuPingPong {
     front_idx: usize,
     width: u32,
     height: u32,
+    readback: Option<ProbeReadback>,
 }
 
 impl GpuPingPong {
@@ -145,7 +228,8 @@ impl GpuPingPong {
                 dimension: wgpu::TextureDimension::D2,
                 format: tex_format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
             let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -155,26 +239,7 @@ impl GpuPingPong {
         let (tex_a, view_a) = make_target("leviathan_feedback_ping");
         let (tex_b, view_b) = make_target("leviathan_feedback_pong");
 
-        let mut init_encoder =
-            rs.device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("leviathan_feedback_init_clear"),
-                });
-        for view in [&view_a, &view_b] {
-            let _pass = init_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("leviathan_clear_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-        }
-        rs.queue.submit(std::iter::once(init_encoder.finish()));
+        clear_feedback(rs, [&view_a, &view_b]);
 
         let sampler = rs.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("leviathan_feedback_sampler"),
@@ -340,7 +405,7 @@ impl GpuPingPong {
             tex_format,
             pipeline,
             uniform_buf,
-            _textures: [tex_a, tex_b],
+            textures: [tex_a, tex_b],
             views: [view_a, view_b],
             bind_groups: [bg_a, bg_b],
             audio_tex,
@@ -350,6 +415,7 @@ impl GpuPingPong {
             front_idx: 0,
             width,
             height,
+            readback: None,
         }
     }
 
@@ -364,7 +430,12 @@ impl GpuPingPong {
         Ok(())
     }
 
-    fn step(&mut self, uniforms: &VisualUniforms, scope: &AudioScopeSnapshot) -> egui::TextureId {
+    fn step(
+        &mut self,
+        uniforms: &VisualUniforms,
+        scope: &AudioScopeSnapshot,
+        probe: Option<crate::shader_bus::Probe>,
+    ) -> egui::TextureId {
         self.render_state
             .queue
             .write_buffer(&self.uniform_buf, 0, uniforms.as_bytes());
@@ -414,9 +485,17 @@ impl GpuPingPong {
             pass.set_bind_group(1, &self.audio_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
+        if let Some(probe) = probe {
+            self.readback
+                .get_or_insert_with(|| ProbeReadback::new(&self.render_state.device))
+                .copy(&mut encoder, &self.textures[dst], probe);
+        }
         self.render_state
             .queue
             .submit(std::iter::once(encoder.finish()));
+        if let Some(probe) = probe {
+            self.readback.as_mut().unwrap().map(probe);
+        }
 
         self.render_state
             .renderer
@@ -431,6 +510,28 @@ impl GpuPingPong {
         self.front_idx = dst;
         self.texture_id
     }
+}
+
+fn clear_feedback(rs: &egui_wgpu::RenderState, views: [&wgpu::TextureView; 2]) {
+    let mut encoder = rs
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("leviathan_feedback_clear"),
+        });
+    for view in views {
+        let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+    }
+    rs.queue.submit(std::iter::once(encoder.finish()));
 }
 
 enum Backend {
@@ -456,6 +557,9 @@ pub struct FeedbackViewport {
     shader_error: Option<String>,
     latest_scope: AudioScopeSnapshot,
     show_audio_scope: bool,
+    sampled: Option<crate::shader_bus::Request>,
+    probe_epoch: Option<u64>,
+    probe_result: Option<crate::shader_bus::Reply>,
 }
 
 impl FeedbackViewport {
@@ -475,6 +579,9 @@ impl FeedbackViewport {
             shader_error: None,
             latest_scope: AudioScopeSnapshot::default(),
             show_audio_scope: true,
+            sampled: None,
+            probe_epoch: None,
+            probe_result: None,
         }
     }
 
@@ -808,7 +915,20 @@ impl FeedbackViewport {
         now: f64,
         cv: &CvFrame,
         scope: &AudioScopeSnapshot,
+        probe: Option<crate::shader_bus::Probe>,
     ) -> egui::TextureId {
+        if let Some(probe) = probe {
+            if self.probe_epoch != Some(probe.request.epoch) {
+                self.clear_feedback();
+                self.probe_epoch = Some(probe.request.epoch);
+            }
+        }
+        if let Backend::Hardware(gpu) = &mut self.backend {
+            self.probe_result = gpu
+                .readback
+                .as_mut()
+                .and_then(|readback| readback.poll(&gpu.render_state.device));
+        }
         self.latest_scope = *scope;
         if self.watched_path.is_some() {
             ctx.request_repaint_after(Duration::from_secs_f64(HOT_RELOAD_POLL_SECS));
@@ -832,11 +952,24 @@ impl FeedbackViewport {
         cv.gate_v = std::mem::take(&mut self.pending_gates);
         let frame = self.frame_index;
         self.frame_index = self.frame_index.wrapping_add(1);
+        let word = probe.map(|probe| probe.request.word);
+        let probe = probe.filter(|probe| self.sampled != Some(probe.request));
 
         let id = match &mut self.backend {
             Backend::Hardware(gpu) => {
-                let uniforms = VisualUniforms::from_cv(&cv, frame, gpu.width, gpu.height);
-                gpu.step(&uniforms, scope)
+                let mut uniforms = VisualUniforms::from_cv(&cv, frame, gpu.width, gpu.height);
+                if let Some(word) = word {
+                    uniforms.byte_mask = u32::from(word);
+                }
+                let probe = probe.filter(|_| {
+                    gpu.readback
+                        .as_ref()
+                        .is_none_or(|readback| readback.pending.is_none())
+                });
+                if let Some(probe) = probe {
+                    self.sampled = Some(probe.request);
+                }
+                gpu.step(&uniforms, scope, probe)
             }
             Backend::Software {
                 surface,
@@ -845,7 +978,15 @@ impl FeedbackViewport {
                 let surf_w = surface.width;
                 let surf_h = surface.height;
                 let uniforms = VisualUniforms::from_cv(&cv, frame, surf_w as u32, surf_h as u32);
-                let rgba = surface.step(&uniforms);
+                let rgba = surface.step_with_bus(&uniforms, word);
+                if let Some(probe) = probe {
+                    let pixels = probe.positions(surf_w as u32, surf_h as u32).map(|(x, y)| {
+                        let offset = (y as usize * surf_w + x as usize) * 4;
+                        rgba[offset..offset + 4].try_into().unwrap()
+                    });
+                    self.sampled = Some(probe.request);
+                    self.probe_result = Some(probe.reply(&pixels));
+                }
                 let color_img = egui::ColorImage::from_rgba_unmultiplied([surf_w, surf_h], rgba);
                 let tex = preview_tex.get_or_insert_with(|| {
                     ctx.load_texture(
@@ -860,6 +1001,24 @@ impl FeedbackViewport {
         };
         self.preview = Some((next, id));
         id
+    }
+
+    pub fn take_probe_result(&mut self) -> Option<crate::shader_bus::Reply> {
+        self.probe_result.take()
+    }
+
+    pub fn clear_feedback(&mut self) {
+        match &mut self.backend {
+            Backend::Hardware(gpu) => {
+                clear_feedback(&gpu.render_state, [&gpu.views[0], &gpu.views[1]])
+            }
+            Backend::Software { surface, .. } => surface.clear(),
+        }
+        self.preview = None;
+        self.frame_index = 0;
+        self.sampled = None;
+        self.pending_gates = [0.0; NUM_LANES];
+        self.probe_result = None;
     }
 
     pub fn request_next_frame(&self, ctx: &egui::Context, now: f64) {
@@ -888,8 +1047,8 @@ mod tests {
         scope.wave_l[0] = 240;
         scope.bands = [0.85, 0.4, 0.2, 0.1];
 
-        let id0 = vp.render_frame(&ctx, 0.0, &cv, &scope);
-        let id1 = vp.render_frame(&ctx, FRAME_PERIOD, &cv, &scope);
+        let id0 = vp.render_frame(&ctx, 0.0, &cv, &scope, None);
+        let id1 = vp.render_frame(&ctx, FRAME_PERIOD, &cv, &scope, None);
         assert_eq!(id0, id1);
         assert_eq!(vp.latest_scope, scope);
 
@@ -924,21 +1083,146 @@ mod tests {
         let silent = CvFrame::default();
         let mut hit = silent;
         hit.gate_v[0] = 10.0;
-        let first = vp.render_frame(&ctx, 0.0, &silent, &scope);
+        let first = vp.render_frame(&ctx, 0.0, &silent, &scope, None);
         assert_eq!(
-            vp.render_frame(&ctx, FRAME_PERIOD / 2.0, &hit, &scope),
+            vp.render_frame(&ctx, FRAME_PERIOD / 2.0, &hit, &scope, None),
             first
         );
         assert_eq!(vp.frame_index, 1);
         assert_eq!(vp.pending_gates[0], 10.0);
-        vp.render_frame(&ctx, FRAME_PERIOD, &silent, &scope);
+        vp.render_frame(&ctx, FRAME_PERIOD, &silent, &scope, None);
         assert_eq!(vp.frame_index, 2);
         assert_eq!(vp.pending_gates[0], 0.0);
 
-        vp.render_frame(&ctx, 12.0, &silent, &scope);
-        vp.render_frame(&ctx, 12.0, &silent, &scope);
+        vp.render_frame(&ctx, 12.0, &silent, &scope, None);
+        vp.render_frame(&ctx, 12.0, &silent, &scope, None);
         assert_eq!(vp.frame_index, 3);
         assert!((vp.preview.unwrap().0 - 12.0 - FRAME_PERIOD).abs() < 1e-9);
+    }
+
+    #[test]
+    fn probes_sample_the_feedback_field_once_per_clock_request() {
+        use crate::shader_bus::{Probe, Request};
+
+        let ctx = egui::Context::default();
+        let mut viewport = FeedbackViewport::new_software();
+        let cv = CvFrame::default();
+        let scope = AudioScopeSnapshot::default();
+        let probe = |epoch, word| Probe {
+            request: Request {
+                epoch,
+                pulse: 0,
+                word,
+            },
+            rotation: 0,
+            threshold: 96,
+        };
+        let dark = probe(1, 0);
+        viewport.render_frame(&ctx, 0.0, &cv, &scope, Some(dark));
+        let sampled = viewport.take_probe_result().unwrap();
+        assert_eq!(sampled.request, dark.request);
+        viewport.render_frame(&ctx, FRAME_PERIOD, &cv, &scope, Some(dark));
+        assert!(viewport.take_probe_result().is_none());
+
+        let bright = probe(2, 255);
+        viewport.render_frame(&ctx, 2.0 * FRAME_PERIOD, &cv, &scope, Some(bright));
+        let with_input = viewport.take_probe_result().unwrap();
+        assert_eq!(with_input.request, bright.request);
+        assert_ne!(sampled.word, with_input.word);
+
+        viewport.render_frame(&ctx, 3.0 * FRAME_PERIOD, &cv, &scope, Some(probe(3, 0)));
+        assert_eq!(viewport.take_probe_result().unwrap().word, sampled.word);
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu adapter"]
+    fn wgpu_shader_probe_reads_rendered_texels_in_bit_order() {
+        use crate::shader_bus::{Probe, Request};
+
+        fn wait<F: Future>(future: F) -> F::Output {
+            let mut future = std::pin::pin!(future);
+            let waker = Waker::from(Arc::new(NoopWake));
+            let mut context = Context::from_waker(&waker);
+            for _ in 0..500 {
+                if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                    return output;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("wgpu setup timed out");
+        }
+
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
+        let adapter = wait(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .expect("wgpu adapter");
+        let (device, queue) =
+            wait(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).unwrap();
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+        let rs = egui_wgpu::RenderState {
+            adapter,
+            available_adapters: Vec::new(),
+            device,
+            queue,
+            target_format: format,
+            renderer: Arc::new(egui::mutex::RwLock::new(renderer)),
+        };
+        let mut gpu = GpuPingPong::new(&rs, 64, 36);
+        gpu.replace_shader(r#"
+            struct VisualUniforms { beat: f32, z_norm: f32, roll_rad: f32, feedback_norm: f32,
+                gate_energy: vec4<f32>, pitch_norm: vec4<f32>, byte_mask: u32, frame_index: u32,
+                width: f32, height: f32 };
+            @group(0) @binding(0) var<uniform> u: VisualUniforms;
+            @vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+                let corners = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+                return vec4<f32>(corners[i], 0.0, 1.0);
+            }
+            @fragment fn fs_main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+                let bright = select(0.0, 1.0, p.x >= u.width * 0.5 && (u.byte_mask & 1u) == 1u);
+                return vec4<f32>(bright, bright, bright, 1.0);
+            }
+        "#).unwrap();
+        let probe = Probe {
+            request: Request {
+                epoch: 2,
+                pulse: 8,
+                word: 1,
+            },
+            rotation: 13,
+            threshold: 128,
+        };
+        let uniforms = VisualUniforms {
+            width: 64.0,
+            height: 36.0,
+            byte_mask: 1,
+            ..Default::default()
+        };
+        gpu.step(&uniforms, &AudioScopeSnapshot::default(), Some(probe));
+        let _ = rs.device.poll(wgpu::Maintain::Wait);
+        let first = gpu.readback.as_mut().unwrap().poll(&rs.device).unwrap();
+        assert_eq!(first.request, probe.request);
+        assert_eq!(first.word, 0xc3);
+
+        let dark = Probe {
+            request: Request {
+                pulse: 9,
+                word: 0,
+                ..probe.request
+            },
+            ..probe
+        };
+        gpu.step(
+            &VisualUniforms {
+                byte_mask: 0,
+                ..uniforms
+            },
+            &AudioScopeSnapshot::default(),
+            Some(dark),
+        );
+        let _ = rs.device.poll(wgpu::Maintain::Wait);
+        let second = gpu.readback.as_mut().unwrap().poll(&rs.device).unwrap();
+        assert_eq!(second.request, dark.request);
+        assert_eq!(second.word, 0);
     }
 
     #[test]

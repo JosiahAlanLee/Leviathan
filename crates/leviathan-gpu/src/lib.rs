@@ -601,12 +601,22 @@ impl FeedbackSurface {
     }
 
     pub fn step(&mut self, u: &VisualUniforms) -> &[u8] {
+        self.step_with_bus(u, None)
+    }
+
+    pub fn clear(&mut self) {
+        self.front.fill(0);
+        self.back.fill(0);
+    }
+
+    pub fn step_with_bus(&mut self, u: &VisualUniforms, word: Option<u8>) -> &[u8] {
         let w = self.width.max(1) as f32;
         let h = self.height.max(1) as f32;
         let aspect = w / h;
         let (sin_r, cos_r) = u.roll_rad.sin_cos();
         let zoom = 1.5 - 0.8 * u.z_norm;
         let fb = u.feedback_norm.clamp(0.0, 0.94);
+        let byte_glow = word.map_or(0.0, |byte| 0.18 * (f32::from(byte) / 255.0));
 
         for y in 0..self.height {
             let ny = (y as f32 / h) * 2.0 - 1.0;
@@ -623,7 +633,7 @@ impl FeedbackSurface {
                 let kick = u.gate_energy[0];
 
                 let r_val = 0.08 + 0.55 * ring.max(0.0) + 0.35 * kick;
-                let g_val = 0.10 + 0.45 * grid.abs() + 0.25 * fb;
+                let g_val = 0.10 + 0.45 * grid.abs() + 0.25 * fb + byte_glow;
                 let b_val = 0.16 + 0.65 * (-ring).max(0.0) + 0.25 * u.gate_energy[3];
 
                 let idx = (y * self.width + x) * 4;

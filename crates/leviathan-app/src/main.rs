@@ -21,6 +21,7 @@ mod rack_ui;
 mod rework_ui;
 mod sampler_ui;
 mod session_ui;
+mod shader_bus;
 mod smf;
 mod tracker_edit;
 mod tracker_keys;
@@ -35,7 +36,7 @@ use gen_ui::{GenUi, MidiDestination, MidiFileAction};
 use gpu_view::FeedbackViewport;
 use lane_mix::LaneMix;
 use leviathan_core::{
-    CvFrame, EngineConfig, FillCondition, NoteCell, Pattern, PatternChain, SongPlayer, SongStatus,
+    CvFrame, EngineConfig, FillCondition, LaunchTarget, NoteCell, Pattern, PatternChain, SongPlayer, SongStatus,
     SoundLock, NUM_LANES, ROWS_PER_PATTERN,
 };
 use leviathan_dsp::{default_lane_patches, BenderParams, DelayMode, LanePatch, MachineKind, MasterPeaks};
@@ -226,6 +227,8 @@ struct LeviathanApp {
     kit_sounding: [u8; NUM_LANES],
     capture_kit_slot: Option<usize>,
     routed_byte: Option<u8>,
+    latest_shader: shader_bus::Status,
+    shader_recording: Option<Arc<shader_bus::Recorder>>,
     audio: AudioControl,
     tel_rx: rtrb::Consumer<AudioTelemetry>,
     offline_player: Option<SongPlayer>,
@@ -339,6 +342,8 @@ impl LeviathanApp {
             kit_sounding: [0; NUM_LANES],
             capture_kit_slot: None,
             routed_byte: None,
+            latest_shader: shader_bus::Status::default(),
+            shader_recording: None,
             audio: AudioControl::new(cmd_tx),
             tel_rx,
             offline_player,
@@ -378,10 +383,14 @@ impl LeviathanApp {
     }
 
     fn toggle_playing(&mut self) {
-        self.playing = !self.playing;
+        self.set_playing(!self.playing);
+    }
+
+    fn set_playing(&mut self, playing: bool) {
+        self.playing = playing;
         self.play_request = self.play_request.wrapping_add(1);
         self.send_audio(AudioCommand::SetPlaying {
-            playing: self.playing,
+            playing,
             request: self.play_request,
         });
     }
@@ -814,6 +823,7 @@ impl LeviathanApp {
             allow_lane_source,
             self.instruments.take.is_some(),
             self.routed_byte,
+            self.instruments.shader_bus.route.lane.is_some(),
             self.rack_panel.routing_error,
         );
         if routing != self.instruments.routing {
@@ -822,6 +832,18 @@ impl LeviathanApp {
                 self.instruments.routing = routing;
                 self.send_audio(AudioCommand::SetRackRouting(routing));
             }
+        }
+        if self.instruments.shader_bus.route.lane == Some(lane as u8) {
+            let input = self
+                .latest_shader
+                .request
+                .map_or("—".into(), |req| format!("{:02X}", req.word));
+            let byte = self
+                .latest_shader
+                .latched
+                .map_or("—".into(), |reply| format!("{:02X}", reply.word));
+            ui.monospace(format!("Shader {input} → {byte} · OT2 FramePos"))
+                .on_hover_text("Set the return and its probes in Scene (F6).");
         }
     }
 
@@ -918,7 +940,48 @@ impl LeviathanApp {
     ) {
         ui.heading("Feedback");
         let width = ui.available_width();
-        ui.image((preview, egui::vec2(width, width * 9.0 / 16.0)));
+        let field = ui.image((preview, egui::vec2(width, width * 9.0 / 16.0)));
+        if self.instruments.shader_bus.route.lane.is_some() {
+            let accepted = self.latest_shader.latched;
+            let rotation =
+                accepted.map_or(self.instruments.shader_bus.rotation, |reply| reply.rotation);
+            let painter = ui.painter_at(field.rect);
+            let points = shader_bus::Probe::points(rotation);
+            for (bit, ([x, y], label)) in points
+                .into_iter()
+                .zip(["0", "1", "2", "3", "4", "5", "6", "7"])
+                .enumerate()
+            {
+                let position =
+                    field.rect.min + egui::vec2(x * field.rect.width(), y * field.rect.height());
+                let lit = accepted.is_some_and(|reply| reply.word & (1 << bit) != 0);
+                let fill = if lit {
+                    egui::Color32::from_rgb(212, 233, 157)
+                } else {
+                    egui::Color32::BLACK
+                };
+                let text = if lit {
+                    egui::Color32::BLACK
+                } else {
+                    egui::Color32::WHITE
+                };
+                painter.circle(
+                    position,
+                    8.0,
+                    fill,
+                    egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
+                );
+                painter.text(
+                    position,
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    egui::FontId::monospace(10.0),
+                    text,
+                );
+            }
+            field.on_hover_text("The numbered probes show the bits of the last latched return.");
+        }
+        self.draw_shader_bus(ui);
         ui.small(self.viewport.status_label());
         ui.monospace(format!(
             "Z {:.2} V · Roll {:+.2} V · Feedback {:.2} V",
@@ -938,6 +1001,101 @@ impl LeviathanApp {
                 automation,
             });
         }
+    }
+
+    fn draw_shader_bus(&mut self, ui: &mut egui::Ui) {
+        let patch = &mut self.instruments.shader_bus;
+        let previous = patch.route;
+        let route_label = previous
+            .lane
+            .map_or("Off".into(), |lane| format!("Lane {}", lane + 1));
+        egui::ComboBox::from_label("Shader return to OT2")
+            .selected_text(route_label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut patch.route.lane, None, "Off");
+                for (lane, voice) in self.lane_patches.iter().enumerate() {
+                    ui.selectable_value(
+                        &mut patch.route.lane,
+                        Some(lane as u8),
+                        format!("Lane {} · {}", lane + 1, voice.machine.short_name()),
+                    );
+                }
+            });
+        if patch.route.lane.is_some() {
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::DragValue::new(&mut patch.rotation).range(0..=359).prefix("Probes ").suffix("°"));
+                ui.add(egui::DragValue::new(&mut patch.threshold).prefix("Threshold "))
+                    .on_hover_text("A probe sets its bit when the sampled field reaches this brightness.");
+                ui.checkbox(&mut patch.route.feedback, "Return → Lookup")
+                    .on_hover_text("Feed the held return through Lookup into the next shader step. The reset word seeds the loop.");
+            });
+        }
+        let route = patch.route;
+        if route != previous {
+            if route.lane != previous.lane {
+                self.latest_shader = shader_bus::Status::default();
+            }
+            self.send_audio(AudioCommand::SetShaderRoute(route));
+        }
+        let Some(lane) = route.lane else { return };
+        let input = self
+            .latest_shader
+            .request
+            .map_or("—".into(), |req| format!("{:02X}", req.word));
+        let held = self
+            .latest_shader
+            .latched
+            .map_or("—".into(), |reply| format!("{:02X}", reply.word));
+        ui.monospace(format!("In {input} · Held {held}"));
+        if self.latest_shader.missed > 0 {
+            ui.small(format!("{} missed pulses", self.latest_shader.missed));
+        }
+        if self.offline_player.is_some() {
+            ui.small("Shader return uses the audio device clock.");
+        }
+        if ui.button("Clear field").clicked() {
+            self.latest_shader.request = None;
+            self.viewport.clear_feedback();
+            self.send_audio(AudioCommand::ClearShaderField);
+        }
+        if let Some(pulses) = self.shader_recording.as_ref().map(|recording| recording.len()) {
+            ui.horizontal(|ui| {
+                ui.label(format!("Recording · {pulses} pulses"));
+                if ui.button("Keep take").clicked() {
+                    self.send_audio(AudioCommand::FinishShaderTake);
+                }
+            });
+        } else if ui.add_enabled(self.offline_player.is_none(), egui::Button::new("Record return from start"))
+            .on_hover_text("Restart the cued pattern or chain and capture the held byte on each pulse. Pause or keep the take to finish.")
+            .clicked()
+        {
+            self.record_shader_take(lane);
+        }
+        if let Some(take) = &self.instruments.shader_bus.take {
+            ui.small(format!(
+                "WAV take · {} · Lane {} · {} pulses",
+                take.target.label(),
+                take.lane + 1,
+                take.words.len()
+            ));
+        }
+    }
+
+    fn record_shader_take(&mut self, lane: u8) {
+        let target = if self.latest_song.chain_entry.is_some() && !self.chain.as_slice().is_empty()
+        {
+            LaunchTarget::Chain
+        } else {
+            LaunchTarget::Pattern(self.latest_song.pattern.min(self.patterns.len() - 1))
+        };
+        self.set_playing(false);
+        self.send_audio(AudioCommand::Launch(target));
+        self.send_audio(AudioCommand::Reset);
+        self.latest_shader = shader_bus::Status::default();
+        let recording = Arc::new(shader_bus::Recorder::new(target, lane));
+        self.shader_recording = Some(Arc::clone(&recording));
+        self.send_audio(AudioCommand::RecordShaderTake(recording));
+        self.set_playing(true);
     }
 
     fn record_inspector_undo_once(&mut self, ctx: &egui::Context, selected: usize) {
@@ -1003,6 +1161,14 @@ impl LeviathanApp {
     }
 
     fn project_snapshot(&self) -> project::Project {
+        let mut instruments = self.instruments.clone();
+        if let Some(take) = self
+            .shader_recording
+            .as_ref()
+            .and_then(|recording| recording.snapshot())
+        {
+            instruments.shader_bus.take = Some(take);
+        }
         project::Project {
             bpm: self.bpm,
             master_send: self.master_send,
@@ -1017,7 +1183,7 @@ impl LeviathanApp {
             sample_regions: self.sampler_ui.regions,
             custom_shader: self.viewport.custom_shader().cloned(),
             voice_calibration: self.voice_calibration,
-            instruments: self.instruments.clone(),
+            instruments,
         }
     }
 
@@ -1055,6 +1221,8 @@ impl LeviathanApp {
         self.rack_panel.beats_left = None;
         self.rack_panel.routing_error = false;
         self.routed_byte = None;
+        self.latest_shader = shader_bus::Status::default();
+        self.shader_recording = None;
         self.master_meters = MasterMeters::default();
         self.histories = (0..project.patterns.len())
             .map(|_| EditHistory::default())
@@ -1112,9 +1280,23 @@ impl eframe::App for LeviathanApp {
                 self.rack_panel.beats_left = telemetry.capture_beats_left;
                 self.transport_position = telemetry.transport_position;
                 self.routed_byte = telemetry.routed_byte;
+                self.latest_shader = telemetry.shader;
                 self.echo_timing = telemetry.echo_timing;
                 self.kit_sounding = telemetry.kit_sounding;
                 peaks.merge(telemetry.master);
+            }
+        }
+        if self
+            .shader_recording
+            .as_ref()
+            .is_some_and(|recording| recording.is_done())
+        {
+            if let Some(take) = self
+                .shader_recording
+                .take()
+                .and_then(|recording| recording.snapshot())
+            {
+                self.instruments.shader_bus.take = Some(take);
             }
         }
         if let Some(result) = self
@@ -1237,9 +1419,22 @@ impl eframe::App for LeviathanApp {
                 *gate = gate.max(peak);
             }
         }
+        let patch = &self.instruments.shader_bus;
+        let probe = patch
+            .route
+            .lane
+            .and(self.latest_shader.request)
+            .map(|request| shader_bus::Probe {
+                request,
+                rotation: patch.rotation,
+                threshold: patch.threshold,
+            });
         let preview = self
             .viewport
-            .render_frame(ctx, now, &visual_cv, &self.latest_scope);
+            .render_frame(ctx, now, &visual_cv, &self.latest_scope, probe);
+        if let Some(reply) = self.viewport.take_probe_result() {
+            self.send_audio(AudioCommand::ShaderReply(reply));
+        }
 
         egui::TopBottomPanel::top("transport_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -1854,6 +2049,31 @@ mod tests {
             restored.patterns[0].lanes[0][0].lock.machine,
             MachineKind::VastFunSynth as i16
         );
+    }
+
+    #[test]
+    fn scene_shader_return_controls_are_available_from_the_tracker() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        app.cursor.select(0, 0, SubColumn::Note, false);
+        app.lane_patches[0] = LanePatch::for_machine(MachineKind::OtisTwin);
+        frame(&ctx, &mut app, tap(Key::F6, Modifiers::NONE));
+        click_text(&ctx, &mut app, "Off");
+        click_text(&ctx, &mut app, "Lane 1 · OT2");
+        click_text(&ctx, &mut app, "Return → Lookup");
+        let route = app.project_snapshot().instruments.shader_bus.route;
+        assert_eq!(route.lane, Some(0));
+        assert!(route.feedback);
+
+        let output = frame(&ctx, &mut app, tap(Key::F4, Modifiers::NONE));
+        let visible = |label| {
+            output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label)
+            })
+        };
+        assert!(visible("Lookup"));
+        assert!(visible("Shader — → — · OT2 FramePos"));
+        assert_eq!((app.cursor.lane, app.cursor.row), (0, 0));
     }
 
     #[test]
