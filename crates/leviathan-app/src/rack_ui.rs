@@ -1,7 +1,7 @@
 use eframe::egui;
 use leviathan_core::rack_routing::{ByteLookup, LaneInput, RackRouting};
 use leviathan_core::NUM_LANES;
-use leviathan_dsp::{CaptureTap, LanePatch, MachineKind};
+use leviathan_dsp::CaptureTap;
 
 use crate::capture::{Stage, Take, MAX_CAPTURE_BEATS};
 
@@ -115,18 +115,18 @@ pub fn draw_routing(
     ui: &mut egui::Ui,
     routing: &mut RackRouting,
     lane: usize,
-    patch: LanePatch,
+    allow_lane_source: bool,
     has_take: bool,
     live_word: Option<u8>,
     routing_error: bool,
 ) {
     egui::CollapsingHeader::new("Sample and ByteBus routing").default_open(true).show(ui, |ui| {
         let input = &mut routing.inputs[lane];
-        egui::ComboBox::from_id_salt(("routing-input", lane))
+        egui::ComboBox::new(("routing-input", lane), format!("Lane {} input", lane + 1))
             .selected_text(match *input {
                 LaneInput::Instrument => "Instrument".to_string(),
                 LaneInput::Capture => "Capture sample".to_string(),
-                LaneInput::Lane(source) => format!("Lane {}", source + 1),
+                LaneInput::Lane(source) => format!("Lane {} into VAST", source + 1),
             })
             .show_ui(ui, |ui| {
                 ui.selectable_value(input, LaneInput::Instrument, "Instrument");
@@ -135,8 +135,7 @@ pub fn draw_routing(
                     LaneInput::Capture,
                     "Capture sample (SMPL, OTIS, OT2, VAST)",
                 );
-                if patch.machine == MachineKind::VastFunSynth || matches!(input, LaneInput::Lane(_))
-                {
+                if allow_lane_source || matches!(input, LaneInput::Lane(_)) {
                     for source in 0..NUM_LANES {
                         if source != lane {
                             ui.selectable_value(

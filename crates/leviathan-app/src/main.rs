@@ -795,18 +795,23 @@ impl LeviathanApp {
     }
 
     fn draw_routing_deck(&mut self, ui: &mut egui::Ui) {
-        let lane = self.cursor.lane;
-        ui.heading(format!(
-            "Lane {} · {}",
-            lane + 1,
-            self.lane_patches[lane].machine.short_name()
+        let (lane, row, pattern) = (self.cursor.lane, self.cursor.row, self.selected_pattern);
+        let patch = &self.lane_patches[lane];
+        let lock = &self.patterns[pattern].lanes[lane][row].lock;
+        let step_machine = MachineKind::from_patch_and_lock(patch, lock);
+        ui.heading(format!("Lane {} routing", lane + 1));
+        ui.label(format!(
+            "Patch {} · Step {pattern:02X}/{row:02X} {}",
+            patch.machine.short_name(),
+            step_machine.short_name(),
         ));
+        let allow_lane_source = [patch.machine, step_machine].contains(&MachineKind::VastFunSynth);
         let mut routing = self.instruments.routing;
         rack_ui::draw_routing(
             ui,
             &mut routing,
             lane,
-            self.lane_patches[lane],
+            allow_lane_source,
             self.instruments.take.is_some(),
             self.routed_byte,
             self.rack_panel.routing_error,
@@ -1798,6 +1803,51 @@ mod tests {
         let output = frame(&ctx, &mut app, Vec::new());
         assert!(!visible(&output, "Oversample FM and Acid · Project"));
         assert_eq!(app.lane_patches[0].machine, MachineKind::KickDrum);
+    }
+
+    #[test]
+    fn routing_offers_a_lane_source_for_a_vast_step_lock() {
+        use leviathan_core::rack_routing::LaneInput;
+
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        let patch = app.lane_patches[0];
+        assert_eq!(patch.machine, MachineKind::KickDrum);
+        app.cursor.select(0, 0, SubColumn::Note, false);
+        app.patterns[0].lanes[0][0].lock.machine = MachineKind::VastFunSynth as i16;
+        frame(&ctx, &mut app, tap(Key::Space, Modifiers::NONE));
+        let output = frame(&ctx, &mut app, tap(Key::F4, Modifiers::NONE));
+        let visible = |output: &egui::FullOutput, label| {
+            output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label)
+            })
+        };
+        assert!(app.playing);
+        assert!(visible(&output, "Patch KICK · Step 00/00 VAST"));
+        assert!(visible(&output, "Lane 1 input"));
+        click_text(&ctx, &mut app, "Instrument");
+        click_text(&ctx, &mut app, "Lane 2 into VAST");
+        assert_eq!(app.instruments.routing.inputs[0], LaneInput::Lane(1));
+        assert_eq!((app.cursor.lane, app.cursor.row), (0, 0));
+
+        app.cursor.select(0, 3, SubColumn::Note, false);
+        let output = frame(&ctx, &mut app, Vec::new());
+        assert!(visible(&output, "Patch KICK · Step 00/03 KICK"));
+        assert!(visible(&output, "Lane 2 into VAST"));
+
+        let path = std::env::temp_dir().join(format!(
+            "leviathan-step-routing-{}.leviathan.json",
+            std::process::id()
+        ));
+        project::save(&path, app.project_snapshot()).unwrap();
+        let restored = project::load(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(restored.instruments.routing.inputs[0], LaneInput::Lane(1));
+        assert_eq!(restored.lane_patches[0], patch);
+        assert_eq!(
+            restored.patterns[0].lanes[0][0].lock.machine,
+            MachineKind::VastFunSynth as i16
+        );
     }
 
     #[test]

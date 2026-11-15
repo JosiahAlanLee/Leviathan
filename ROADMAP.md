@@ -346,6 +346,11 @@ The Copper Relay walkthrough identified two display gaps addressed in the Voice 
 - **Status** — Implemented in [dcf0e3f](https://github.com/JosiahAlanLee/Leviathan/commit/dcf0e3fdca33dacee1fe452c1be06aaf4486b077). Voice / Trig (F2) shows the BBUS, OTIS and oversampling controls for the machine selected by the current tab and labels each control's scope.
 - **Behavior** — FM4 and FS77 start with fresh filter history when oversampling changes. OtisKit band-limits clean output in both conversion directions. OTIS and OTIS Twin preserve the average grit update rate across host rates.
 
+### Routing follow-up
+
+- **Status** — Implemented in [f8de1ad](https://github.com/JosiahAlanLee/Leviathan/commit/f8de1ad824854ff5ebb570d7641918911e9ac5c6). Routing (F4) shows the lane patch and the selected step's machine. It offers lane sources for a VAST patch or step lock and sends `SetRackRouting` for lane-wide edits.
+- **Verification** — The headless walkthrough chooses a lane source for a VAST step on a KICK lane during playback, moves to a KICK step and reloads the route from a saved project.
+
 ### `T32` – SpoonBender Clock-Ratio Stereo Echo and Dual Mix
 
 - **Status** — Implemented in [11168fe](https://github.com/JosiahAlanLee/Leviathan/commit/11168fe5e50df66c0cbe5590f385df102cc083d5). The Mixer sends `SetEchoParams`. Reset and seek clear the measured ByteBus period.
