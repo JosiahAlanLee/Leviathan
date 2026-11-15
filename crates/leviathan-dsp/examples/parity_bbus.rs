@@ -53,13 +53,19 @@ fn main() -> std::io::Result<()> {
     std::fs::create_dir_all(out)?;
     // None: the standalone generator. Some(0x01): the tracker's default word
     // while lane 1 plays (the lane gate mask), as in song playback.
-    for (tag, word) in [("solo", None), ("w01", Some(0x01u8))] {
+    for (tag, word, grit) in [
+        ("solo", None, false),
+        ("w01", Some(0x01u8), false),
+        ("grit-solo", None, true),
+        ("grit-w01", Some(0x01u8), true),
+    ] {
     for (name, params) in VARIANTS {
         for midi in NOTES {
             let mut rack = SynthRack::new(RATE as f32);
             let mut patch = LanePatch::for_machine(MachineKind::ByteBusR2r);
             patch.params = params;
             rack.set_lane_patch(0, patch);
+            rack.set_bbus_grit_lanes(u8::from(grit));
             rack.reset_voices();
             let mut stems = [[0.0; 2]; NUM_LANES];
             let mut cv = CvFrame { run_v: if word.is_some() { 10.0 } else { 0.0 }, ..CvFrame::default() };

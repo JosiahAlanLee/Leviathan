@@ -17,7 +17,7 @@ use crate::audition;
 use crate::capture::{Recorder, Stage, Take, TakeBank};
 use crate::kit::{Kit, KitBank, KitSample};
 use crate::midi::{MidiEvent, MidiKey, MidiReceiver, MidiTarget};
-use crate::project::{NoteGateSettings, Project, PATTERN_BANK_CAPACITY};
+use crate::project::{BbusSettings, NoteGateSettings, Project, PATTERN_BANK_CAPACITY};
 
 pub enum AudioCommand {
     SetPlaying {
@@ -46,6 +46,7 @@ pub enum AudioCommand {
     SetLanePatch { lane: usize, patch: LanePatch },
     SetVoiceCalibration(bool),
     SetNoteGates(NoteGateSettings),
+    SetBbus(BbusSettings),
     SetRackRouting(RackRouting),
     InstallTake(Arc<Take>),
     ArmCapture,
@@ -123,6 +124,7 @@ pub struct AudioProject {
     sample_bank: SampleBank,
     voice_calibration: bool,
     note_gates: NoteGateSettings,
+    bbus: BbusSettings,
     routing: RackRouting,
     take: Option<Arc<Take>>,
     kit: Kit,
@@ -146,6 +148,7 @@ impl AudioProject {
             sample_bank: project.sample_bank(),
             voice_calibration: project.voice_calibration,
             note_gates: project.instruments.note_gates,
+            bbus: project.instruments.bbus,
             routing: project.instruments.routing,
             take: project.instruments.take.clone(),
             kit: project.instruments.kit.clone(),
@@ -395,6 +398,7 @@ impl RtAudioWorker {
                 AudioCommand::SetNoteGates(gates) => {
                     self.synth.set_note_release_lanes(gates.release_lanes());
                 }
+                AudioCommand::SetBbus(bbus) => self.synth.set_bbus_grit_lanes(bbus.grit_lanes()),
                 AudioCommand::SetRackRouting(routing) => {
                     self.synth.set_routing(routing);
                 }
@@ -451,6 +455,7 @@ impl RtAudioWorker {
                     self.synth.set_lane_patches(project.lane_patches);
                     self.synth.set_voice_calibration(project.voice_calibration);
                     self.synth.set_note_release_lanes(project.note_gates.release_lanes());
+                    self.synth.set_bbus_grit_lanes(project.bbus.grit_lanes());
                     self.synth.set_routing(project.routing);
                     self.synth.reset_voices();
                     self.synth.reset_byte_route();

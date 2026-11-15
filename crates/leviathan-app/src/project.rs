@@ -54,6 +54,35 @@ pub struct InstrumentSettings {
     pub kit: Kit,
     pub echo: echo::Params,
     pub note_gates: NoteGateSettings,
+    pub bbus: BbusSettings,
+}
+
+/// BBUS register timing. Off (the default for projects saved before it
+/// existed) keeps every lane free-running; on restarts the register each
+/// note cycle, except on lanes marked grit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BbusSettings {
+    pub cycle_lock: bool,
+    pub grit: [bool; NUM_LANES],
+}
+
+impl BbusSettings {
+    pub fn grit_lanes(self) -> u8 {
+        if !self.cycle_lock {
+            return (1 << NUM_LANES) - 1;
+        }
+        self.grit
+            .into_iter()
+            .enumerate()
+            .filter(|&(_, grit)| grit)
+            .map(|(lane, _)| 1 << lane)
+            .sum()
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +163,8 @@ struct InstrumentFile {
     echo: echo::Params,
     #[serde(skip_serializing_if = "NoteGateSettings::is_default")]
     note_gates: NoteGateSettings,
+    #[serde(skip_serializing_if = "BbusSettings::is_default")]
+    bbus: BbusSettings,
 }
 
 impl InstrumentFile {
@@ -143,6 +174,7 @@ impl InstrumentFile {
             && self.kit.is_none()
             && self.echo == echo::Params::default()
             && self.note_gates.is_default()
+            && self.bbus.is_default()
     }
 }
 
@@ -545,6 +577,7 @@ impl ProjectFile {
                 kit,
                 echo,
                 note_gates: self.instruments.note_gates,
+                bbus: self.instruments.bbus,
             },
         })
     }
@@ -636,6 +669,7 @@ pub fn save(path: &Path, project: Project) -> Result<(), String> {
             kit: KitFile::from_kit(&project.instruments.kit),
             echo: project.instruments.echo,
             note_gates: project.instruments.note_gates,
+            bbus: project.instruments.bbus,
         },
     };
     let mut bytes = serde_json::to_vec(&project).map_err(|error| error.to_string())?;
@@ -820,6 +854,21 @@ mod tests {
         let oversized = format!("{prefix}{frames}[300,-400],[500,-600]]}}");
         let error = serde_json::from_str::<CaptureFile>(&oversized).err().unwrap();
         assert!(error.to_string().contains("frame budget"));
+    }
+
+    #[test]
+    fn bbus_settings_keep_old_projects_free_running_and_round_trip() {
+        let legacy: InstrumentFile = serde_json::from_str(r#"{"routing":{}}"#).unwrap_or_default();
+        assert_eq!(legacy.bbus, BbusSettings::default());
+        assert_eq!(BbusSettings::default().grit_lanes(), 0b11_1111);
+        let mut locked = BbusSettings { cycle_lock: true, ..BbusSettings::default() };
+        assert_eq!(locked.grit_lanes(), 0);
+        locked.grit[2] = true;
+        assert_eq!(locked.grit_lanes(), 0b100);
+        let json = serde_json::to_string(&locked).unwrap();
+        assert_eq!(serde_json::from_str::<BbusSettings>(&json).unwrap(), locked);
+        let file = InstrumentFile { bbus: BbusSettings::default(), ..InstrumentFile::default() };
+        assert!(!serde_json::to_string(&file).unwrap().contains("bbus"));
     }
 
     #[test]

@@ -376,6 +376,8 @@ struct VoiceState {
     kit: otis_kit::Voice,
     otis_twin: otis_twin::TwinVoice,
     bbus: bbus::Voice,
+    /// BBUS free-runs its register across note cycles (the original sound).
+    bbus_grit: bool,
     fs77: fs77::Voice,
     active_machine: Option<MachineKind>,
     note_pitch: f32,
@@ -408,6 +410,7 @@ impl Default for VoiceState {
             kit: otis_kit::Voice::default(),
             otis_twin: otis_twin::TwinVoice::default(),
             bbus: bbus::Voice::default(),
+            bbus_grit: false,
             fs77: fs77::Voice::default(),
             active_machine: None,
             note_pitch: 0.0,
@@ -511,7 +514,7 @@ impl VoiceState {
                         .step(hz, sample_rate, gate, trigger, &params, calibrated, None)
                 }
                 MachineKind::ByteBusR2r => {
-                    self.bbus.step(hz, sample_rate, gate, trigger, bus_word, &params)
+                    self.bbus.step(hz, sample_rate, gate, trigger, bus_word, &params, !self.bbus_grit)
                 }
                 MachineKind::Fs77FormantFm => {
                     self.fs77.step(hz, sample_rate, gate, trigger, &params, &mut self.rng)
@@ -825,6 +828,7 @@ pub struct SynthRack {
     lane_patches: [LanePatch; NUM_LANES],
     voice_calibration: bool,
     note_release_lanes: u8,
+    bbus_grit_lanes: u8,
     routing: RackRouting,
     render_order: [usize; NUM_LANES],
     byte_register: byte_route::Register,
@@ -852,6 +856,7 @@ impl SynthRack {
             lane_patches: DEFAULT_LANE_PATCHES,
             voice_calibration: false,
             note_release_lanes: ALL_LANES_AUDIBLE,
+            bbus_grit_lanes: 0,
             routing: RackRouting::default(),
             render_order: core::array::from_fn(|lane| lane),
             byte_register: byte_route::Register::default(),
@@ -900,6 +905,7 @@ impl SynthRack {
 
     pub fn reset_voices(&mut self) {
         self.voices = Self::fresh_voices(self.audible_mask, self.channels);
+        self.apply_bbus_grit();
         self.counter = ByteBusCounter::default();
     }
 
@@ -975,6 +981,23 @@ impl SynthRack {
     }
 
     /// Select the lanes where gate-off releases the original synth envelopes.
+    /// Select the lanes where BBUS free-runs its register across note cycles
+    /// (the original, grittier sound). Other lanes restart it every cycle.
+    pub fn set_bbus_grit_lanes(&mut self, lanes: u8) {
+        self.bbus_grit_lanes = lanes & ALL_LANES_AUDIBLE;
+        self.apply_bbus_grit();
+    }
+
+    pub fn bbus_grit_lanes(&self) -> u8 {
+        self.bbus_grit_lanes
+    }
+
+    fn apply_bbus_grit(&mut self) {
+        for (lane, voice) in self.voices.iter_mut().enumerate() {
+            voice.bbus_grit = self.bbus_grit_lanes & (1 << lane) != 0;
+        }
+    }
+
     pub fn set_note_release_lanes(&mut self, lanes: u8) {
         self.note_release_lanes = lanes & ALL_LANES_AUDIBLE;
     }
@@ -1887,5 +1910,14 @@ mod tests {
             let cents = 1200.0 * (f64::from(v_oct_to_hz(volts)) / want).log2();
             assert!(cents.abs() < 0.1, "semitone {semitone}: {cents:.3} cents");
         }
+    }
+
+    #[test]
+    fn bbus_grit_lanes_survive_voice_resets() {
+        let mut rack = SynthRack::new(48_000.0);
+        rack.set_bbus_grit_lanes(0b101);
+        rack.reset_voices();
+        assert_eq!(rack.bbus_grit_lanes(), 0b101);
+        assert!(rack.voices[0].bbus_grit && !rack.voices[1].bbus_grit && rack.voices[2].bbus_grit);
     }
 }
