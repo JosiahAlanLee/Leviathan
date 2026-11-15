@@ -96,12 +96,18 @@ fn main() -> std::io::Result<()> {
         raw.write_all(&s.to_le_bytes())?;
     }
     raw.flush()?;
+    // PARITY_KIT_RAW=1 renders the original response (raw output, squared taper) as lev-raw-*.
+    let raw = std::env::var_os("PARITY_KIT_RAW").is_some();
     for (name, velocity, tune, decay, level, filter, start, reverse, clock, drop) in CASES {
         let mut rack = SynthRack::new(RATE as f32);
         rack.set_lane_patch(0, LanePatch::for_machine(MachineKind::OtisKit));
         let mut slots = [Slot::default(); otis_kit::SLOTS];
         slots[0] = Slot { tune, decay, level, filter, start, reverse };
-        let lane = Lane { clock, drop_samples: drop, velocity: VelocityCurve::Chip, ..Lane::default() };
+        let mut lane = Lane { clock, drop_samples: drop, velocity: VelocityCurve::Chip, ..Lane::default() };
+        if raw {
+            lane.raw_output = true;
+            lane.filter_taper = otis_kit::FilterTaper::Squared;
+        }
         rack.set_kit_controls(slots, [lane; NUM_LANES]);
         rack.reset_voices();
         let samples = CaptureSamples { kit: Some(&memory), ..CaptureSamples::default() };
@@ -116,7 +122,8 @@ fn main() -> std::io::Result<()> {
             rack.render_session_with_echo_stems(&cv, &samples, &mut stems, &mut delays, &mut []);
             mono.push(stems[0][0] + stems[0][1]);
         }
-        write_f32(&out.join(format!("lev-{name}.wav")), &mono)?;
+        let side = if raw { "lev-raw" } else { "lev" };
+        write_f32(&out.join(format!("{side}-{name}.wav")), &mono)?;
     }
     Ok(())
 }
