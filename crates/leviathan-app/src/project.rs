@@ -11,7 +11,8 @@ use leviathan_core::{
 };
 use leviathan_dsp::sampler::{SampleBank, SampleRegion, MAX_WAVE_LEN, NUM_BANKS};
 use leviathan_dsp::otis_kit::{
-    Lane as KitLane, Slot as KitSlot, VelocityCurve, MAX_FRAMES as MAX_KIT_FRAMES, SLOTS,
+    FilterTaper, Lane as KitLane, Slot as KitSlot, VelocityCurve, MAX_FRAMES as MAX_KIT_FRAMES,
+    SLOTS,
 };
 use leviathan_dsp::{default_lane_patches, echo, esp, BenderParams, DelayMode, LanePatch, MachineKind};
 use serde::{Deserialize, Serialize};
@@ -306,6 +307,26 @@ struct KitLaneDef {
     // Projects saved before the soft curve existed load on the chip curve.
     #[serde(default, with = "VelocityCurveDef", skip_serializing_if = "is_chip_curve")]
     velocity: VelocityCurve,
+    // Kits saved before reconstruction and the linear filter taper keep their sound.
+    #[serde(default = "legacy_raw_output")]
+    raw_output: bool,
+    #[serde(default = "legacy_filter_taper", with = "FilterTaperDef")]
+    filter_taper: FilterTaper,
+}
+
+fn legacy_raw_output() -> bool {
+    true
+}
+
+fn legacy_filter_taper() -> FilterTaper {
+    FilterTaper::Squared
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "FilterTaper")]
+enum FilterTaperDef {
+    Linear,
+    Squared,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -901,6 +922,12 @@ mod tests {
         let legacy: StoredKitLane =
             serde_json::from_str(r#"{"bytebus":false,"clock":1,"drop_samples":true}"#).unwrap();
         assert_eq!(legacy.0.velocity, VelocityCurve::Chip);
+        assert!(legacy.0.raw_output);
+        assert_eq!(legacy.0.filter_taper, FilterTaper::Squared);
+        let fresh = serde_json::to_string(&StoredKitLane(KitLane::default())).unwrap();
+        let fresh: StoredKitLane = serde_json::from_str(&fresh).unwrap();
+        assert!(!fresh.0.raw_output);
+        assert_eq!(fresh.0.filter_taper, FilterTaper::Linear);
         assert_eq!((legacy.0.clock, legacy.0.drop_samples), (1, true));
         let chip = serde_json::to_string(&StoredKitLane(KitLane::default())).unwrap();
         assert!(!chip.contains("velocity"), "{chip}");

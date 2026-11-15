@@ -16,6 +16,82 @@ pub struct Lane {
     pub clock: u8,
     pub drop_samples: bool,
     pub velocity: VelocityCurve,
+    /// Hold each chip sample to the host rate (stair-step, with images above
+    /// the chip's Nyquist) instead of band-limiting it. Kits saved before
+    /// reconstruction existed load with this on.
+    pub raw_output: bool,
+    /// The slot filter knob's taper. Kits saved before load as Squared.
+    pub filter_taper: FilterTaper,
+}
+
+/// Slot filter knob to the two chip-rate lowpass coefficients.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FilterTaper {
+    /// Linear in the knob, as the ES5505 K1 register (OtisLab Otis Kit).
+    #[default]
+    Linear,
+    /// The original squared knob: about half the cutoff at the same setting.
+    Squared,
+}
+
+impl FilterTaper {
+    fn coefficient(self, filter: f32) -> f32 {
+        match self {
+            Self::Linear => 0.015 + 0.985 * filter,
+            Self::Squared => 0.015 + 0.985 * filter * filter,
+        }
+    }
+}
+
+const TAPS: usize = 32;
+const PHASES: usize = 64;
+/// Reconstruction from the chip rate when it is below the host rate:
+/// Blackman-windowed sinc, cutoff at 0.9 of the chip's Nyquist, 32 taps,
+/// 64 fractional phases (interpolated), each row normalised to unity at DC.
+static KERNEL: [[f32; TAPS]; PHASES + 1] = make_kernel();
+
+const fn sine_turns(turns: f32) -> f32 {
+    let wrapped = turns - (turns as i32) as f32;
+    let wrapped = if wrapped < 0.0 { wrapped + 1.0 } else { wrapped };
+    crate::voice::sine_cycle(wrapped)
+}
+
+const fn make_kernel() -> [[f32; TAPS]; PHASES + 1] {
+    const CUTOFF: f32 = 0.9;
+    let mut table = [[0.0; TAPS]; PHASES + 1];
+    let mut p = 0;
+    while p <= PHASES {
+        let fraction = p as f32 / PHASES as f32;
+        let mut sum = 0.0;
+        let mut k = 0;
+        while k < TAPS {
+            // Distance from the output instant (8 chip samples behind the
+            // newest, plus the fraction) to the tap k samples back.
+            let d = k as f32 - (TAPS / 2) as f32 + fraction;
+            let x = CUTOFF * d;
+            let sinc = if x == 0.0 || (x > -1.0e-6 && x < 1.0e-6) {
+                1.0
+            } else {
+                sine_turns(0.5 * x) / (core::f32::consts::PI * x)
+            };
+            let w = d / (TAPS / 2) as f32;
+            let window = if w <= -1.0 || w >= 1.0 {
+                0.0
+            } else {
+                0.42 + 0.5 * sine_turns(0.5 * w + 0.25) + 0.08 * sine_turns(w + 0.25)
+            };
+            table[p][k] = sinc * window;
+            sum += sinc * window;
+            k += 1;
+        }
+        k = 0;
+        while k < TAPS {
+            table[p][k] /= sum;
+            k += 1;
+        }
+        p += 1;
+    }
+    table
 }
 
 /// How MIDI velocity maps to hit gain. Both curves keep 192 quantized steps.
@@ -106,6 +182,12 @@ struct Hit {
     amp: f32,
     decay: f32,
     held: f32,
+    /// Band-limit the output (chip rate below the host rate, not raw output).
+    smooth: bool,
+    history: [f32; TAPS],
+    head: u8,
+    /// Chip samples of silence still to pass through the reconstruction.
+    tail: u8,
 }
 
 const ONE: u64 = 1 << 32;
@@ -150,10 +232,10 @@ impl Hit {
         pitch_oct: f32,
         velocity: f32,
         clock: u8,
-        drop_samples: bool,
-        curve: VelocityCurve,
+        settings: Lane,
         rate: f32,
     ) -> Self {
+        let Lane { drop_samples, velocity: curve, .. } = settings;
         let chip = CHIP_RATES[usize::from(clock).min(CHIP_RATES.len() - 1)];
         let end_frame = sample.pcm.len() - 1;
         let start_frame = ((end_frame as f32 * params.start) as usize).min(end_frame - 1);
@@ -180,10 +262,14 @@ impl Hit {
             phase: 1.0,
             ratio: chip / rate,
             filtered: [0.0; 2],
-            cutoff: 0.015 + 0.985 * params.filter * params.filter,
+            cutoff: settings.filter_taper.coefficient(params.filter),
             amp,
             decay,
             held: 0.0,
+            smooth: !settings.raw_output && chip < rate,
+            history: [0.0; TAPS],
+            head: 0,
+            tail: TAPS as u8,
         }
     }
 
@@ -200,8 +286,19 @@ impl Hit {
             return 0.0;
         };
         if self.amp == 0.0 && self.phase >= 1.0 {
-            self.generation = None;
-            return 0.0;
+            if !self.smooth || self.tail == 0 {
+                self.generation = None;
+                return 0.0;
+            }
+            // Let the last samples ring out of the reconstruction filter.
+            while self.phase >= 1.0 && self.tail > 0 {
+                self.phase -= 1.0;
+                self.push(0.0);
+                self.tail -= 1;
+            }
+            let out = self.reconstruct();
+            self.phase += self.ratio;
+            return out;
         }
         while self.phase >= 1.0 {
             self.phase -= 1.0;
@@ -217,6 +314,9 @@ impl Hit {
             self.filtered[0] += self.cutoff * (value as f32 * PCM_GAIN - self.filtered[0]);
             self.filtered[1] += self.cutoff * (self.filtered[0] - self.filtered[1]);
             self.held = self.filtered[1] * self.amp;
+            if self.smooth {
+                self.push(self.held);
+            }
             self.amp *= self.decay;
             let next = if self.reverse {
                 self.position.checked_sub(self.delta)
@@ -233,8 +333,30 @@ impl Hit {
                 break;
             }
         }
+        let out = if self.smooth { self.reconstruct() } else { self.held };
         self.phase += self.ratio;
-        self.held
+        out
+    }
+
+    #[inline]
+    fn push(&mut self, value: f32) {
+        self.head = (self.head + 1) % TAPS as u8;
+        self.history[usize::from(self.head)] = value;
+    }
+
+    /// The output `phase` chip samples after the newest, delayed by TAPS / 2.
+    #[inline]
+    fn reconstruct(&self) -> f32 {
+        let position = self.phase.clamp(0.0, 1.0) * PHASES as f32;
+        let row = (position as usize).min(PHASES - 1);
+        let mix = position - row as f32;
+        let mut out = 0.0;
+        for k in 0..TAPS {
+            let tap = KERNEL[row][k] + mix * (KERNEL[row + 1][k] - KERNEL[row][k]);
+            let index = (usize::from(self.head) + TAPS - k) % TAPS;
+            out += tap * self.history[index];
+        }
+        out
     }
 }
 
@@ -313,8 +435,7 @@ impl Voice {
                     pitch,
                     velocity,
                     clock,
-                    settings.drop_samples,
-                    settings.velocity,
+                    settings,
                     sample_rate,
                 );
                 if next.generation.is_some() {
@@ -450,8 +571,7 @@ mod tests {
                 0.0,
                 1.0,
                 0,
-                false,
-                VelocityCurve::Chip,
+                Lane { raw_output: true, filter_taper: FilterTaper::Squared, ..Lane::default() },
                 output_rate,
             );
             assert!(
@@ -528,5 +648,36 @@ mod tests {
         }
         assert_eq!(voice.generations()[0], [Some(2), None]);
         assert_eq!(voice.generations()[7], [Some(1), None]);
+    }
+
+    #[test]
+    fn reconstruction_removes_chip_images_and_raw_output_keeps_them() {
+        // A 10 kHz tone at 48 kHz played on the 29.8 kHz clock: its first
+        // image sits at about 19.76 kHz.
+        let pcm: std::vec::Vec<i16> = (0..9_600)
+            .map(|i| (16_000.0 * crate::voice::sine_cycle(((i * 10_000) % 48_000) as f32 / 48_000.0)) as i16)
+            .collect();
+        let pcm: &'static [i16] = std::boxed::Box::leak(pcm.into_boxed_slice());
+        let bank = Bank { current: Sample { generation: 1, rate: 48_000, pcm }, old: None };
+        let level = |raw: bool, hz: f64| {
+            let lane = Lane { raw_output: raw, ..Lane::default() };
+            let mut hit = Hit::new(bank.current, Slot::default(), 0.0, 1.0, 0, lane, 48_000.0);
+            let out: std::vec::Vec<f32> = (0..6_000).map(|_| hit.render(&bank, 0, 0)).collect();
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (n, &x) in out[1_000..5_800].iter().enumerate() {
+                let w = 2.0 * core::f64::consts::PI * hz * n as f64 / 48_000.0;
+                re += f64::from(x) * w.cos();
+                im += f64::from(x) * w.sin();
+            }
+            (re * re + im * im).sqrt()
+        };
+        let image = CHIP_RATES[0] as f64 - 10_000.0;
+        let raw = 20.0 * (level(true, image) / level(true, 10_000.0)).log10();
+        let smooth = 20.0 * (level(false, image) / level(false, 10_000.0)).log10();
+        assert!(raw > -20.0, "raw image {raw:.1} dB");
+        assert!(smooth < -60.0, "reconstructed image {smooth:.1} dB");
+        for row in KERNEL.iter() {
+            assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-4);
+        }
     }
 }
