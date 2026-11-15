@@ -544,6 +544,12 @@ impl VoiceState {
         if attack {
             self.env = (velocity / 10.0).clamp(0.1, 1.0);
             self.pitch_env = 1.0;
+            if calibrated && machine == MachineKind::KickDrum {
+                // Calibrated voicing restarts the oscillator so every hit has
+                // the same attack and polarity, as a triggered drum circuit
+                // does. Legacy voicing keeps the free-running phase.
+                self.phase = 0.0;
+            }
             self.fm.trigger();
             self.sampler.trigger(sample_bank, &lock);
         }
@@ -1936,5 +1942,34 @@ mod tests {
         assert_eq!(rack.bbus_grit_lanes(), 0b101);
         assert!(rack.voices.iter().all(|voice| !voice.otis_warm_tables));
         assert!(rack.voices[0].bbus_grit && !rack.voices[1].bbus_grit && rack.voices[2].bbus_grit);
+    }
+
+    #[test]
+    fn calibrated_kick_hits_restart_from_zero_with_the_same_attack() {
+        let mut rack = SynthRack::new(48_000.0);
+        rack.set_lane_patch(0, LanePatch::for_machine(MachineKind::KickDrum));
+        rack.set_voice_calibration(true);
+        rack.reset_voices();
+        let mut stems = [[0.0; 2]; NUM_LANES];
+        let mut cv = CvFrame::default();
+        let mut onsets = std::vec::Vec::new();
+        for _ in 0..4 {
+            let mut first = [0.0f32; 4];
+            for n in 0..6_000 {
+                cv.gate_v[0] = if n < 4_200 { 10.0 } else { 0.0 };
+                cv.velocity_v[0] = 10.0;
+                rack.render_stereo_with_stems(&cv, &mut stems);
+                if n < 4 {
+                    first[n] = stems[0][0] + stems[0][1];
+                }
+            }
+            onsets.push(first);
+        }
+        for hit in &onsets[1..] {
+            for (a, b) in hit.iter().zip(&onsets[0]) {
+                assert!((a - b).abs() < 1e-3, "{onsets:?}");
+            }
+        }
+        assert!(onsets[0][0].abs() < 0.01);
     }
 }
