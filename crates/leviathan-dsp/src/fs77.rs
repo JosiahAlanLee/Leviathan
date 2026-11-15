@@ -306,8 +306,11 @@ impl Voice {
         // FS1R Unvoiced consonant / breath operator tuned to vowel `F2` (`skirt_unv > 0.35`)
         let unv_amt = ((skirt_unv - 0.35) * (1.0 / 0.65)).clamp(0.0, 1.0);
         let unvoiced = if unv_amt > 1e-4 {
-            let white = noise(rng);
-            let g_unv = ((core::f32::consts::PI * f2_hz) / sr).clamp(0.02, 0.65);
+            let white = noise(rng) * crate::voice::rate_noise(sr);
+            let g_unv = crate::voice::rate_g(
+                ((core::f32::consts::PI * f2_hz) / crate::voice::REFERENCE_RATE).clamp(0.02, 0.65),
+                sr,
+            );
             let bp = self.unvoiced_svf.step(white, g_unv, 0.22, 1.0).band;
             bp * unv_amt * (0.30 + 0.70 * self.breath_env) * 0.85
         } else {
@@ -319,7 +322,9 @@ impl Voice {
         // SY77 Dual Coupled 12 dB Digital Filters (`filt1` + `filt2`, single step per filter)
         let cut_norm = (filter_cut * 0.82 + 0.18 * self.mod_env).clamp(0.0, 1.0);
         let cut_hz = 95.0 + cubic_curve(cut_norm) * 14_500.0;
-        let g_f = ((core::f32::consts::PI * cut_hz.min(sr * 0.42)) / sr).clamp(0.008, 0.72);
+        let reference = crate::voice::REFERENCE_RATE;
+        let g_f48 = ((core::f32::consts::PI * cut_hz.min(reference * 0.42)) / reference).clamp(0.008, 0.72);
+        let g_f = crate::voice::rate_g(g_f48, sr);
 
         let lp_reso = if reso_dac < 0.50 {
             (0.50 - reso_dac) * 2.0
@@ -334,7 +339,10 @@ impl Voice {
 
         let damping = (0.95 - 0.78 * lp_reso - 0.45 * bp_ym_amt).clamp(0.14, 1.10);
         let g_f1 = if bp_ym_amt > 0.0 {
-            (g_f * (1.0 - 0.82 * bp_ym_amt + 0.36 * bp_ym_amt * bp_ym_amt)).clamp(0.005, 0.72)
+            crate::voice::rate_g(
+                (g_f48 * (1.0 - 0.82 * bp_ym_amt + 0.36 * bp_ym_amt * bp_ym_amt)).clamp(0.005, 0.72),
+                sr,
+            )
         } else {
             g_f
         };

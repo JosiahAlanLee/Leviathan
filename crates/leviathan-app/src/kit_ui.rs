@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use eframe::egui;
-use leviathan_dsp::otis_kit::{VelocityCurve, CHIP_RATES, SLOTS};
+use leviathan_dsp::otis_kit::{FilterTaper, VelocityCurve, CHIP_RATES, SLOTS};
 
 use crate::kit::Kit;
 use crate::param_ui::format_kit_velocity;
@@ -72,6 +72,18 @@ impl KitUi {
                 })
                 .response
                 .on_hover_text("Velocity curve for this lane. Chip: 0.375 dB per step, as the hardware. Soft: 0.125 dB per step, so ordinary tracker velocities stay audible.");
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut settings.raw_output, "Raw output")
+                .on_hover_text("Hold each chip sample to the output rate: stair-step grit with images above the chip's Nyquist. Off band-limits the output when the chip clock is below the output rate, as OtisLab's converter does.");
+            let mut squared = settings.filter_taper == FilterTaper::Squared;
+            if ui
+                .checkbox(&mut squared, "Squared filter taper")
+                .on_hover_text("The original Leviathan filter knob: about half the cutoff at the same setting. Off is linear, like the ES5505 K1 register.")
+                .changed()
+            {
+                settings.filter_taper = if squared { FilterTaper::Squared } else { FilterTaper::Linear };
+            }
         });
         edits.controls = *settings != old;
         ui.separator();

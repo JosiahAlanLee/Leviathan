@@ -16,6 +16,7 @@ mod fs77;
 mod master;
 mod otis;
 pub mod otis_kit;
+mod oversample;
 mod otis_twin;
 mod perc;
 mod pvx;
@@ -252,6 +253,23 @@ pub fn fast_sin_turns(turns: f32) -> f32 {
     -(0.225 * (y * y.abs() - y) + y)
 }
 
+/// Polynomial band-limited step residual for a rising-phase saw that drops by
+/// 2 at the wrap; subtract from the naive saw.
+#[inline]
+fn poly_blep(phase: f32, dt: f32) -> f32 {
+    if dt <= 0.0 {
+        0.0
+    } else if phase < dt {
+        let x = phase / dt;
+        x + x - x * x - 1.0
+    } else if phase > 1.0 - dt {
+        let x = (phase - 1.0) / dt;
+        x * x + x + x + 1.0
+    } else {
+        0.0
+    }
+}
+
 #[inline]
 fn fast_tanh(x: f32) -> f32 {
     let x = x.clamp(-3.0, 3.0);
@@ -381,6 +399,10 @@ struct VoiceState {
     bbus_grit: bool,
     /// OTIS TableSel spans the bright tables and their warm twins.
     otis_warm_tables: bool,
+    /// FS77 and the 4-Op FM core run at 4x and Acid's saw is band-limited.
+    /// Off (grit) is the original single-rate rendering.
+    oversample: bool,
+    decimator: oversample::Decimator4,
     fs77: fs77::Voice,
     active_machine: Option<MachineKind>,
     note_pitch: f32,
@@ -415,6 +437,8 @@ impl Default for VoiceState {
             bbus: bbus::Voice::default(),
             bbus_grit: false,
             otis_warm_tables: true,
+            oversample: true,
+            decimator: oversample::Decimator4::default(),
             fs77: fs77::Voice::default(),
             active_machine: None,
             note_pitch: 0.0,
@@ -444,6 +468,7 @@ impl VoiceState {
         self.kit = otis_kit::Voice::default();
         self.otis_twin = otis_twin::TwinVoice::default();
         self.bbus = bbus::Voice::default();
+        self.decimator = oversample::Decimator4::default();
         self.fs77 = fs77::Voice::default();
         self.active_machine = None;
     }
@@ -521,6 +546,14 @@ impl VoiceState {
                 MachineKind::ByteBusR2r => {
                     self.bbus.step(hz, sample_rate, gate, trigger, bus_word, &params, !self.bbus_grit)
                 }
+                MachineKind::Fs77FormantFm if self.oversample => {
+                    let rate = sample_rate * oversample::FACTOR as f32;
+                    let block = core::array::from_fn(|i| {
+                        let trigger = if i == 0 { trigger } else { None };
+                        self.fs77.step(hz, rate, gate, trigger, &params, &mut self.rng)
+                    });
+                    self.decimator.process(block)
+                }
                 MachineKind::Fs77FormantFm => {
                     self.fs77.step(hz, sample_rate, gate, trigger, &params, &mut self.rng)
                 }
@@ -580,6 +613,18 @@ impl VoiceState {
                 let drive = 1.8 + 2.2 * lock_param(&lock, 1, 0.35).clamp(0.0, 1.0);
                 fast_tanh(drive * fast_sin_turns(self.phase) * self.env)
             }
+            MachineKind::FourOpFm if self.oversample => {
+                let rate = sample_rate * oversample::FACTOR as f32;
+                let env = self.env;
+                let block = core::array::from_fn(|_| {
+                    if calibrated {
+                        self.fm.step_calibrated(base_hz, rate, env, &lock)
+                    } else {
+                        self.fm.step_sample(base_hz, rate, env, &lock)
+                    }
+                });
+                self.decimator.process(block)
+            }
             MachineKind::FourOpFm => {
                 if calibrated {
                     self.fm.step_calibrated(base_hz, sample_rate, self.env, &lock)
@@ -592,14 +637,20 @@ impl VoiceState {
                 let drive = 1.6 + (lock.values[1] - 0.5) * 2.0;
                 fast_tanh(drive * (0.65 * fast_sin_turns(self.phase) + 0.35 * saw)) * self.env
             }
-            MachineKind::NoiseWash => noise * self.env * (0.55 + (lock.values[1] - 0.5) * 0.70),
+            MachineKind::NoiseWash => {
+                noise * voice::rate_noise(sample_rate) * self.env * (0.55 + (lock.values[1] - 0.5) * 0.70)
+            }
             MachineKind::VarSampler => {
                 self.sampler
                     .step_sample_gated(sample_bank, base_hz, sample_rate, &lock, gate)
                     * self.env
             }
             MachineKind::AcidLead => {
-                let saw = 2.0 * self.phase - 1.0;
+                let saw = if self.oversample {
+                    2.0 * self.phase - 1.0 - poly_blep(self.phase, (freq * dt).min(0.5))
+                } else {
+                    2.0 * self.phase - 1.0
+                };
                 let shaped = if (lock.values[1] - 0.5).abs() < 1e-6 {
                     saw
                 } else {
@@ -621,7 +672,7 @@ impl VoiceState {
             (0.22 + (lock.values[2] - 0.5) * 0.8 + 0.52 * self.env).clamp(0.05, 0.88)
         }
         .clamp(0.04, 0.88);
-        let g = (cutoff_norm * 0.72).clamp(0.01, 0.78);
+        let g = voice::rate_g((cutoff_norm * 0.72).clamp(0.01, 0.78), sample_rate);
         let base_k = if matches!(machine, MachineKind::AcidLead) {
             0.55_f32
         } else {
@@ -834,6 +885,7 @@ pub struct SynthRack {
     voice_calibration: bool,
     note_release_lanes: u8,
     bbus_grit_lanes: u8,
+    alias_grit_lanes: u8,
     otis_warm_tables: bool,
     routing: RackRouting,
     render_order: [usize; NUM_LANES],
@@ -863,6 +915,7 @@ impl SynthRack {
             voice_calibration: false,
             note_release_lanes: ALL_LANES_AUDIBLE,
             bbus_grit_lanes: 0,
+            alias_grit_lanes: 0,
             otis_warm_tables: true,
             routing: RackRouting::default(),
             render_order: core::array::from_fn(|lane| lane),
@@ -1006,8 +1059,20 @@ impl SynthRack {
         self.apply_lane_flags();
     }
 
+    /// Select the lanes that keep the original single-rate FS77 / 4-Op FM /
+    /// Acid rendering (grit). Other lanes oversample.
+    pub fn set_alias_grit_lanes(&mut self, lanes: u8) {
+        self.alias_grit_lanes = lanes & ALL_LANES_AUDIBLE;
+        self.apply_lane_flags();
+    }
+
+    pub fn alias_grit_lanes(&self) -> u8 {
+        self.alias_grit_lanes
+    }
+
     fn apply_lane_flags(&mut self) {
         for (lane, voice) in self.voices.iter_mut().enumerate() {
+            voice.oversample = self.alias_grit_lanes & (1 << lane) == 0;
             voice.bbus_grit = self.bbus_grit_lanes & (1 << lane) != 0;
             voice.otis_warm_tables = self.otis_warm_tables;
         }
@@ -1932,7 +1997,9 @@ mod tests {
         let mut rack = SynthRack::new(48_000.0);
         rack.set_bbus_grit_lanes(0b101);
         rack.set_otis_warm_tables(false);
+        rack.set_alias_grit_lanes(0b10);
         rack.reset_voices();
+        assert!(rack.voices[0].oversample && !rack.voices[1].oversample);
         assert_eq!(rack.bbus_grit_lanes(), 0b101);
         assert!(rack.voices.iter().all(|voice| !voice.otis_warm_tables));
         assert!(rack.voices[0].bbus_grit && !rack.voices[1].bbus_grit && rack.voices[2].bbus_grit);

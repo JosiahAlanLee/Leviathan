@@ -59,7 +59,7 @@ impl Voice {
         let sub_step = phase_step(hz * 0.5, sample_rate);
         self.sub_phase = wrap_turns(self.sub_phase + sub_step);
         let sub_noise = 0.18 * (1.0 - wave_mix) * pulse(self.sub_phase, sub_step, 0.5)
-            + 0.18 * wave_mix * noise(rng);
+            + 0.18 * wave_mix * noise(rng) * crate::voice::rate_noise(sample_rate);
         let drive = if mode_drive < 0.5 {
             mode_drive * 2.0
         } else {
@@ -67,7 +67,7 @@ impl Voice {
         };
         let input = fast_tanh((1.0 + 4.0 * drive) * (0.55 * osc1 + 0.32 * osc2 + sub_noise));
         let cutoff = (cutoff + self.filter_env * env_mod * 0.70).min(1.0);
-        let g = 0.008 + 0.84 * cutoff * cutoff;
+        let g = crate::voice::rate_g(0.008 + 0.84 * cutoff * cutoff, sample_rate);
         let damping = 1.55 - 1.46 * resonance;
         // Keep positive damping at full resonance and apply op-amp slew and
         // saturation in the integrator feedback.

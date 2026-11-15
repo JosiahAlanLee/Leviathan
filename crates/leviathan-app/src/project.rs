@@ -11,7 +11,8 @@ use leviathan_core::{
 };
 use leviathan_dsp::sampler::{SampleBank, SampleRegion, MAX_WAVE_LEN, NUM_BANKS};
 use leviathan_dsp::otis_kit::{
-    Lane as KitLane, Slot as KitSlot, VelocityCurve, MAX_FRAMES as MAX_KIT_FRAMES, SLOTS,
+    FilterTaper, Lane as KitLane, Slot as KitSlot, VelocityCurve, MAX_FRAMES as MAX_KIT_FRAMES,
+    SLOTS,
 };
 use leviathan_dsp::{default_lane_patches, echo, esp, BenderParams, DelayMode, LanePatch, MachineKind};
 use serde::{Deserialize, Serialize};
@@ -56,6 +57,35 @@ pub struct InstrumentSettings {
     pub note_gates: NoteGateSettings,
     pub bbus: BbusSettings,
     pub otis: OtisSettings,
+    pub oversample: OversampleSettings,
+}
+
+/// FS77 and 4-Op FM at 4x with a band-limited Acid saw. Off (the default for
+/// projects saved before it) keeps every lane at the original single rate;
+/// on oversamples every lane not marked grit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OversampleSettings {
+    pub enabled: bool,
+    pub grit: [bool; NUM_LANES],
+}
+
+impl OversampleSettings {
+    pub fn grit_lanes(self) -> u8 {
+        if !self.enabled {
+            return (1 << NUM_LANES) - 1;
+        }
+        self.grit
+            .into_iter()
+            .enumerate()
+            .filter(|&(_, grit)| grit)
+            .map(|(lane, _)| 1 << lane)
+            .sum()
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// OTIS table set. Off (the default for projects saved before the warm
@@ -183,6 +213,8 @@ struct InstrumentFile {
     bbus: BbusSettings,
     #[serde(skip_serializing_if = "OtisSettings::is_default")]
     otis: OtisSettings,
+    #[serde(skip_serializing_if = "OversampleSettings::is_default")]
+    oversample: OversampleSettings,
 }
 
 impl InstrumentFile {
@@ -194,6 +226,7 @@ impl InstrumentFile {
             && self.note_gates.is_default()
             && self.bbus.is_default()
             && self.otis.is_default()
+            && self.oversample.is_default()
     }
 }
 
@@ -306,6 +339,26 @@ struct KitLaneDef {
     // Projects saved before the soft curve existed load on the chip curve.
     #[serde(default, with = "VelocityCurveDef", skip_serializing_if = "is_chip_curve")]
     velocity: VelocityCurve,
+    // Kits saved before reconstruction and the linear filter taper keep their sound.
+    #[serde(default = "legacy_raw_output")]
+    raw_output: bool,
+    #[serde(default = "legacy_filter_taper", with = "FilterTaperDef")]
+    filter_taper: FilterTaper,
+}
+
+fn legacy_raw_output() -> bool {
+    true
+}
+
+fn legacy_filter_taper() -> FilterTaper {
+    FilterTaper::Squared
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "FilterTaper")]
+enum FilterTaperDef {
+    Linear,
+    Squared,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -598,6 +651,7 @@ impl ProjectFile {
                 note_gates: self.instruments.note_gates,
                 bbus: self.instruments.bbus,
                 otis: self.instruments.otis,
+                oversample: self.instruments.oversample,
             },
         })
     }
@@ -691,6 +745,7 @@ pub fn save(path: &Path, project: Project) -> Result<(), String> {
             note_gates: project.instruments.note_gates,
             bbus: project.instruments.bbus,
             otis: project.instruments.otis,
+            oversample: project.instruments.oversample,
         },
     };
     let mut bytes = serde_json::to_vec(&project).map_err(|error| error.to_string())?;
@@ -891,6 +946,11 @@ mod tests {
         let file = InstrumentFile { bbus: BbusSettings::default(), ..InstrumentFile::default() };
         assert!(!serde_json::to_string(&file).unwrap().contains("bbus"));
         assert!(!legacy.otis.warm_tables);
+        assert_eq!(legacy.oversample.grit_lanes(), 0b11_1111);
+        let mut oversample = OversampleSettings { enabled: true, ..OversampleSettings::default() };
+        assert_eq!(oversample.grit_lanes(), 0);
+        oversample.grit[4] = true;
+        assert_eq!(oversample.grit_lanes(), 0b1_0000);
         let warm = OtisSettings { warm_tables: true };
         let json = serde_json::to_string(&warm).unwrap();
         assert_eq!(serde_json::from_str::<OtisSettings>(&json).unwrap(), warm);
@@ -901,6 +961,12 @@ mod tests {
         let legacy: StoredKitLane =
             serde_json::from_str(r#"{"bytebus":false,"clock":1,"drop_samples":true}"#).unwrap();
         assert_eq!(legacy.0.velocity, VelocityCurve::Chip);
+        assert!(legacy.0.raw_output);
+        assert_eq!(legacy.0.filter_taper, FilterTaper::Squared);
+        let fresh = serde_json::to_string(&StoredKitLane(KitLane::default())).unwrap();
+        let fresh: StoredKitLane = serde_json::from_str(&fresh).unwrap();
+        assert!(!fresh.0.raw_output);
+        assert_eq!(fresh.0.filter_taper, FilterTaper::Linear);
         assert_eq!((legacy.0.clock, legacy.0.drop_samples), (1, true));
         let chip = serde_json::to_string(&StoredKitLane(KitLane::default())).unwrap();
         assert!(!chip.contains("velocity"), "{chip}");

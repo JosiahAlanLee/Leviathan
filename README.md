@@ -63,6 +63,14 @@ Leviathan uses a strict hexagonal ("ports and adapters") layout so external GPU,
 - New sessions restart the **BBUS** register every note cycle (**BBUS cycle lock**, in **Voice / Trig** when the lane plays BBUS). Its sixteen steps are then one period, as when ByteBusLab Parallel Sum's cycle is the pitch, so the voice is pitched and harmonic.
 - **Lane grit** lets one lane's register run free across note cycles: the original sound, whose feedback repeats only every 15–255 cycles and reads as a noisy, digital comb around the pitch. Projects saved before the option load with the lock off, so they sound as before.
 
+## Oversampled FM and Acid
+
+- **Oversample FM and Acid** (in **Voice / Trig** on FS77, 4-Op FM and Acid lanes) runs FS77 and the 4-Op FM operators at four times the output rate through a 96-tap decimator and band-limits Acid's saw (polyBLEP), so high notes and deep modulation no longer fold back as low, inharmonic tones. **Lane grit** keeps a lane at the original single rate. New sessions turn it on; projects saved earlier keep the original rendering. Six oversampled FS77 lanes take about a fifth of one core.
+
+## Sample-rate independence
+
+- Voices tuned with per-sample filter coefficients, decays, delays and noise at 48 kHz now convert them for the device rate, so a project sounds the same at 44.1, 48 and 96 kHz. At 48 kHz every voice renders bit-identically to before (FS77 changes only through its 4x oversampling). Remaining differences across rates are within about 2 dB except grit controls that hold whole samples, FS77's ResoDac and VAST Triple's PreTilt at their extremes (3-5 dB).
+
 ## OTIS warm tables
 
 - **OTIS warm tables** (in **Voice / Trig** when the lane plays OTIS) adds a darker twin of each transwave table. **TableSel** then alternates bright and warm: the lower half of each quarter plays the original table, the upper half its twin (formant swept lower, partials rolled off above the fourth harmonic, peak-matched). New sessions turn it on; projects saved earlier keep the four bright tables.
@@ -73,6 +81,7 @@ Leviathan uses a strict hexagonal ("ports and adapters") layout so external GPU,
 - Select **OKIT** in **Lane Patch** or in a **Step Lock**. Go to **Samples** (F5) and open **OtisKit**. The **Factory kit** button fills all eight slots. You can also load a WAV, load a folder in filename order, or arm a capture directly into the selected slot. Capture from the **Capture and Banks** tab still writes to the stereo take.
 - **Tracker** addressing maps MIDI 60–67 (C-4 through G-4) to slots 1–8 at unity pitch. Each additional group of eight notes transposes an octave. **ByteBus** addressing takes bits 0–2 from Register/Lookup and uses the tracker note for pitch. An optional slot offset wraps around the bank. Kit controls and step offsets are latched on each hit.
 - Each lane picks a **velocity curve**. **Chip** (the default, as on the hardware) drops 0.375 dB per step, so velocity 94 is −18.75 dB and 52 is about −44 dB. **Soft** drops 0.125 dB per step, about 24 dB in all, so ordinary tracker dynamics stay audible. The step inspector and velocity tooltips show the gain on the lane's curve. Projects saved earlier load on Chip.
+- **Raw output** and **Squared filter taper** (per kit lane). New kits band-limit the output when the chip clock is below the output rate (32-tap windowed sinc at 0.9 of the chip's Nyquist, as OtisLab's converter does) and use a linear filter knob like the ES5505 K1 register. Raw output keeps the stair-step grit, with images above the chip's Nyquist; the squared taper is the original, about half the cutoff at the same setting. Kits saved earlier load with both on.
 - **REWORK** previews the capture's trim region or an OtisKit slot from Start to its end. Set the seed, fineness and amount, listen to A and B, and commit the result. A replacement or project reload invalidates a stale preview. Export includes committed audio. Preview audition plays from the monitor and stays outside the recorded and exported signal.
 - Projects save as version 2 in the same `.leviathan.json` file. The new version stores the stereo take and mono kit slots as base64 little-endian signed 16-bit PCM with explicit rate and frame count. Version 1 files with numeric PCM still load.
 

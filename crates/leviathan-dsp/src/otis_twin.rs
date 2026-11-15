@@ -430,7 +430,7 @@ impl TwinVoice {
         self.frame_b = approach(self.frame_b, target_fb, FRAME_SLEW_SECONDS, sr);
 
         if self.decim_counter == 0 {
-            self.decim_counter = (grit * grit * 6.0) as u8;
+            self.decim_counter = crate::voice::rate_samples((grit * grit * 6.0) as u32 as f32, sr).min(255.0) as u8;
             let discard = (grit * FRACTION_BITS as f32) as u32;
             let frac_mask = u32::MAX << discard;
 
@@ -488,10 +488,12 @@ impl TwinVoice {
             0.006
         };
         self.k1_slewed = approach(self.k1_slewed, target_k1, time, rate);
-        let g1 = self.k1_slewed;
+        // Tuned as per-sample poles at 48 kHz; keep the same cutoffs at other rates.
+        let g1 = crate::voice::rate_coef(self.k1_slewed, rate);
+        let g1_48 = self.k1_slewed;
 
         let resonance = (1.0 - 2.0 * f2).max(0.0);
-        let fb_gain = resonance * 2.85 * (1.0 - 0.22 * g1);
+        let fb_gain = resonance * 2.85 * (1.0 - 0.22 * g1_48);
         let fb_sig = fast_tanh(self.lp[3]);
         let driven_in = fast_tanh(input * (1.0 + 0.85 * fb_gain) - fb_gain * fb_sig);
 
@@ -503,9 +505,9 @@ impl TwinVoice {
 
         // Above center, F2 raises the two-pole high-pass floor.
         let highpass = (2.0 * f2 - 1.0).max(0.0);
-        let min_hp = (60.0 / rate).clamp(0.0005, 0.01);
-        let max_hp = (g1 * 0.42).clamp(min_hp, 0.22);
-        let g_hp = min_hp + (max_hp - min_hp) * highpass * highpass;
+        let min_hp = (60.0 / crate::voice::REFERENCE_RATE).clamp(0.0005, 0.01);
+        let max_hp = (g1_48 * 0.42).clamp(min_hp, 0.22);
+        let g_hp = crate::voice::rate_coef(min_hp + (max_hp - min_hp) * highpass * highpass, rate);
 
         self.hp_lp[0] += g_hp * (lp_out - self.hp_lp[0]);
         let hp1 = lp_out - self.hp_lp[0];

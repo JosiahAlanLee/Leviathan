@@ -160,7 +160,10 @@ impl Voice {
         let combined = converted * (1.0 - 0.45 * sub) + 0.55 * sub * sub_signal;
         self.dc = approach(self.dc, combined, 0.012, rate);
         let frequency = 120.0 + 15_000.0 * cutoff * cutoff;
-        let g = (core::f32::consts::PI * frequency / rate).clamp(0.005, 0.8);
+        let g = crate::voice::rate_g(
+            (core::f32::consts::PI * frequency / crate::voice::REFERENCE_RATE).clamp(0.005, 0.8),
+            rate,
+        );
         let filtered = self.filter.step(combined - self.dc, g, 0.72, 0.0).low;
         crate::fast_tanh(filtered) * self.amp
     }
