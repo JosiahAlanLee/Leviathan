@@ -9,7 +9,11 @@ use leviathan_core::{
     EngineConfig, LaunchTarget, NoteCell, Pattern, PatternChain, SongPlayer, SoundLock,
     MAX_CHAIN_ENTRIES, NUM_LANES, ROWS_PER_PATTERN,
 };
-use leviathan_dsp::{BenderParams, LaneChannel, LanePatch, MachineKind, SynthRack};
+use leviathan_dsp::otis_kit::{self, Sample};
+use leviathan_dsp::{
+    echo, BenderParams, CaptureSamples, DelayMode, LaneChannel, LanePatch, MachineKind,
+    StereoDelay, SynthRack,
+};
 
 pub const RATE: u32 = 48_000;
 
@@ -51,11 +55,43 @@ pub struct Song {
     /// One `(pattern index, scene)` per chain entry.
     pub chain: Vec<(usize, Scene)>,
     pub tail_seconds: f64,
+    /// Eight one-shots for OtisKit lanes (the app's kit page).
+    pub kit: Option<Kit>,
+    pub echo: Option<echo::Params>,
+    pub delay_mode: DelayMode,
+    /// Note gates (opt-in, #25): gate-off releases envelopes, held full-gate steps retrigger.
+    pub note_gates: bool,
+}
+
+/// Host-owned kit memory, as the app's `kit.rs` provides it.
+pub struct Kit {
+    pub pcm: [Vec<i16>; otis_kit::SLOTS],
+    pub slots: [otis_kit::Slot; otis_kit::SLOTS],
+    pub lanes: [otis_kit::Lane; NUM_LANES],
+}
+
+impl otis_kit::Memory for Kit {
+    fn current(&self, slot: usize) -> Option<Sample<'_>> {
+        let pcm = self.pcm.get(slot)?;
+        (!pcm.is_empty()).then_some(Sample { generation: slot as u64 + 1, rate: RATE, pcm })
+    }
+    fn previous(&self, _lane: usize, slot: usize, generation: u64) -> Option<Sample<'_>> {
+        self.current(slot).filter(|s| s.generation == generation)
+    }
 }
 
 impl Song {
     pub fn new(bpm: f64) -> Self {
-        Self { bpm, patterns: Vec::new(), chain: Vec::new(), tail_seconds: 6.0 }
+        Self {
+            bpm,
+            patterns: Vec::new(),
+            chain: Vec::new(),
+            tail_seconds: 6.0,
+            kit: None,
+            echo: None,
+            delay_mode: DelayMode::Slapback,
+            note_gates: false,
+        }
     }
 
     /// Adds a pattern, plays it `repeats` times under `scene`, and returns its index.
@@ -95,6 +131,7 @@ pub fn render(song: &Song, keep_stems: bool) -> Rendered {
         sample_rate: f64::from(RATE),
         ..EngineConfig::default()
     });
+    player.evaluator.set_retrigger_held_notes(song.note_gates);
     player.set_chain(chain);
     player.launch(LaunchTarget::Chain, song.patterns.len());
     player.evaluator.playing = true;
@@ -103,6 +140,15 @@ pub fn render(song: &Song, keep_stems: bool) -> Rendered {
     let mut rack = SynthRack::new(RATE as f32);
     rack.set_lane_channels(first.channels);
     rack.set_lane_patches(first.patches);
+    rack.set_note_release_lanes(if song.note_gates { 0xff } else { 0 });
+    if let Some(echo) = song.echo {
+        rack.set_echo_params(echo);
+    }
+    rack.set_tempo(song.bpm);
+    if let Some(kit) = &song.kit {
+        rack.set_kit_controls(kit.slots, kit.lanes);
+    }
+    rack.set_delay_mode(song.delay_mode);
     rack.reset_voices();
     rack.set_bender_params(first.bender);
     rack.reset_master(first.send);
@@ -113,6 +159,20 @@ pub fn render(song: &Song, keep_stems: bool) -> Rendered {
     let mut stems = [[0.0; 2]; NUM_LANES];
     let mut entry = Some(0);
     let mut wraps = 0;
+    let samples = CaptureSamples {
+        kit: song.kit.as_ref().map(|kit| kit as &dyn otis_kit::Memory),
+        ..CaptureSamples::default()
+    };
+    let mut echo_storage = if song.echo.is_some_and(|e| e.echo_mix > 0.0) {
+        vec![[0.0; 2]; echo::capacity(RATE as f32)]
+    } else {
+        Vec::new()
+    };
+    let mut delays: Box<[StereoDelay; NUM_LANES]> = Box::new(std::array::from_fn(|_| {
+        let mut delay = StereoDelay::new(RATE as f32);
+        delay.set_mode(song.delay_mode);
+        delay
+    }));
     for frame in 0..frames {
         if frame == music {
             player.evaluator.playing = false;
@@ -135,7 +195,9 @@ pub fn render(song: &Song, keep_stems: bool) -> Rendered {
         if retrigger {
             rack.retrigger_gates();
         }
-        let (left, right) = rack.render_stereo_with_stems(&cv, &mut stems);
+        let ((left, right), _) = rack.render_session_with_echo_stems(
+            &cv, &samples, &mut stems, &mut delays, &mut echo_storage,
+        );
         out.master.push([left, right]);
         if keep_stems {
             out.stems.push(stems);
@@ -325,5 +387,106 @@ pub fn default_scene(patches: [LanePatch; NUM_LANES]) -> Scene {
         channels: [channel(0.8, 0.0, 0.0, 0.0); NUM_LANES],
         bender: BenderParams::default(),
         send: 0.0,
+    }
+}
+
+// ---- synthetic one-shot kit ------------------------------------------------
+
+/// Eight synthesized one-shots (no recordings): kick, snare, closed hat, open
+/// hat, clap, rim, low tom, metal. Slot n plays from MIDI 60 + n.
+pub fn synth_kit(clock: u8) -> Kit {
+    let rate = RATE as f32;
+    let mut noise = 0x1234_5678u32;
+    let white = move || {
+        noise ^= noise << 13;
+        noise ^= noise >> 17;
+        noise ^= noise << 5;
+        noise as f32 / u32::MAX as f32 * 2.0 - 1.0
+    };
+    let make = |seconds: f32, f: &mut dyn FnMut(f32, f32) -> f32| -> Vec<i16> {
+        let n = (seconds * rate) as usize;
+        let mut hp = 0.0f32;
+        let mut prev = 0.0f32;
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / rate;
+                let x = f(t, 0.0);
+                // gentle DC blocker
+                hp = 0.995 * (hp + x - prev);
+                prev = x;
+                (hp.clamp(-1.0, 1.0) * 30_000.0) as i16
+            })
+            .collect()
+    };
+    use core::f32::consts::TAU;
+    let mut phase = 0.0f32;
+    let kick = make(0.55, &mut |t, _| {
+        let f = 48.0 + 160.0 * (-t * 38.0).exp();
+        phase += TAU * f / rate;
+        (phase.sin() * (-t * 6.5).exp() * 1.4).tanh()
+    });
+    let mut w = white.clone();
+    let mut lp = 0.0f32;
+    let snare = make(0.32, &mut |t, _| {
+        let n = w();
+        lp += 0.45 * (n - lp);
+        0.55 * (TAU * 186.0 * t).sin() * (-t * 28.0).exp() + 0.8 * (n - 0.6 * lp) * (-t * 13.0).exp()
+    });
+    let mut w2 = white.clone();
+    let mut hpz = (0.0f32, 0.0f32);
+    let mut hat = |len: f32, decay: f32, w: &mut dyn FnMut() -> f32| {
+        make(len, &mut |t, _| {
+            let n = w();
+            let y = n - hpz.0;
+            hpz.0 = n;
+            hpz.1 += 0.6 * (y - hpz.1);
+            let metal: f32 = [317.0, 421.0, 543.0, 687.0, 811.0, 1043.0]
+                .iter()
+                .map(|f| ((TAU * f * 6.0 * t).sin()).signum())
+                .sum::<f32>()
+                / 6.0;
+            (0.6 * hpz.1 + 0.35 * metal) * (-t * decay).exp()
+        })
+    };
+    let closed = hat(0.09, 55.0, &mut w2);
+    let mut w3 = white.clone();
+    let open = hat(0.6, 7.0, &mut w3);
+    let mut w4 = white.clone();
+    let mut bp = (0.0f32, 0.0f32);
+    let clap = make(0.4, &mut |t, _| {
+        let n = w4();
+        // two-pole bandpass near 1.2 kHz
+        let f = 2.0 * (core::f32::consts::PI * 1200.0 / rate).sin();
+        bp.0 += f * bp.1;
+        let high = n - bp.0 - 0.5 * bp.1;
+        bp.1 += f * high;
+        let env = if t < 0.03 {
+            (-((t * 1000.0) % 10.0) * 0.35).exp()
+        } else {
+            (-(t - 0.03) * 16.0).exp()
+        };
+        1.8 * bp.1 * env
+    });
+    let rim = make(0.08, &mut |t, _| {
+        ((TAU * 1700.0 * t).sin() * 0.7 + (TAU * 480.0 * t).sin() * 0.5) * (-t * 70.0).exp()
+    });
+    let mut ph2 = 0.0f32;
+    let tom = make(0.6, &mut |t, _| {
+        let f = 92.0 + 60.0 * (-t * 18.0).exp();
+        ph2 += TAU * f / rate;
+        ph2.sin() * (-t * 7.0).exp()
+    });
+    let metal = make(1.2, &mut |t, _| {
+        [(540.0, 1.0), (812.0, 0.7), (1263.0, 0.5), (1987.0, 0.35)]
+            .iter()
+            .map(|&(f, a)| a * (TAU * f * t).sin())
+            .sum::<f32>()
+            * 0.45
+            * (-t * 3.2).exp()
+    });
+    Kit {
+        pcm: [kick, snare, closed, open, clap, rim, tom, metal],
+        slots: [otis_kit::Slot::default(); otis_kit::SLOTS],
+        lanes: [otis_kit::Lane { bytebus: false, clock, drop_samples: false }; NUM_LANES],
     }
 }

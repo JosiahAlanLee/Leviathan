@@ -1,4 +1,4 @@
-//! Long demo songs that put all seventeen machines to work, rendered offline
+//! Long demo songs that put all eighteen machines to work, rendered offline
 //! through the same `SongPlayer` + `SynthRack` path as the app's WAV export.
 //!
 //! `cargo run --release -p leviathan-dsp --example voice_demos -- <out-dir> [track]`
@@ -38,6 +38,7 @@ fn trim(machine: MachineKind) -> f32 {
         OtisTwin => -28.0,
         Fs77FormantFm => -25.1,
         VastTriple => -25.0,
+        OtisKit => -34.0,
     };
     10f32.powf((-29.0 - rms_db) / 20.0)
 }
@@ -78,6 +79,7 @@ struct Track {
     bpm: f64,
     entries: usize,
     build: fn(usize) -> (Pattern, Scene),
+    setup: fn(&mut Song),
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +107,7 @@ fn tour(e: usize) -> (Pattern, Scene) {
         OtisTwin => (2, 5),
         Fs77FormantFm => (3, 1),
         VastTriple => (3, 1),
+        OtisKit => (1, 3),
     };
     let drum = matches!(machine, KickDrum | ElectroPerc | NoiseWash);
     let mut p = empty();
@@ -573,12 +576,250 @@ fn byte_bus(e: usize) -> (Pattern, Scene) {
     (p, scene)
 }
 
-const TRACKS: [Track; 5] = [
-    Track { file: "00-voice-tour", title: "Voice tour", bpm: 120.0, entries: 34, build: tour },
-    Track { file: "01-undertow", title: "Undertow", bpm: 132.0, entries: 48, build: undertow },
-    Track { file: "02-phase-garden", title: "Phase Garden", bpm: 118.0, entries: 48, build: phase_garden },
-    Track { file: "03-cold-tables", title: "Cold Tables", bpm: 92.0, entries: 36, build: cold_tables },
-    Track { file: "04-byte-bus", title: "Byte Bus", bpm: 140.0, entries: 52, build: byte_bus },
+// ---------------------------------------------------------------------------
+// 5. KIT MACHINE: 124 bpm. Two OtisKit lanes on the synthetic kit (lane 0 at
+//    the top chip rate, lane 1 at the gritty 29.8 kHz rate), Sub Bass, OTIS
+//    Twin lead whose Mode/Grit walks one-shot -> bidir -> forward-wrap with
+//    rising grit, held VAST Triple chords, long ping-pong delay, transport-
+//    synced SpoonBender echo with ESP colouration. Note gates on.
+// ---------------------------------------------------------------------------
+
+const K_KICK: u8 = 60;
+const K_SNARE: u8 = 61;
+const K_CH: u8 = 62;
+const K_OH: u8 = 63;
+const K_CLAP: u8 = 64;
+const K_RIM: u8 = 65;
+const K_TOM: u8 = 66;
+const K_METAL: u8 = 67;
+
+/// OtisKit's hit gain falls 0.375 dB per step below 127 (velocity 94 is
+/// -18.75 dB, 52 is about -44 dB), so musical 0..127 dynamics map into 100..127.
+fn kit_cell(slot: u8, velocity: u8) -> leviathan_core::NoteCell {
+    note(slot, 100 + (u16::from(velocity.min(127)) * 27 / 127) as u8, 0.5)
+}
+
+fn kit_machine(e: usize) -> (Pattern, Scene) {
+    let sec = e / 4;
+    let last = e % 4 == 3;
+    let roots = [41i32, 41, 44, 39];
+    let kick = !matches!(sec, 0 | 3) || (sec == 3 && e % 4 >= 2);
+    let hats = matches!(sec, 1 | 2 | 4 | 5);
+    let lead = matches!(sec, 1..=5);
+    let pads = matches!(sec, 0 | 2 | 3 | 5);
+    // Mode/Grit walk across the piece: one-shot, bidir, forward-wrap.
+    let scan = match sec {
+        0 | 1 => leviathan_dsp::TwinLoopMode::OneShot,
+        2 | 3 => leviathan_dsp::TwinLoopMode::Bidir,
+        _ => leviathan_dsp::TwinLoopMode::FwdWrap,
+    };
+    let mut p = empty();
+    for row in 0..64 {
+        let (bar, s) = (row / 16, row % 16);
+        let root = roots[bar];
+        let seed = e * 64 + row;
+        let t = row as f32 / 64.0;
+        if kick && s % 4 == 0 {
+            put(&mut p, 0, row, kit_cell(K_KICK, if s == 0 { 127 } else { 118 }));
+        } else if kick && matches!(s, 4 | 12) && sec >= 2 {
+            put(&mut p, 0, row, kit_cell(if sec >= 4 { K_CLAP } else { K_SNARE }, 112));
+        }
+        if sec == 3 && s % 2 == 0 && bar >= 2 {
+            put(&mut p, 0, row, kit_cell(K_TOM, 70 + 3 * s as u8).with(lock(&[(1, 0.5 + 0.02 * (s as f32 - 8.0))])));
+        }
+        if kick && last && bar == 3 && s >= 13 {
+            put(&mut p, 0, row, kit_cell(K_SNARE, 96).ratchet(if s == 15 { 4 } else { 2 }));
+        }
+        if hats {
+            let cell = if s % 4 == 2 {
+                kit_cell(K_OH, 96)
+            } else if s % 2 == 1 {
+                kit_cell(K_CH, vel(74, 34, seed))
+            } else {
+                kit_cell(K_CH, vel(52, 24, seed))
+            };
+            put(&mut p, 1, row, cell);
+            if matches!(s, 7 | 11) && sec >= 4 {
+                put(&mut p, 1, row, kit_cell(K_RIM, 90).chance(70));
+            }
+        }
+        if sec == 0 && s == 8 && bar % 2 == 1 {
+            put(&mut p, 1, row, kit_cell(K_METAL, 84).with(lock(&[(1, 0.38)])));
+        }
+        if kick && sec != 3 && matches!(s, 2 | 3 | 7 | 10 | 11 | 14) {
+            let gate = if matches!(s, 2 | 10) { 1.0 } else { 0.35 };
+            put(&mut p, 2, row, note(root as u8, vel(110, 10, seed), gate));
+        }
+        if lead {
+            const LINE: [i32; 16] = [12, -1, 7, -1, 10, 12, -1, 3, -1, 7, -1, 15, 12, -1, 10, -1];
+            if LINE[s] >= 0 {
+                let grit = ((e % 8) as f32 + t) / 8.0;
+                let gate = if matches!(s, 11 | 12) { 1.0 } else { 0.4 };
+                put(&mut p, 3, row, note((root + LINE[s]) as u8, vel(100, 20, seed), gate)
+                    .with(lock(&[(7, scan.encode(grit)), (2, 0.15 + 0.6 * wave(t + e as f32 * 0.25))])));
+            }
+        }
+        if pads && s == 0 {
+            // Held chord: four full-gate steps in a row, which retrigger under note gates,
+            // then a short release gap before the next bar.
+            for k in 0..12 {
+                let chord = [0, 3, 7][k % 3];
+                put(&mut p, 4, row + k, note((root + 12 + chord) as u8, 88, if k == 11 { 0.6 } else { 1.0 }));
+            }
+        }
+        if sec >= 4 && s == 6 && bar % 2 == 0 {
+            put(&mut p, 5, row, note((root + 24) as u8, 104, 0.3).with(lock(&[(1, 0.7), (3, 0.6)])));
+        }
+    }
+    let wet = matches!(sec, 0 | 3);
+    let scene = Scene {
+        patches: [
+            patch(OtisKit, &[]),
+            patch(OtisKit, &[(7, 0.42)]),
+            patch(SubBass, &[(1, 0.5)]),
+            patch(OtisTwin, &[(0, 0.4), (3, 0.7)]),
+            patch(VastTriple, &[(0, 0.2), (2, 0.35)]),
+            patch(Fs77FormantFm, &[]),
+        ],
+        channels: [
+            lane(OtisKit, 1.5, 0.0, 0.0, 0.05),
+            lane(OtisKit, 0.8, 0.2, 0.35, 0.1),
+            lane(SubBass, 1.15, 0.0, 0.0, 0.0),
+            lane(OtisTwin, 0.85, -0.15, 0.45, 0.3),
+            lane(VastTriple, 0.75, 0.25, 0.25, if wet { 0.6 } else { 0.25 }),
+            lane(Fs77FormantFm, 0.6, -0.3, 0.6, 0.4),
+        ],
+        bender: if wet { bend(0.48, 0.55, 0.75) } else { bend(0.5, 0.3, 0.4) },
+        send: if wet { 0.15 } else { 0.05 },
+    };
+    (p, scene)
+}
+
+fn kit_machine_setup(song: &mut Song) {
+    let mut kit = synth_kit(2);
+    kit.lanes[1].clock = 0;
+    kit.slots[3].decay = 0.7;
+    song.kit = Some(kit);
+    song.note_gates = true;
+    song.delay_mode = leviathan_dsp::DelayMode::LongPingPong;
+    song.echo = Some(leviathan_dsp::echo::Params {
+        echo_mix: 0.3,
+        sync: leviathan_dsp::echo::Sync::Transport,
+        ratio: 4,
+        feedback: 0.5,
+        tone: 0.45,
+        spread: 0.7,
+        esp: leviathan_dsp::esp::Mode::Rate224,
+        ..Default::default()
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 6. LONG NOTES: 96 bpm. Built to hear note lengths: Acid and CZ lines that
+//    mix short gates with runs of full-gate steps (retriggered under note
+//    gates), long OTIS Twin drones at high forward-wrap grit, FS77 formant
+//    calls into a free-time echo with the frequency shifter in the loop.
+// ---------------------------------------------------------------------------
+
+fn long_notes(e: usize) -> (Pattern, Scene) {
+    let sec = e / 4;
+    let roots = [38i32, 38, 34, 36];
+    let drums = matches!(sec, 1 | 2 | 4);
+    let acid = matches!(sec, 1..=4);
+    let mut p = empty();
+    for row in 0..64 {
+        let (bar, s) = (row / 16, row % 16);
+        let root = roots[bar];
+        let seed = e * 64 + row;
+        let t = row as f32 / 64.0;
+        if drums {
+            if matches!(s, 0 | 10) {
+                put(&mut p, 0, row, kit_cell(K_KICK, 124));
+            } else if s == 8 {
+                put(&mut p, 0, row, kit_cell(K_SNARE, 110));
+            } else if s % 2 == 1 && sec != 2 {
+                put(&mut p, 0, row, kit_cell(K_CH, vel(60, 30, seed)).chance(80));
+            }
+        }
+        if acid {
+            // Bars 0-1: staccato. Bars 2-3: same notes, runs of three full gates.
+            const LINE: [i32; 16] = [0, 0, 12, -1, 3, 3, 3, -1, 7, -1, 10, 10, 10, 12, -1, 5];
+            if LINE[s] >= 0 {
+                let held = bar >= 2;
+                let gate = if held && LINE[s] == LINE[(s + 15) % 16] || held && LINE[s] == LINE[(s + 1) % 16] { 1.0 } else { 0.25 };
+                let lane_n = if sec == 3 { 2 } else { 1 };
+                let machine = if lane_n == 1 { AcidLead } else { CzPhaseDist };
+                let _ = machine;
+                put(&mut p, lane_n, row, note((root + LINE[s]) as u8, vel(100, 24, seed), gate)
+                    .with(lock(&[(2, 0.25 + 0.4 * wave(t + e as f32 / 8.0)), (0, 0.35)])));
+            }
+        }
+        if s == 0 && bar % 2 == 0 && sec != 4 {
+            for k in 0..28 {
+                put(&mut p, 3, row + k, note((root - 12) as u8, 84, if k == 27 { 0.5 } else { 1.0 })
+                    .with(lock(&[(7, leviathan_dsp::TwinLoopMode::FwdWrap.encode(0.2 + 0.2 * sec as f32)), (2, t)])));
+            }
+        }
+        if matches!(sec, 0 | 3 | 5) && s == 12 && bar % 2 == 1 {
+            put(&mut p, 4, row, note((root + 24) as u8, 108, 0.6).with(lock(&[(1, hash(seed as u32)), (2, 0.6)])));
+        }
+        if matches!(sec, 2 | 4) && s % 8 == 4 {
+            put(&mut p, 5, row, note((root + 12) as u8, 96, 1.0));
+        }
+    }
+    let scene = Scene {
+        patches: [
+            patch(OtisKit, &[]),
+            patch(AcidLead, &[(3, 0.7), (1, 0.6)]),
+            patch(CzPhaseDist, &[]),
+            patch(OtisTwin, &[(0, 0.8), (6, 0.8)]),
+            patch(Fs77FormantFm, &[]),
+            patch(PolivoksSub, &[]),
+        ],
+        channels: [
+            lane(OtisKit, 1.4, 0.0, 0.1, 0.05),
+            lane(AcidLead, 0.8, 0.1, 0.35, 0.2),
+            lane(CzPhaseDist, 0.9, -0.1, 0.35, 0.2),
+            lane(OtisTwin, 0.9, 0.0, 0.2, 0.5),
+            lane(Fs77FormantFm, 0.7, 0.35, 0.7, 0.6),
+            lane(PolivoksSub, 0.8, -0.3, 0.2, 0.1),
+        ],
+        bender: bend(0.5, 0.35, 0.5),
+        send: 0.08,
+    };
+    (p, scene)
+}
+
+fn long_notes_setup(song: &mut Song) {
+    song.kit = Some(synth_kit(1));
+    song.note_gates = true;
+    song.delay_mode = leviathan_dsp::DelayMode::Slapback;
+    song.echo = Some(leviathan_dsp::echo::Params {
+        echo_mix: 0.4,
+        time: 0.55,
+        feedback: 0.62,
+        tone: 0.4,
+        spread: 0.5,
+        shift_hz: -7.0,
+        shift_in_loop: true,
+        ..Default::default()
+    });
+}
+
+fn tour_setup(song: &mut Song) {
+    song.kit = Some(synth_kit(2));
+}
+
+fn no_setup(_: &mut Song) {}
+
+const TRACKS: [Track; 7] = [
+    Track { file: "00-voice-tour", title: "Voice tour", bpm: 120.0, entries: 36, build: tour, setup: tour_setup },
+    Track { file: "01-undertow", title: "Undertow", bpm: 132.0, entries: 48, build: undertow, setup: no_setup },
+    Track { file: "02-phase-garden", title: "Phase Garden", bpm: 118.0, entries: 48, build: phase_garden, setup: no_setup },
+    Track { file: "03-cold-tables", title: "Cold Tables", bpm: 92.0, entries: 36, build: cold_tables, setup: no_setup },
+    Track { file: "04-byte-bus", title: "Byte Bus", bpm: 140.0, entries: 52, build: byte_bus, setup: no_setup },
+    Track { file: "05-kit-machine", title: "Kit Machine", bpm: 124.0, entries: 24, build: kit_machine, setup: kit_machine_setup },
+    Track { file: "06-long-notes", title: "Long Notes", bpm: 96.0, entries: 24, build: long_notes, setup: long_notes_setup },
 ];
 
 fn main() -> std::io::Result<()> {
@@ -591,6 +832,7 @@ fn main() -> std::io::Result<()> {
             continue;
         }
         let mut song = Song::new(track.bpm);
+        (track.setup)(&mut song);
         for e in 0..track.entries {
             let (pattern, scene) = (track.build)(e);
             song.play(pattern, scene, 1);
@@ -623,6 +865,12 @@ fn main() -> std::io::Result<()> {
         }
         println!();
         write_wav(&out.join(format!("{}.wav", track.file)), &audio.master)?;
+        if std::env::var_os("VOICE_DEMO_STEMS").is_some() {
+            for lane in 0..NUM_LANES {
+                let stem: Vec<[f32; 2]> = audio.stems.iter().map(|s| s[lane]).collect();
+                write_wav(&out.join(format!("{}-lane{lane}.wav", track.file)), &stem)?;
+            }
+        }
     }
     Ok(())
 }
