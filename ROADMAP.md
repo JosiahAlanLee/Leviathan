@@ -336,6 +336,11 @@ Use what the walkthrough shows about panel order, keyboard navigation, and playb
 
 The Copper Relay walkthrough identified two display gaps addressed in the Voice / Trig deck. OTIS Twin's stored Mode/Grit value is decoded into scan mode and grit percentage. OtisKit shows the hit's velocity gain in dB alongside its MIDI velocity. Output peak checks measure clipping at the output. Use isolated stems to review deliberate voice coloration and changes in balance across sections.
 
+### Original voice gate follow-up
+
+- **Status** — Implemented in [771226b](https://github.com/JosiahAlanLee/Leviathan/commit/771226b4b1f4695c939d609f48c49f9292983a15). Voice / Trig (F2) sends `SetNoteGates` for the project mode and per-lane one-shot choice.
+- **Behavior** — The tracker signals a new attack on a continuous gate when the active step changes. KICK, FM4, SUB, AIR, ACID and CHRD use a 4 ms envelope time constant after gate-off, with full decay on lanes set to one-shot. New projects start with note gates enabled. Project files saved before this option retain their previous playback until it is enabled.
+
 ### `T32` – SpoonBender Clock-Ratio Stereo Echo and Dual Mix
 
 - **Status** — Implemented in [11168fe](https://github.com/JosiahAlanLee/Leviathan/commit/11168fe5e50df66c0cbe5590f385df102cc083d5). The Mixer sends `SetEchoParams`. Reset and seek clear the measured ByteBus period.
