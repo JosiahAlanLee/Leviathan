@@ -206,7 +206,7 @@ fn render(
     rack.set_kit_controls(project.instruments.kit.params, project.instruments.kit.lanes);
     rack.set_delay_mode(project.delay_mode);
     rack.reset_master(project.master_send);
-    let samples = CaptureSamples {
+    let mut samples = CaptureSamples {
         kit: Some(&project.instruments.kit),
         current: project
             .instruments
@@ -215,6 +215,8 @@ fn render(
             .map(crate::capture::Take::sample),
         ..CaptureSamples::default()
     };
+    let mut shader = project.instruments.shader_bus.replay(plan.target);
+    let ppqn = player.evaluator.config.ppqn;
 
     let mut echo_storage = if project.instruments.echo.echo_mix > 0.0 {
         vec![[0.0; 2]; echo::capacity(plan.settings.sample_rate as f32)]
@@ -240,6 +242,7 @@ fn render(
             player.evaluator.playing = false;
         }
         let (cv, retrigger) = player.step_sample(&project.patterns);
+        samples.ot2_frame = shader.step(&cv, ppqn);
         if retrigger {
             rack.retrigger_gates();
         }

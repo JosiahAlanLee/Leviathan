@@ -384,6 +384,12 @@ The Copper Relay walkthrough identified two display gaps addressed in the Voice 
 - **Acceptance** — Verify bit-exact output for identical input PCM, region, seed, smoothness, and amount under `--no-default-features`. Cover amount zero, short regions, seam and edge continuity, stereo correlation, and bounded gain. Test that completion after capture, reload, or a newer mutation cannot overwrite the current sample. Compare reopened PCM and live/WAV output.
 - **Behavioral reference** — [OtisLab REWORK](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/otislab/docs/MANUAL.md#rework)
 
+## Clocked shader return prototype
+
+- **Status** — Implemented in [83fa9d0](https://github.com/JosiahAlanLee/Leviathan/commit/83fa9d0a4754af9dc519a678152b2a74fd6e3ef2). Scene (F6) sends `SetShaderRoute`, `ShaderReply`, `ClearShaderField`, `RecordShaderTake` and `FinishShaderTake`. Routing (F4) shows the input and held return for the destination lane.
+- **Instrument** — Sample eight points from the feedback field and latch the byte on the next audio-owned ByteBus edge. A single OT2 lane reads the return as a frame address. Route the held byte back through Lookup to close the loop. Record the held words against the cued transport so WAV and stem export can replay them without a graphics context.
+- **Hardware check** — Play the route on the laptop while watching the missed-pulse count. For a modular patch, evaluate a separate return word with clock and reset against the Rack bridge parity fixtures below.
+
 ## External Elektron Engines
 
 Keep Machinemodule and Monomodule in their external AGPL Rack plugins with user-supplied OS images. DrumLab is retired. [Adapter license boundary](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/adapter/README.md#the-license-boundary) · [Gorgon preview manifest](https://github.com/JosiahAlanLee/Gorgon/blob/22b8d4f0d61e5955deae42f726d57a763b0d8968/docs/PREVIEW_RELEASE.md)

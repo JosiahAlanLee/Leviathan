@@ -21,6 +21,7 @@ use crate::capture::{Take, MAX_CAPTURE_FRAMES};
 use crate::kit::{Kit, KitSample};
 use crate::pcm;
 use crate::lane_mix::LaneMix;
+use crate::shader_bus;
 use crate::wav::{sample_peaks, DecodedWav};
 
 pub const PATTERN_BANK_CAPACITY: usize = 16;
@@ -58,6 +59,7 @@ pub struct InstrumentSettings {
     pub bbus: BbusSettings,
     pub otis: OtisSettings,
     pub oversample: OversampleSettings,
+    pub shader_bus: shader_bus::Patch,
 }
 
 /// FS77 and 4-Op FM at 4x with a band-limited Acid saw. Off (the default for
@@ -215,6 +217,8 @@ struct InstrumentFile {
     otis: OtisSettings,
     #[serde(skip_serializing_if = "OversampleSettings::is_default")]
     oversample: OversampleSettings,
+    #[serde(skip_serializing_if = "shader_bus::Patch::is_default")]
+    shader_bus: shader_bus::Patch,
 }
 
 impl InstrumentFile {
@@ -227,6 +231,7 @@ impl InstrumentFile {
             && self.bbus.is_default()
             && self.otis.is_default()
             && self.oversample.is_default()
+            && self.shader_bus.is_default()
     }
 }
 
@@ -595,6 +600,9 @@ impl ProjectFile {
         {
             return Err("Invalid pattern bank or selection".to_string());
         }
+        if !self.instruments.shader_bus.is_valid(self.patterns.len()) {
+            return Err("Invalid ByteBus shader route or take".into());
+        }
         if self.chain.len() > MAX_CHAIN_ENTRIES
             || self
                 .chain
@@ -652,6 +660,7 @@ impl ProjectFile {
                 bbus: self.instruments.bbus,
                 otis: self.instruments.otis,
                 oversample: self.instruments.oversample,
+                shader_bus: self.instruments.shader_bus,
             },
         })
     }
@@ -714,6 +723,13 @@ pub fn save(path: &Path, project: Project) -> Result<(), String> {
     if !project.instruments.kit.is_valid() || !project.instruments.echo.is_valid() {
         return Err("Invalid OtisKit or BEND Echo settings".into());
     }
+    if !project
+        .instruments
+        .shader_bus
+        .is_valid(project.patterns.len())
+    {
+        return Err("Invalid ByteBus shader route or take".into());
+    }
     let project = ProjectFile {
         version: PROJECT_VERSION,
         bpm: project.bpm,
@@ -746,6 +762,7 @@ pub fn save(path: &Path, project: Project) -> Result<(), String> {
             bbus: project.instruments.bbus,
             otis: project.instruments.otis,
             oversample: project.instruments.oversample,
+            shader_bus: project.instruments.shader_bus,
         },
     };
     let mut bytes = serde_json::to_vec(&project).map_err(|error| error.to_string())?;

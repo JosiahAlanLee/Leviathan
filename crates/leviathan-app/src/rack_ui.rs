@@ -118,6 +118,7 @@ pub fn draw_routing(
     allow_lane_source: bool,
     has_take: bool,
     live_word: Option<u8>,
+    shader_uses_lookup: bool,
     routing_error: bool,
 ) {
     egui::CollapsingHeader::new("Sample and ByteBus routing").default_open(true).show(ui, |ui| {
@@ -173,7 +174,7 @@ pub fn draw_routing(
         ui.checkbox(&mut routing.frame_bytebus, "Clock OTIS frames from ByteBus");
         ui.separator();
         ui.checkbox(&mut routing.bytebus.enabled, "Register → Lookup → BBUS");
-        if routing.bytebus.enabled || routing.frame_bytebus {
+        if routing.bytebus.enabled || routing.frame_bytebus || shader_uses_lookup {
             ui.add(egui::DragValue::new(&mut routing.bytebus.reset_word).prefix("Reset word "));
             let label = |lookup| match lookup {
                 ByteLookup::Identity => "Identity",

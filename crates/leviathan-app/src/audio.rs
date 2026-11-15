@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use leviathan_core::rack_routing::RackRouting;
+use leviathan_core::rack_routing::{ByteRoute, RackRouting};
 use leviathan_core::{
     AutomationRow, CvFrame, EngineConfig, LaunchTarget, NoteCell, Pattern, PatternChain,
     SongPlayer, SongStatus, SoundLock, NUM_LANES, ROWS_PER_PATTERN,
@@ -21,6 +21,7 @@ use crate::midi::{MidiEvent, MidiKey, MidiReceiver, MidiTarget, MIDI_QUEUE_CAPAC
 use crate::project::{
     BbusSettings, NoteGateSettings, OtisSettings, OversampleSettings, Project, PATTERN_BANK_CAPACITY,
 };
+use crate::shader_bus;
 
 pub enum AudioCommand {
     SetPlaying {
@@ -53,6 +54,11 @@ pub enum AudioCommand {
     SetOtis(OtisSettings),
     SetOversample(OversampleSettings),
     SetRackRouting(RackRouting),
+    SetShaderRoute(shader_bus::Route),
+    ShaderReply(shader_bus::Reply),
+    ClearShaderField,
+    RecordShaderTake(Arc<shader_bus::Recorder>),
+    FinishShaderTake,
     InstallTake(Arc<Take>),
     ArmCapture,
     CancelCapture,
@@ -134,6 +140,7 @@ pub struct AudioProject {
     otis: OtisSettings,
     oversample: OversampleSettings,
     routing: RackRouting,
+    shader_route: shader_bus::Route,
     take: Option<Arc<Take>>,
     kit: Kit,
     echo: echo::Params,
@@ -160,6 +167,7 @@ impl AudioProject {
             otis: project.instruments.otis,
             oversample: project.instruments.oversample,
             routing: project.instruments.routing,
+            shader_route: project.instruments.shader_bus.route,
             take: project.instruments.take.clone(),
             kit: project.instruments.kit.clone(),
             echo: project.instruments.echo,
@@ -193,6 +201,7 @@ enum RetainedSnapshot {
     KitSample(Arc<KitSample>),
     Kit(Arc<Kit>),
     Audition(Arc<audition::Request>),
+    ShaderTake(Arc<shader_bus::Recorder>),
 }
 
 impl RetainedSnapshot {
@@ -205,6 +214,7 @@ impl RetainedSnapshot {
             Self::KitSample(sample) => Arc::strong_count(sample) > 1,
             Self::Kit(kit) => Arc::strong_count(kit) > 1,
             Self::Audition(audition) => Arc::strong_count(audition) > 1,
+            Self::ShaderTake(take) => Arc::strong_count(take) > 1,
         }
     }
 }
@@ -257,6 +267,7 @@ impl AudioControl {
             }
             AudioCommand::SetKit(kit) => Some(RetainedSnapshot::Kit(Arc::clone(kit))),
             AudioCommand::Audition(request) => Some(RetainedSnapshot::Audition(Arc::clone(request))),
+            AudioCommand::RecordShaderTake(take) => Some(RetainedSnapshot::ShaderTake(Arc::clone(take))),
             AudioCommand::ReplaceProject(project) => {
                 Some(RetainedSnapshot::Project(Arc::clone(project)))
             }
@@ -307,6 +318,7 @@ pub struct AudioTelemetry {
     pub kit_sounding: [u8; NUM_LANES],
     /// Tempo of an incoming MIDI clock while it is followed and running.
     pub midi_clock_bpm: Option<f32>,
+    pub shader: shader_bus::Status,
 }
 
 #[derive(Clone, Copy)]
@@ -339,6 +351,8 @@ struct RtAudioWorker {
     audition: audition::Player,
     recorder: Option<Recorder>,
     last_playing_beat: Option<f64>,
+    shader: shader_bus::Clock,
+    shader_lookup: ByteRoute,
     /// Stamped MIDI events waiting for their sample within this block.
     pending_midi: Box<[(u32, MidiEvent)]>,
     pending_len: usize,
@@ -420,6 +434,8 @@ impl RtAudioWorker {
             audition: audition::Player::default(),
             recorder: None,
             last_playing_beat: None,
+            shader: shader_bus::Clock::default(),
+            shader_lookup: ByteRoute::default(),
             pending_midi: vec![(0, MidiEvent::Stop); MIDI_QUEUE_CAPACITY].into_boxed_slice(),
             pending_len: 0,
             pending_next: 0,
@@ -476,7 +492,24 @@ impl RtAudioWorker {
                 AudioCommand::SetOtis(otis) => self.synth.set_otis_warm_tables(otis.warm_tables),
                 AudioCommand::SetOversample(o) => self.synth.set_alias_grit_lanes(o.grit_lanes()),
                 AudioCommand::SetRackRouting(routing) => {
-                    self.synth.set_routing(routing);
+                    if self.synth.set_routing(routing) {
+                        self.shader_lookup = routing.bytebus;
+                    }
+                }
+                AudioCommand::SetShaderRoute(route) => {
+                    self.shader.set_route(route);
+                    self.tel_divider = 255;
+                }
+                AudioCommand::ShaderReply(reply) => self.shader.reply(reply),
+                AudioCommand::ClearShaderField => {
+                    self.shader.clear_field();
+                    self.tel_divider = 255;
+                }
+                AudioCommand::RecordShaderTake(take) => self.shader.record(take),
+                AudioCommand::FinishShaderTake
+                | AudioCommand::Launch(_)
+                | AudioCommand::SetChain(_) => {
+                    self.shader.finish_recording();
                 }
                 AudioCommand::InstallTake(take) => {
                     self.takes
@@ -491,6 +524,7 @@ impl RtAudioWorker {
                     self.cancel_capture();
                     self.last_playing_beat = None;
                     self.synth.reset_transport_clocks();
+                    self.shader.reset_transport();
                     self.tel_divider = 255;
                 }
                 AudioCommand::CancelCapture => self.cancel_capture(),
@@ -535,6 +569,9 @@ impl RtAudioWorker {
                     self.synth.set_otis_warm_tables(project.otis.warm_tables);
                     self.synth.set_alias_grit_lanes(project.oversample.grit_lanes());
                     self.synth.set_routing(project.routing);
+                    self.shader.reset_transport();
+                    self.shader.set_route(project.shader_route);
+                    self.shader_lookup = project.routing.bytebus;
                     self.synth.reset_voices();
                     self.synth.reset_byte_route();
                     self.takes
@@ -581,6 +618,7 @@ impl RtAudioWorker {
                     if !playing {
                         self.cancel_capture();
                         self.last_playing_beat = None;
+                        self.shader.finish_recording();
                     }
                 }
                 AudioCommand::PlayFromRow {
@@ -590,6 +628,8 @@ impl RtAudioWorker {
                     self.cancel_capture();
                     self.last_playing_beat = None;
                     self.synth.reset_transport_clocks();
+                    self.shader.reset_transport();
+                    self.tel_divider = 255;
                 }
                 AudioCommand::SetMidiTarget(target) => self.midi_target = target,
                 AudioCommand::SetMidiClockFollow(follow) => {
@@ -709,9 +749,11 @@ impl RtAudioWorker {
                         if matches!(event, MidiEvent::Start | MidiEvent::Stop) {
                             self.cancel_capture();
                             self.last_playing_beat = None;
+                            self.shader.finish_recording();
                         }
                         if event == MidiEvent::Start {
                             self.synth.reset_transport_clocks();
+                            self.shader.reset_transport();
                         }
                         self.tel_divider = 255;
                     }
@@ -747,6 +789,7 @@ impl RtAudioWorker {
                 self.cancel_capture();
                 self.last_playing_beat = None;
                 self.synth.reset_transport_clocks();
+                self.shader.reset_transport();
             } else {
                 self.player.evaluator.playing = true;
             }
@@ -844,8 +887,12 @@ impl RtAudioWorker {
             )
         });
         self.last_playing_beat = self.player.evaluator.playing.then_some(cv.beat);
+        let shader_edge =
+            self.shader
+                .step(&cv, self.player.evaluator.config.ppqn, self.shader_lookup);
         let mut samples = self.takes.samples();
         samples.kit = Some(&self.kit);
+        samples.ot2_frame = self.shader.frame();
         let (pair, capture) = self.synth.render_session_with_echo(
             &render_cv, &samples, tap, &mut self.echo_storage,
         );
@@ -858,7 +905,8 @@ impl RtAudioWorker {
         };
         self.scope_tap.push_stereo(pair.0, pair.1);
         self.tel_divider = self.tel_divider.wrapping_add(1);
-        if retrigger
+        if shader_edge
+            || retrigger
             || cv.retrigger_mask != 0
             || cv.gate_v != self.last_reported_gates
             || (self.tel_divider & 255) == 0
@@ -886,6 +934,7 @@ impl RtAudioWorker {
                 echo_timing: self.synth.echo_timing(),
                 kit_sounding: self.synth.kit_sounding(),
                 midi_clock_bpm: self.clock.bpm.filter(|_| self.clock.active(self.sample_clock)),
+                shader: self.shader.status(),
             };
             // Carry the interval's peaks forward if the UI hasn't drained its ring yet.
             if self.tel_tx.push(telemetry).is_ok() {
@@ -1436,6 +1485,178 @@ mod tests {
             rendered.push(worker.next_stereo());
         }
         rendered
+    }
+
+    #[test]
+    fn shader_take_replays_the_clocked_ot2_performance_in_chain_export() {
+        use crate::export::{ExportJob, ExportRequest, ExportSettings, ExportSource};
+        use crate::project;
+        use crate::wav::WavEncoding;
+        use leviathan_core::rack_routing::LaneInput;
+        use leviathan_dsp::MachineKind;
+
+        let cc = eframe::CreationContext::_new_kittest(eframe::egui::Context::default());
+        let app = crate::LeviathanApp::with_audio(&cc, |_, _, _, _, _| Err("Offline".into()));
+        let directory =
+            std::env::temp_dir().join(format!("leviathan-shader-take-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let song_path = directory.join("return.leviathan.json");
+
+        for from_capture in [false, true] {
+            let mut song = app.project_snapshot();
+            song.bpm = 120.0;
+            let mut phrase = Pattern {
+                length: 4,
+                ..Pattern::default()
+            };
+            phrase.lanes[0][..4].fill(NoteCell {
+                active: true,
+                midi: 51,
+                velocity: 120,
+                gate_fraction: 1.0,
+                lock: SoundLock {
+                    machine: MachineKind::OtisTwin as i16,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            song.patterns = vec![phrase.clone(), phrase];
+            assert!(song.chain.push(0));
+            assert!(song.chain.push(1));
+            if from_capture {
+                let pcm = (0..512)
+                    .map(|i| {
+                        let sign = if i < 256 { 1 } else { -1 };
+                        let value = sign * if i % 256 < 128 { 8000 } else { -8000 };
+                        [value; 2]
+                    })
+                    .collect();
+                song.instruments.take = Take::new(48_000, pcm);
+                song.instruments.routing.inputs[0] = LaneInput::Capture;
+            }
+
+            let frames = 48_000;
+            let dry = render_test_project_live(&song, 24_000, 24_000);
+            song.instruments.shader_bus.route.lane = Some(0);
+            let (tx, rx) = rtrb::RingBuffer::new(16);
+            let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(32);
+            let mut audio = AudioControl::new(tx);
+            let mut worker = RtAudioWorker::new(Pattern::default(), 48_000.0, rx, tel_tx, None);
+            let recording = Arc::new(shader_bus::Recorder::new(LaunchTarget::Chain, 0));
+            audio.send(AudioCommand::ReplaceProject(Arc::new(
+                AudioProject::prepare(&song, 1),
+            )));
+            audio.send(AudioCommand::Launch(LaunchTarget::Chain));
+            audio.send(AudioCommand::Reset);
+            audio.send(AudioCommand::RecordShaderTake(recording.clone()));
+            audio.send(AudioCommand::SetPlaying {
+                playing: true,
+                request: 1,
+            });
+            worker.drain_commands();
+            let mut responded = None;
+            let mut live = Vec::with_capacity(frames);
+            for sample in 0..frames {
+                live.push(worker.next_stereo());
+                if sample % 113 == 0 {
+                    if let Some(request) = worker
+                        .shader
+                        .status()
+                        .request
+                        .filter(|&r| Some(r) != responded)
+                    {
+                        responded = Some(request);
+                        if request.pulse != 2 {
+                            let word = if request.pulse % 2 == 0 { 0 } else { 255 };
+                            audio.send(AudioCommand::ShaderReply(shader_bus::Reply {
+                                request,
+                                word,
+                                rotation: 0,
+                            }));
+                        }
+                        worker.drain_commands();
+                    }
+                }
+            }
+            audio.send(AudioCommand::FinishShaderTake);
+            worker.drain_commands();
+            assert!(recording.is_done());
+            let take = recording.snapshot().unwrap();
+            assert_eq!(take.words, [256, 0, 255, 255, 255, 0, 255, 0]);
+            assert!(live[6000..24_000]
+                .iter()
+                .zip(&dry[6000..])
+                .any(|(a, b)| (a.0 - b.0).abs() > 1e-4));
+            song.instruments.shader_bus.take = Some(take.clone());
+            project::save(&song_path, song).unwrap();
+            let reopened = project::load(&song_path).unwrap();
+            assert_eq!(reopened.instruments.shader_bus.take.as_ref(), Some(&take));
+
+            let destination = directory.join(if from_capture { "capture" } else { "rom" });
+            ExportJob::start(
+                reopened,
+                false,
+                ExportRequest {
+                    settings: ExportSettings {
+                        source: ExportSource::Chain,
+                        encoding: WavEncoding::Float32,
+                        stems: true,
+                        tail_seconds: 0.0,
+                        ..Default::default()
+                    },
+                    destination: destination.clone(),
+                },
+            )
+            .unwrap()
+            .finish()
+            .unwrap();
+            let master = std::fs::read(destination.join("master.wav")).unwrap();
+            let start = master.len() - frames * 8;
+            assert_eq!(&master[start - 8..start - 4], b"data");
+            for (index, frame) in master[start..].chunks_exact(8).enumerate() {
+                let left = f32::from_le_bytes(frame[..4].try_into().unwrap());
+                let right = f32::from_le_bytes(frame[4..].try_into().unwrap());
+                assert_eq!(
+                    (left, right),
+                    live[index],
+                    "capture {from_capture}, sample {index}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn followed_midi_restart_rejects_shader_results_from_the_previous_run() {
+        let (tx, rx) = rtrb::RingBuffer::new(8);
+        let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(8);
+        let mut audio = AudioControl::new(tx);
+        let mut worker = RtAudioWorker::new(Pattern::default(), 48_000.0, rx, tel_tx, None);
+        audio.send(AudioCommand::SetShaderRoute(shader_bus::Route {
+            lane: Some(0),
+            feedback: false,
+        }));
+        audio.send(AudioCommand::SetPlaying { playing: true, request: 1 });
+        worker.drain_commands();
+        worker.next_stereo();
+        let old = worker.shader.status().request.unwrap();
+
+        worker.handle_midi(MidiEvent::Clock);
+        worker.handle_midi(MidiEvent::Start);
+        assert!(!worker.player.evaluator.playing);
+        worker.handle_midi(MidiEvent::Clock);
+        worker.next_stereo();
+        let fresh = worker.shader.status().request.unwrap();
+        assert_eq!(fresh.pulse, 0);
+        assert_ne!(fresh.epoch, old.epoch);
+        for (request, word) in [(old, 255), (fresh, 0)] {
+            audio.send(AudioCommand::ShaderReply(shader_bus::Reply { request, word, rotation: 0 }));
+        }
+        worker.drain_commands();
+        for _ in 0..5_999 {
+            worker.next_stereo();
+        }
+        assert_eq!(worker.shader.frame(), Some((0, 0)));
     }
 
     #[test]

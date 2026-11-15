@@ -484,6 +484,7 @@ impl VoiceState {
         bus_word: Option<u8>,
         calibrated: bool,
         release_on_gate_off: bool,
+        ot2_frame: Option<u8>,
     ) -> f32 {
         let gate = cv.gate_v[lane] > 2.5;
         let velocity = cv.velocity_v[lane];
@@ -543,6 +544,10 @@ impl VoiceState {
                         .step(hz, sample_rate, trigger, &params, calibrated, None, warm)
                 }
                 MachineKind::OtisTwin => {
+                    let mut params = params;
+                    if let Some(word) = ot2_frame {
+                        params[2] = f32::from(word) / 255.0;
+                    }
                     self.otis_twin
                         .step(hz, sample_rate, gate, trigger, &params, calibrated, None)
                 }
@@ -749,6 +754,10 @@ impl VoiceState {
         } else {
             self.active_machine.unwrap_or(patch.machine)
         };
+        let ot2_frame = samples
+            .ot2_frame
+            .filter(|&(target, _)| target == lane)
+            .map(|(_, word)| word);
         if machine == MachineKind::OtisKit {
             let switching = self.active_machine != Some(machine);
             if switching {
@@ -769,7 +778,15 @@ impl VoiceState {
         }
         if input == LaneInput::Instrument {
             return [self.render(
-                cv, lane, patch, rate, sample_bank, bus_word, calibrated, release_on_gate_off,
+                cv,
+                lane,
+                patch,
+                rate,
+                sample_bank,
+                bus_word,
+                calibrated,
+                release_on_gate_off,
+                ot2_frame,
             ); 2];
         }
         let sampled = matches!(
@@ -789,7 +806,15 @@ impl VoiceState {
         if !captured && through.is_none() {
             self.capture.finish();
             return [self.render(
-                cv, lane, patch, rate, sample_bank, bus_word, calibrated, release_on_gate_off,
+                cv,
+                lane,
+                patch,
+                rate,
+                sample_bank,
+                bus_word,
+                calibrated,
+                release_on_gate_off,
+                ot2_frame,
             ); 2];
         }
 
@@ -853,6 +878,11 @@ impl VoiceState {
                         frame_byte
                     } else {
                         None
+                    };
+                    let bus = if machine == MachineKind::OtisTwin {
+                        ot2_frame.or(bus)
+                    } else {
+                        bus
                     };
                     self.capture.frames(take, bus)
                 });
