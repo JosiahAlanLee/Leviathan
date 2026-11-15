@@ -1,4 +1,4 @@
-use crate::voice::{approach, choice, noise, phase_step, pulse, sine, StateVariable};
+use crate::voice::{approach, choice, noise, phase_step, pulse, rate_g, rate_noise, sine, StateVariable};
 use crate::{fast_tanh, wrap_turns};
 use leviathan_core::SOUND_PARAMS;
 
@@ -46,20 +46,21 @@ impl Voice {
         let decay = decay * decay;
         self.sweep = approach(self.sweep, 0.0, 0.007, sample_rate);
         let body_hz = (hz * (0.45 + 1.3 * tune)).clamp(40.0, 1800.0);
-        let cutoff = 0.035 + 0.70 * tone * tone;
+        let cutoff = rate_g(0.035 + 0.70 * tone * tone, sample_rate);
+        let hiss = rate_noise(sample_rate);
         let raw = match mode {
             0 => {
                 let swept = body_hz * (1.0 + 3.2 * pitch_env * self.sweep);
                 let first = sine(self.advance(0, swept, sample_rate));
                 let second = sine(self.advance(1, swept * 1.52, sample_rate));
-                let wires = self.band.step(noise(rng), cutoff, 0.82, 0.0).band;
+                let wires = self.band.step(hiss * noise(rng), cutoff, 0.82, 0.0).band;
                 self.body = approach(self.body, 0.0, 0.018 + 0.34 * decay, sample_rate);
                 self.wire = approach(self.wire, 0.0, 0.027 + 0.58 * decay, sample_rate);
                 let membrane = 0.66 * first + 0.25 * (0.36 + 0.64 * self.sweep) * second;
                 membrane * self.body * (1.0 - 0.64 * snappy) + 1.5 * snappy * wires * self.wire
             }
             1 => {
-                let texture = self.band.step(noise(rng), cutoff, 0.53, 0.0).band;
+                let texture = self.band.step(hiss * noise(rng), cutoff, 0.53, 0.0).band;
                 let burst = clap_burst(self.age, clap_spacing);
                 self.wire = approach(self.wire, 0.0, 0.037 + 0.50 * decay, sample_rate);
                 self.body = 0.0;
@@ -69,7 +70,7 @@ impl Voice {
                 let swept = 2.3 * body_hz * (1.0 + 0.5 * pitch_env * self.sweep);
                 let first = sine(self.advance(0, swept, sample_rate));
                 let second = sine(self.advance(1, swept * (1.55 + 0.5 * spread), sample_rate));
-                let click = self.band.step(noise(rng), cutoff, 0.44, 0.0).band;
+                let click = self.band.step(hiss * noise(rng), cutoff, 0.44, 0.0).band;
                 self.body = approach(self.body, 0.0, 0.009 + 0.17 * decay, sample_rate);
                 self.wire = approach(self.wire, 0.0, 0.003 + 0.014 * decay, sample_rate);
                 (0.53 * first + 0.39 * second) * self.body + 0.80 * snappy * click * self.wire
@@ -87,8 +88,8 @@ impl Voice {
                 let metal = 0.37 * square[0] * square[3]
                     + 0.32 * square[1] * square[4]
                     + 0.31 * square[2] * square[5];
-                let high = self.highpass.step(metal, 0.14 + 0.38 * tone, 1.2, 0.0).high;
-                let band = self.band.step(high, 0.34 + 0.43 * tone, 0.85, 0.0).band;
+                let high = self.highpass.step(metal, rate_g(0.14 + 0.38 * tone, sample_rate), 1.2, 0.0).high;
+                let band = self.band.step(high, rate_g(0.34 + 0.43 * tone, sample_rate), 0.85, 0.0).band;
                 self.body = approach(self.body, 0.0, 0.012 + 1.25 * decay, sample_rate);
                 self.wire = 0.0;
                 (0.31 * high + (0.55 + 0.37 * snappy) * band) * self.body

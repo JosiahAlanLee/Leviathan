@@ -1,8 +1,12 @@
-use crate::voice::{approach, choice, phase_step, pulse, saw, sine, triangle, StateVariable};
+use crate::voice::{
+    approach, choice, phase_step, pulse, rate_g, rate_samples, saw, sine, triangle, StateVariable,
+};
 use crate::{fast_tanh, wrap_turns};
 use leviathan_core::SOUND_PARAMS;
 
-const COMB_SAMPLES: usize = 256;
+/// Comb length tuned at 48 kHz; the buffer holds twice that for 96 kHz.
+const COMB_TUNED: usize = 256;
+const COMB_SAMPLES: usize = 2 * COMB_TUNED;
 const ALGORITHM_COUNT: usize = 4;
 const EQUATION_COUNT: usize = 5;
 
@@ -134,12 +138,14 @@ impl Voice {
             }
             _ => {
                 let osc = source(pulse(self.phase, step, 0.45)) * gain;
-                let delay = 8 + (warp * (COMB_SAMPLES - 8) as f32) as usize;
+                let delay = (rate_samples(8.0 + (warp * (COMB_TUNED - 8) as f32) as u32 as f32, sample_rate)
+                    as usize)
+                    .clamp(1, COMB_SAMPLES - 1);
                 self.allpass_comb(osc, delay, 0.35 + 0.45 * warp)
             }
         };
         let cutoff = (cutoff + 0.25 * depth * (modulation - 0.5)).clamp(0.0, 1.0);
-        let g = 0.01 + 0.84 * cutoff * cutoff;
+        let g = rate_g(0.01 + 0.84 * cutoff * cutoff, sample_rate);
         let damping = 1.60 - 1.42 * resonance;
         let input = if algorithm == 3 {
             shaped

@@ -637,7 +637,9 @@ impl VoiceState {
                 let drive = 1.6 + (lock.values[1] - 0.5) * 2.0;
                 fast_tanh(drive * (0.65 * fast_sin_turns(self.phase) + 0.35 * saw)) * self.env
             }
-            MachineKind::NoiseWash => noise * self.env * (0.55 + (lock.values[1] - 0.5) * 0.70),
+            MachineKind::NoiseWash => {
+                noise * voice::rate_noise(sample_rate) * self.env * (0.55 + (lock.values[1] - 0.5) * 0.70)
+            }
             MachineKind::VarSampler => {
                 self.sampler
                     .step_sample_gated(sample_bank, base_hz, sample_rate, &lock, gate)
@@ -670,7 +672,7 @@ impl VoiceState {
             (0.22 + (lock.values[2] - 0.5) * 0.8 + 0.52 * self.env).clamp(0.05, 0.88)
         }
         .clamp(0.04, 0.88);
-        let g = (cutoff_norm * 0.72).clamp(0.01, 0.78);
+        let g = voice::rate_g((cutoff_norm * 0.72).clamp(0.01, 0.78), sample_rate);
         let base_k = if matches!(machine, MachineKind::AcidLead) {
             0.55_f32
         } else {

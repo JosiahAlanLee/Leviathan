@@ -108,7 +108,7 @@ impl Voice {
         let output = if mod_mode <= 0.5 {
             mixed + (2.0 * mod_mode) * (a * b - mixed)
         } else {
-            a * b + (2.0 * mod_mode - 1.0) * (a * noise(rng) - a * b)
+            a * b + (2.0 * mod_mode - 1.0) * (a * (noise(rng) * crate::voice::rate_noise(sample_rate)).clamp(-1.0, 1.0) - a * b)
         };
         let gain = if calibrated { 0.76 } else { 1.0 };
         output * self.amp * gain

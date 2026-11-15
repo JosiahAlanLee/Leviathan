@@ -326,8 +326,9 @@ fn cutoff_curve(value: f32) -> f32 {
 }
 
 #[inline]
+/// The g tuned at 48 kHz (and its clamps), re-warped to `rate`.
 fn filter_coefficient(hz: f32, rate: f32, ceiling: f32) -> f32 {
-    (PI * hz / rate).clamp(0.008, ceiling)
+    crate::voice::rate_g((PI * hz / crate::voice::REFERENCE_RATE).clamp(0.008, ceiling), rate)
 }
 
 #[inline]
