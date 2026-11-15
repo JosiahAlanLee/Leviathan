@@ -254,7 +254,7 @@ impl Voice {
         // Grit lowers the scanner update rate and address precision. The
         // accumulator still advances every sample so pitch stays independent.
         if self.hold == 0 {
-            self.hold = (grit * grit * 15.0) as u8;
+            self.hold = crate::voice::rate_samples((grit * grit * 15.0) as u32 as f32, sample_rate).min(255.0) as u8;
             let discarded = (grit * 12.0) as u32;
             let phase = (self.phase >> discarded) << discarded;
             let frame = (self.frame * ((FRAMES - 1) as u32 * FRACTION) as f32 + 0.5) as u32;
@@ -273,8 +273,8 @@ impl Voice {
             self.hold -= 1;
         }
         let input = self.held_sample - 0.88 * k2 * self.filtered[1];
-        let first = 0.012 + 0.78 * k1 * k1;
-        let second = 0.04 + 0.68 * k1;
+        let first = crate::voice::rate_coef(0.012 + 0.78 * k1 * k1, sample_rate);
+        let second = crate::voice::rate_coef(0.04 + 0.68 * k1, sample_rate);
         self.filtered[0] += first * (input - self.filtered[0]);
         self.filtered[1] += second * (self.filtered[0] - self.filtered[1]);
         let sample = if calibrated {

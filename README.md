@@ -67,6 +67,10 @@ Leviathan uses a strict hexagonal ("ports and adapters") layout so external GPU,
 
 - **Oversample FM and Acid** (in **Voice / Trig** on FS77, 4-Op FM and Acid lanes) runs FS77 and the 4-Op FM operators at four times the output rate through a 96-tap decimator and band-limits Acid's saw (polyBLEP), so high notes and deep modulation no longer fold back as low, inharmonic tones. **Lane grit** keeps a lane at the original single rate. New sessions turn it on; projects saved earlier keep the original rendering. Six oversampled FS77 lanes take about a fifth of one core.
 
+## Sample-rate independence
+
+- Voices tuned with per-sample filter coefficients, decays, delays and noise at 48 kHz now convert them for the device rate, so a project sounds the same at 44.1, 48 and 96 kHz. At 48 kHz every voice renders bit-identically to before (FS77 changes only through its 4x oversampling). Remaining differences across rates are within about 2 dB except grit controls that hold whole samples, FS77's ResoDac and VAST Triple's PreTilt at their extremes (3-5 dB).
+
 ## OTIS warm tables
 
 - **OTIS warm tables** (in **Voice / Trig** when the lane plays OTIS) adds a darker twin of each transwave table. **TableSel** then alternates bright and warm: the lower half of each quarter plays the original table, the upper half its twin (formant swept lower, partials rolled off above the fourth harmonic, peak-matched). New sessions turn it on; projects saved earlier keep the four bright tables.
