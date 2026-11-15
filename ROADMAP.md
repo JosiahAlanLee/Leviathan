@@ -341,6 +341,11 @@ The Copper Relay walkthrough identified two display gaps addressed in the Voice 
 - **Status** — Implemented in [771226b](https://github.com/JosiahAlanLee/Leviathan/commit/771226b4b1f4695c939d609f48c49f9292983a15). Voice / Trig (F2) sends `SetNoteGates` for the project mode and per-lane one-shot choice.
 - **Behavior** — The tracker signals a new attack on a continuous gate when the active step changes. KICK, FM4, SUB, AIR, ACID and CHRD use a 4 ms envelope time constant after gate-off, with full decay on lanes set to one-shot. New projects start with note gates enabled. Project files saved before this option retain their previous playback until it is enabled.
 
+### Timbre rendering follow-up
+
+- **Status** — Implemented in [dcf0e3f](https://github.com/JosiahAlanLee/Leviathan/commit/dcf0e3fdca33dacee1fe452c1be06aaf4486b077). Voice / Trig (F2) shows the BBUS, OTIS and oversampling controls for the machine selected by the current tab and labels each control's scope.
+- **Behavior** — FM4 and FS77 start with fresh filter history when oversampling changes. OtisKit band-limits clean output in both conversion directions. OTIS and OTIS Twin preserve the average grit update rate across host rates.
+
 ### `T32` – SpoonBender Clock-Ratio Stereo Echo and Dual Mix
 
 - **Status** — Implemented in [11168fe](https://github.com/JosiahAlanLee/Leviathan/commit/11168fe5e50df66c0cbe5590f385df102cc083d5). The Mixer sends `SetEchoParams`. Reset and seek clear the measured ByteBus period.

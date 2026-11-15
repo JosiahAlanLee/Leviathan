@@ -500,6 +500,9 @@ impl VoiceState {
         {
             self.reset_synthesis();
             attack = true;
+        } else if gate && machine == MachineKind::FourOpFm && previous != Some(machine) {
+            // A legacy machine lock can enter FM without resetting the voice.
+            self.decimator = oversample::Decimator4::default();
         }
         self.prev_gate = gate;
         if gate {
@@ -1078,7 +1081,11 @@ impl SynthRack {
 
     fn apply_lane_flags(&mut self) {
         for (lane, voice) in self.voices.iter_mut().enumerate() {
-            voice.oversample = self.alias_grit_lanes & (1 << lane) == 0;
+            let oversample = self.alias_grit_lanes & (1 << lane) == 0;
+            if voice.oversample != oversample {
+                voice.decimator = oversample::Decimator4::default();
+                voice.oversample = oversample;
+            }
             voice.bbus_grit = self.bbus_grit_lanes & (1 << lane) != 0;
             voice.otis_warm_tables = self.otis_warm_tables;
         }
@@ -1995,6 +2002,33 @@ mod tests {
             let want = 261.625_58_f64 * 2f64.powf(f64::from(semitone) / 12.0);
             let cents = 1200.0 * (f64::from(v_oct_to_hz(volts)) / want).log2();
             assert!(cents.abs() < 0.1, "semitone {semitone}: {cents:.3} cents");
+        }
+    }
+
+    #[test]
+    fn reenabling_oversampling_on_a_silent_lane_does_not_replay_history() {
+        let capture = CaptureSamples::default();
+        let dry_peak = |rack: &mut SynthRack, cv: &CvFrame, frames| {
+            (0..frames).fold(0.0_f32, |peak, _| {
+                let (_, dry) = rack.render_session(cv, &capture, Some(CaptureTap::Lane(0)));
+                peak.max(dry[0].abs())
+            })
+        };
+        for machine in [MachineKind::Fs77FormantFm, MachineKind::FourOpFm] {
+            let mut rack = SynthRack::new(48_000.0);
+            let mut patch = LanePatch::for_machine(machine);
+            patch.params[0] = 0.0;
+            rack.set_lane_patch(0, patch);
+            let mut cv = CvFrame::default();
+            cv.gate_v[0] = 10.0;
+            cv.velocity_v[0] = 10.0;
+            assert!(dry_peak(&mut rack, &cv, 2_800) > 0.01);
+            rack.set_alias_grit_lanes(1);
+            cv.gate_v[0] = 0.0;
+            dry_peak(&mut rack, &cv, 48_000);
+            assert!(dry_peak(&mut rack, &cv, 128) < 1e-7);
+            rack.set_alias_grit_lanes(0);
+            assert!(dry_peak(&mut rack, &cv, 128) < 1e-7, "{machine:?}");
         }
     }
 

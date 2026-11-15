@@ -75,7 +75,7 @@ impl KitUi {
         });
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut settings.raw_output, "Raw output")
-                .on_hover_text("Hold each chip sample to the output rate: stair-step grit with images above the chip's Nyquist. Off band-limits the output when the chip clock is below the output rate, as OtisLab's converter does.");
+                .on_hover_text("Use stair-step output from the chip. With Raw output off, the converter filters both upsampling and downsampling between the chip and output rates.");
             let mut squared = settings.filter_taper == FilterTaper::Squared;
             if ui
                 .checkbox(&mut squared, "Squared filter taper")
