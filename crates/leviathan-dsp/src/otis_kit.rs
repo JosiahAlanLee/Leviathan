@@ -45,10 +45,36 @@ impl FilterTaper {
 
 const TAPS: usize = 32;
 const PHASES: usize = 64;
-/// Reconstruction from the chip rate when it is below the host rate:
-/// Blackman-windowed sinc, cutoff at 0.9 of the chip's Nyquist, 32 taps,
-/// 64 fractional phases (interpolated), each row normalised to unity at DC.
-static KERNEL: [[f32; TAPS]; PHASES + 1] = make_kernel();
+type Kernel = [[f32; TAPS]; PHASES + 1];
+
+// These cutoffs are fractions of the chip's Nyquist. The downsampler
+// selects a band at or below 0.85 of the host's Nyquist for transition room.
+const DOWN_CUTOFFS: [f32; 16] = [
+    0.075, 0.125, 0.1875, 0.25, 0.3125, 0.375, 0.4375, 0.475, 0.5, 0.55, 0.60, 0.65,
+    0.70, 0.75, 0.80, 0.825,
+];
+static UPSAMPLE: Kernel = make_kernel(0.9);
+static DOWNSAMPLE: [Kernel; DOWN_CUTOFFS.len()] = downsample_kernels();
+
+const fn downsample_kernels() -> [Kernel; DOWN_CUTOFFS.len()] {
+    let mut banks = [[[0.0; TAPS]; PHASES + 1]; DOWN_CUTOFFS.len()];
+    let mut i = 0;
+    while i < DOWN_CUTOFFS.len() {
+        banks[i] = make_kernel(DOWN_CUTOFFS[i]);
+        i += 1;
+    }
+    banks
+}
+
+fn output_kernel(chip: f32, host: f32) -> &'static Kernel {
+    if chip < host {
+        &UPSAMPLE
+    } else {
+        let cutoff = 0.85 * (host / chip);
+        let band = DOWN_CUTOFFS.iter().rposition(|&f| f <= cutoff).unwrap_or(0);
+        &DOWNSAMPLE[band]
+    }
+}
 
 const fn sine_turns(turns: f32) -> f32 {
     let wrapped = turns - (turns as i32) as f32;
@@ -56,8 +82,8 @@ const fn sine_turns(turns: f32) -> f32 {
     crate::voice::sine_cycle(wrapped)
 }
 
-const fn make_kernel() -> [[f32; TAPS]; PHASES + 1] {
-    const CUTOFF: f32 = 0.9;
+// Blackman-windowed sinc with fractional phases normalized to unity at DC.
+const fn make_kernel(cutoff: f32) -> Kernel {
     let mut table = [[0.0; TAPS]; PHASES + 1];
     let mut p = 0;
     while p <= PHASES {
@@ -65,10 +91,10 @@ const fn make_kernel() -> [[f32; TAPS]; PHASES + 1] {
         let mut sum = 0.0;
         let mut k = 0;
         while k < TAPS {
-            // Distance from the output instant (8 chip samples behind the
+            // Distance from the output instant (half the kernel behind the
             // newest, plus the fraction) to the tap k samples back.
             let d = k as f32 - (TAPS / 2) as f32 + fraction;
-            let x = CUTOFF * d;
+            let x = cutoff * d;
             let sinc = if x == 0.0 || (x > -1.0e-6 && x < 1.0e-6) {
                 1.0
             } else {
@@ -182,8 +208,7 @@ struct Hit {
     amp: f32,
     decay: f32,
     held: f32,
-    /// Band-limit the output (chip rate below the host rate, not raw output).
-    smooth: bool,
+    kernel: Option<&'static Kernel>,
     history: [f32; TAPS],
     head: u8,
     /// Chip samples of silence still to pass through the reconstruction.
@@ -266,7 +291,7 @@ impl Hit {
             amp,
             decay,
             held: 0.0,
-            smooth: !settings.raw_output && chip < rate,
+            kernel: (!settings.raw_output && chip != rate).then(|| output_kernel(chip, rate)),
             history: [0.0; TAPS],
             head: 0,
             tail: TAPS as u8,
@@ -285,23 +310,19 @@ impl Hit {
             self.generation = None;
             return 0.0;
         };
-        if self.amp == 0.0 && self.phase >= 1.0 {
-            if !self.smooth || self.tail == 0 {
-                self.generation = None;
-                return 0.0;
-            }
-            // Let the last samples ring out of the reconstruction filter.
-            while self.phase >= 1.0 && self.tail > 0 {
-                self.phase -= 1.0;
-                self.push(0.0);
-                self.tail -= 1;
-            }
-            let out = self.reconstruct();
-            self.phase += self.ratio;
-            return out;
-        }
         while self.phase >= 1.0 {
             self.phase -= 1.0;
+            if self.amp == 0.0 {
+                if self.kernel.is_none() || self.tail == 0 {
+                    self.generation = None;
+                    return 0.0;
+                }
+                // Clock the filter's tail, including extra ticks in the
+                // host frame where a fast chip played its last sample.
+                self.push(0.0);
+                self.tail -= 1;
+                continue;
+            }
             let index = (self.position >> 32) as usize;
             let a = i32::from(sample.pcm[index]);
             let value = if self.drop_samples {
@@ -314,7 +335,7 @@ impl Hit {
             self.filtered[0] += self.cutoff * (value as f32 * PCM_GAIN - self.filtered[0]);
             self.filtered[1] += self.cutoff * (self.filtered[0] - self.filtered[1]);
             self.held = self.filtered[1] * self.amp;
-            if self.smooth {
+            if self.kernel.is_some() {
                 self.push(self.held);
             }
             self.amp *= self.decay;
@@ -328,12 +349,14 @@ impl Hit {
             {
                 self.position = next;
             } else {
-                // Keep the final held sample through its whole chip interval.
                 self.amp = 0.0;
-                break;
+                if self.kernel.is_none() {
+                    // Raw output keeps the last held sample for this frame.
+                    break;
+                }
             }
         }
-        let out = if self.smooth { self.reconstruct() } else { self.held };
+        let out = self.kernel.map_or(self.held, |kernel| self.reconstruct(kernel));
         self.phase += self.ratio;
         out
     }
@@ -346,13 +369,13 @@ impl Hit {
 
     /// The output `phase` chip samples after the newest, delayed by TAPS / 2.
     #[inline]
-    fn reconstruct(&self) -> f32 {
+    fn reconstruct(&self, kernel: &Kernel) -> f32 {
         let position = self.phase.clamp(0.0, 1.0) * PHASES as f32;
         let row = (position as usize).min(PHASES - 1);
         let mix = position - row as f32;
         let mut out = 0.0;
         for k in 0..TAPS {
-            let tap = KERNEL[row][k] + mix * (KERNEL[row + 1][k] - KERNEL[row][k]);
+            let tap = kernel[row][k] + mix * (kernel[row + 1][k] - kernel[row][k]);
             let index = (usize::from(self.head) + TAPS - k) % TAPS;
             out += tap * self.history[index];
         }
@@ -536,11 +559,11 @@ mod tests {
         assert!((20.0 * f64::from(gain_delta).log10() + 9.0).abs() < 0.01);
     }
 
-    struct Bank {
-        current: Sample<'static>,
-        old: Option<Sample<'static>>,
+    struct Bank<'a> {
+        current: Sample<'a>,
+        old: Option<Sample<'a>>,
     }
-    impl Memory for Bank {
+    impl Memory for Bank<'_> {
         fn current(&self, _slot: usize) -> Option<Sample<'_>> {
             Some(self.current)
         }
@@ -657,8 +680,7 @@ mod tests {
         let pcm: std::vec::Vec<i16> = (0..9_600)
             .map(|i| (16_000.0 * crate::voice::sine_cycle(((i * 10_000) % 48_000) as f32 / 48_000.0)) as i16)
             .collect();
-        let pcm: &'static [i16] = std::boxed::Box::leak(pcm.into_boxed_slice());
-        let bank = Bank { current: Sample { generation: 1, rate: 48_000, pcm }, old: None };
+        let bank = Bank { current: Sample { generation: 1, rate: 48_000, pcm: &pcm }, old: None };
         let level = |raw: bool, hz: f64| {
             let lane = Lane { raw_output: raw, ..Lane::default() };
             let mut hit = Hit::new(bank.current, Slot::default(), 0.0, 1.0, 0, lane, 48_000.0);
@@ -676,8 +698,63 @@ mod tests {
         let smooth = 20.0 * (level(false, image) / level(false, 10_000.0)).log10();
         assert!(raw > -20.0, "raw image {raw:.1} dB");
         assert!(smooth < -60.0, "reconstructed image {smooth:.1} dB");
-        for row in KERNEL.iter() {
+        for row in UPSAMPLE.iter() {
             assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-4);
         }
+    }
+
+    #[test]
+    fn faster_chip_clocks_filter_before_downsampling_to_the_host() {
+        for (rate, clock, tone) in [(48_000, 2, 30_000.0), (44_100, 1, 22_200.0)] {
+            let measure = |hz: f64, raw_output| {
+                let pcm = (0..28_800)
+                    .map(|n| {
+                        let phase = core::f64::consts::TAU * hz * n as f64 / 96_000.0;
+                        (24_000.0 * phase.sin()) as i16
+                    })
+                    .collect::<std::vec::Vec<_>>();
+                let bank = Bank {
+                    current: Sample { generation: 1, rate: 96_000, pcm: &pcm },
+                    old: None,
+                };
+                let lane = Lane { raw_output, ..Lane::default() };
+                let mut hit = Hit::new(bank.current, Slot::default(), 0.0, 1.0, clock, lane, rate as f32);
+                let observed_hz = hz.min(f64::from(rate) - hz);
+                let count = rate / 10;
+                let mut re = 0.0;
+                let mut im = 0.0;
+                for n in 0..count * 2 {
+                    let sample = f64::from(hit.render(&bank, 0, 0));
+                    if n >= count {
+                        let phase = core::f64::consts::TAU * observed_hz * f64::from(n) / f64::from(rate);
+                        re += sample * phase.cos();
+                        im += sample * phase.sin();
+                    }
+                }
+                2.0 * re.hypot(im) / f64::from(count)
+            };
+            let raw_alias = measure(tone, true);
+            let clean_alias = measure(tone, false);
+            assert!(raw_alias > 0.1);
+            assert!(clean_alias < 0.01 * raw_alias, "{rate} Hz alias {clean_alias}");
+            let passband_gain = measure(2_000.0, false) / measure(2_000.0, true);
+            assert!((0.95..=1.05).contains(&passband_gain), "{rate} Hz gain {passband_gain}");
+        }
+    }
+
+    #[test]
+    fn reconstruction_drains_after_the_last_tick_of_a_short_sample() {
+        let bank = Bank {
+            current: Sample { generation: 1, rate: 96_000, pcm: &[10_000, -20_000, 10_000] },
+            old: None,
+        };
+        let mut hit = Hit::new(bank.current, Slot::default(), 0.0, 1.0, 2, Lane::default(), 44_100.0);
+        let mut peak = 0.0_f32;
+        for _ in 0..48 {
+            peak = peak.max(hit.render(&bank, 0, 0).abs());
+        }
+        assert!(peak > 0.01);
+        assert!(hit.generation.is_none());
+        assert_eq!(hit.render(&bank, 0, 0), 0.0);
     }
 }

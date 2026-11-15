@@ -1,5 +1,5 @@
 use crate::captured::{FrameSource, Scan};
-use crate::voice::{approach, choice};
+use crate::voice::{approach, choice, GritClock};
 use crate::{fast_tanh, wrap_turns};
 use leviathan_core::SOUND_PARAMS;
 
@@ -270,7 +270,7 @@ pub(super) struct TwinVoice {
     k1_slewed: f32,
     lp: [f32; 4],
     hp_lp: [f32; 2],
-    decim_counter: u8,
+    grit_clock: GritClock,
     sample_frames: [Scan; 2],
 }
 
@@ -301,7 +301,7 @@ impl TwinVoice {
             k1_slewed: 0.35,
             lp: [0.0; 4],
             hp_lp: [0.0; 2],
-            decim_counter: 0,
+            grit_clock: GritClock::new(),
             sample_frames: [Scan::new(); 2],
         }
     }
@@ -371,7 +371,7 @@ impl TwinVoice {
             self.amp_env = velocity;
             self.scan_env = 1.0;
             self.scan_phase = 0.0;
-            self.decim_counter = 0;
+            self.grit_clock = GritClock::new();
             if cold_start {
                 self.phase_a = 0;
                 self.phase_b = 0x4000_0000;
@@ -429,13 +429,11 @@ impl TwinVoice {
         self.frame_a = approach(self.frame_a, target_fa, FRAME_SLEW_SECONDS, sr);
         self.frame_b = approach(self.frame_b, target_fb, FRAME_SLEW_SECONDS, sr);
 
-        if self.decim_counter == 0 {
-            self.decim_counter = crate::voice::rate_samples((grit * grit * 6.0) as u32 as f32, sr).min(255.0) as u8;
+        if let Some(scan_rate) = self.grit_clock.step((grit * grit * 6.0) as u8, sr) {
             let discard = (grit * FRACTION_BITS as f32) as u32;
             let frac_mask = u32::MAX << discard;
 
             let addr_a = phase_to_q20_12(self.phase_a) & frac_mask;
-            let scan_rate = sr / (f32::from(self.decim_counter) + 1.0);
             let read = |scan: &mut Scan, frame, address, invert_bus| {
                 if let Some(source) = source {
                     scan.read_mono(
@@ -467,8 +465,6 @@ impl TwinVoice {
                 s = (q as f32) / levels;
             }
             self.held_wave = s;
-        } else {
-            self.decim_counter -= 1;
         }
 
         self.filter(self.held_wave, f1, f2, sr, calibrated) * self.amp_env

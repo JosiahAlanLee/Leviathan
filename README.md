@@ -58,6 +58,8 @@ Leviathan uses a strict hexagonal ("ports and adapters") layout so external GPU,
 - **OTIS** and **OT2** treat the trimmed region as fixed-length frames. Set **samples per frame**, then scan them with **FramePos** or enable **Clock OTIS frames from ByteBus**. **VAST** takes a gated capture sample or a continuous signal from another lane's dry mixer tap. These processors fold stereo input to mono.
 - **Register → Lookup → BBUS** clocks the tracker word through a shared register at ByteBus clock edges. Set the reset seed and choose Identity, Invert, Square or Fold. The clocked output can also select OTIS frames independently of BBUS. Captures and routing save with the project and render in WAV and stem exports.
 
+In **Voice / Trig** (F2), **Lane Patch** shows timbre options for the lane's base machine. **Step Lock** shows the options for the machine the selected step plays. Project and lane controls show their scope next to the name.
+
 ## BBUS cycle lock
 
 - New sessions restart the **BBUS** register every note cycle (**BBUS cycle lock**, in **Voice / Trig** when the lane plays BBUS). Its sixteen steps are then one period, as when ByteBusLab Parallel Sum's cycle is the pitch, so the voice is pitched and harmonic.
@@ -69,7 +71,7 @@ Leviathan uses a strict hexagonal ("ports and adapters") layout so external GPU,
 
 ## Sample-rate independence
 
-- Voices tuned with per-sample filter coefficients, decays, delays and noise at 48 kHz now convert them for the device rate, so a project sounds the same at 44.1, 48 and 96 kHz. At 48 kHz every voice renders bit-identically to before (FS77 changes only through its 4x oversampling). Remaining differences across rates are within about 2 dB except grit controls that hold whole samples, FS77's ResoDac and VAST Triple's PreTilt at their extremes (3-5 dB).
+- Voices tuned with per-sample filter coefficients, decays, delays and noise at 48 kHz convert them for the device rate. OTIS and OTIS Twin scale the whole grit update period and carry the fractional remainder to keep its average rate. Settings that update every sample use the host clock.
 
 ## OTIS warm tables
 
@@ -81,7 +83,7 @@ Leviathan uses a strict hexagonal ("ports and adapters") layout so external GPU,
 - Select **OKIT** in **Lane Patch** or in a **Step Lock**. Go to **Samples** (F5) and open **OtisKit**. The **Factory kit** button fills all eight slots. You can also load a WAV, load a folder in filename order, or arm a capture directly into the selected slot. Capture from the **Capture and Banks** tab still writes to the stereo take.
 - **Tracker** addressing maps MIDI 60–67 (C-4 through G-4) to slots 1–8 at unity pitch. Each additional group of eight notes transposes an octave. **ByteBus** addressing takes bits 0–2 from Register/Lookup and uses the tracker note for pitch. An optional slot offset wraps around the bank. Kit controls and step offsets are latched on each hit.
 - Each lane picks a **velocity curve**. **Chip** (the default, as on the hardware) drops 0.375 dB per step, so velocity 94 is −18.75 dB and 52 is about −44 dB. **Soft** drops 0.125 dB per step, about 24 dB in all, so ordinary tracker dynamics stay audible. The step inspector and velocity tooltips show the gain on the lane's curve. Projects saved earlier load on Chip.
-- **Raw output** and **Squared filter taper** (per kit lane). New kits band-limit the output when the chip clock is below the output rate (32-tap windowed sinc at 0.9 of the chip's Nyquist, as OtisLab's converter does) and use a linear filter knob like the ES5505 K1 register. Raw output keeps the stair-step grit, with images above the chip's Nyquist; the squared taper is the original, about half the cutoff at the same setting. Kits saved earlier load with both on.
+- **Raw output** and **Squared filter taper** (per kit lane). Clean output uses a 32-tap band-limited converter between the chip and output rates. It suppresses images when upsampling and filters before downsampling. Raw output keeps the original stair-step grit. The squared taper rolls off higher frequencies sooner than the linear K1 taper. Kits saved before these options load with both on.
 - **REWORK** previews the capture's trim region or an OtisKit slot from Start to its end. Set the seed, fineness and amount, listen to A and B, and commit the result. A replacement or project reload invalidates a stale preview. Export includes committed audio. Preview audition plays from the monitor and stays outside the recorded and exported signal.
 - Projects save as version 2 in the same `.leviathan.json` file. The new version stores the stereo take and mono kit slots as base64 little-endian signed 16-bit PCM with explicit rate and frame count. Version 1 files with numeric PCM still load.
 

@@ -328,6 +328,32 @@ pub(super) fn rate_samples(n: f32, rate: f32) -> f32 {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct GritClock(f32);
+
+impl GritClock {
+    pub(super) const fn new() -> Self {
+        Self(0.0)
+    }
+
+    /// Return the effective scan rate on an update. Carry the sub-sample
+    /// remainder so the whole interval scales, including the update sample.
+    #[inline]
+    pub(super) fn step(&mut self, skipped_at_48k: u8, rate: f32) -> Option<f32> {
+        if self.0 > 0.0 {
+            self.0 -= 1.0;
+            return None;
+        }
+        if skipped_at_48k == 0 {
+            self.0 = 0.0;
+            return Some(rate);
+        }
+        let period = rate_samples(f32::from(skipped_at_48k) + 1.0, rate).max(1.0);
+        self.0 += period - 1.0;
+        Some(rate / period)
+    }
+}
+
 /// Amplitude for per-sample white noise so its in-band level matches 48 kHz.
 #[inline]
 pub(super) fn rate_noise(rate: f32) -> f32 {
@@ -351,6 +377,32 @@ fn atan_fast(x: f32) -> f32 {
 #[cfg(test)]
 mod rate_tests {
     use super::*;
+
+    #[test]
+    fn grit_clock_keeps_the_full_update_period_at_each_sample_rate() {
+        for rate in [44_100, 48_000, 96_000] {
+            for skipped in [0, 1, 4, 15] {
+                let target = if skipped == 0 {
+                    rate as f32
+                } else {
+                    REFERENCE_RATE / (f32::from(skipped) + 1.0)
+                };
+                let mut clock = GritClock::new();
+                let mut updates = 0;
+                for sample in 0..rate {
+                    let update = clock.step(skipped, rate as f32);
+                    if rate == 48_000 {
+                        assert_eq!(update.is_some(), sample % (u32::from(skipped) + 1) == 0);
+                    }
+                    if let Some(scan_rate) = update {
+                        assert!((scan_rate - target).abs() < 0.01);
+                        updates += 1;
+                    }
+                }
+                assert!((updates as f32 - target).abs() <= 1.0);
+            }
+        }
+    }
 
     #[test]
     fn conversions_are_identity_at_48k_and_preserve_time_constants() {

@@ -1,5 +1,5 @@
 use crate::captured::{FrameSource, Scan};
-use crate::voice::{approach, choice, sine_cycle};
+use crate::voice::{approach, choice, sine_cycle, GritClock};
 use crate::wrap_turns;
 use leviathan_core::SOUND_PARAMS;
 
@@ -199,7 +199,7 @@ pub(super) struct Voice {
     amp: f32,
     filtered: [f32; 2],
     held_sample: f32,
-    hold: u8,
+    grit_clock: GritClock,
     scan_sample: Scan,
 }
 
@@ -225,7 +225,7 @@ impl Voice {
             self.phase = 0;
             self.scan = 0.0;
             self.frame = position;
-            self.hold = 0;
+            self.grit_clock = GritClock::new();
         }
         self.amp = approach(self.amp, 0.0, 0.016 + 2.2 * decay * decay, sample_rate);
         if self.amp == 0.0 {
@@ -253,8 +253,7 @@ impl Voice {
         self.phase = advance(self.phase, increment);
         // Grit lowers the scanner update rate and address precision. The
         // accumulator still advances every sample so pitch stays independent.
-        if self.hold == 0 {
-            self.hold = crate::voice::rate_samples((grit * grit * 15.0) as u32 as f32, sample_rate).min(255.0) as u8;
+        if let Some(scan_rate) = self.grit_clock.step((grit * grit * 15.0) as u8, sample_rate) {
             let discarded = (grit * 12.0) as u32;
             let phase = (self.phase >> discarded) << discarded;
             let frame = (self.frame * ((FRAMES - 1) as u32 * FRACTION) as f32 + 0.5) as u32;
@@ -263,14 +262,12 @@ impl Voice {
                     source,
                     self.frame,
                     phase as f32 / CYCLE as f32,
-                    sample_rate / (f32::from(self.hold) + 1.0),
+                    scan_rate,
                     false,
                 )
             } else {
                 scan_sample(table_index(table, warm_tables), frame, phase) * (1.0 / 32_768.0)
             };
-        } else {
-            self.hold -= 1;
         }
         let input = self.held_sample - 0.88 * k2 * self.filtered[1];
         let first = crate::voice::rate_coef(0.012 + 0.78 * k1 * k1, sample_rate);

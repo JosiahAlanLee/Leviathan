@@ -664,34 +664,40 @@ impl LeviathanApp {
         if after != before {
             self.send_audio(AudioCommand::SetNoteGates(after));
         }
-        let bbus_lane = self.lane_patches[lane].machine == MachineKind::ByteBusR2r;
-        let bbus = &mut self.instruments.bbus;
-        let before = *bbus;
-        if bbus_lane {
+        let patch = &self.lane_patches[lane];
+        let machine = if self.edit_lane_patch {
+            patch.machine
+        } else {
+            let lock = &self.patterns[pattern].lanes[lane][row].lock;
+            MachineKind::from_patch_and_lock(patch, lock)
+        };
+        if machine == MachineKind::ByteBusR2r {
+            let bbus = &mut self.instruments.bbus;
+            let before = *bbus;
             ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut bbus.cycle_lock, "BBUS cycle lock")
+                ui.checkbox(&mut bbus.cycle_lock, "BBUS cycle lock · Project")
                     .on_hover_text("Restart the BBUS register every note cycle so it repeats at the note's pitch, like Parallel Sum clocked from an oscillator. Off keeps every lane free-running, as in projects made before this option.");
                 if bbus.cycle_lock {
-                    ui.checkbox(&mut bbus.grit[lane], format!("Lane {} grit", lane + 1))
+                    ui.checkbox(&mut bbus.grit[lane], format!("BBUS grit · Lane {}", lane + 1))
                         .on_hover_text("Let this lane's BBUS register run free across note cycles: the original, noisier and more digital sound.");
                 }
             });
-        }
-        let after = *bbus;
-        if after != before {
-            self.send_audio(AudioCommand::SetBbus(after));
+            let after = *bbus;
+            if after != before {
+                self.send_audio(AudioCommand::SetBbus(after));
+            }
         }
         if matches!(
-            self.lane_patches[lane].machine,
+            machine,
             MachineKind::Fs77FormantFm | MachineKind::FourOpFm | MachineKind::AcidLead
         ) {
             let oversample = &mut self.instruments.oversample;
             let before = *oversample;
             ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut oversample.enabled, "Oversample FM and Acid")
+                ui.checkbox(&mut oversample.enabled, "Oversample FM and Acid · Project")
                     .on_hover_text("Run FS77 and the 4-Op FM operators at four times the output rate and band-limit Acid's saw, so high notes and deep modulation stop folding back as low, inharmonic tones. Off keeps every lane at the original single rate, as in projects made before this option.");
                 if oversample.enabled {
-                    ui.checkbox(&mut oversample.grit[lane], format!("Lane {} grit", lane + 1))
+                    ui.checkbox(&mut oversample.grit[lane], format!("FM and Acid grit · Lane {}", lane + 1))
                         .on_hover_text("Keep this lane at the original single rate, with its aliasing.");
                 }
             });
@@ -700,10 +706,10 @@ impl LeviathanApp {
                 self.send_audio(AudioCommand::SetOversample(after));
             }
         }
-        if self.lane_patches[lane].machine == MachineKind::OtisTranswave {
+        if machine == MachineKind::OtisTranswave {
             let otis = &mut self.instruments.otis;
             if ui
-                .checkbox(&mut otis.warm_tables, "OTIS warm tables")
+                .checkbox(&mut otis.warm_tables, "OTIS warm tables · Project")
                 .on_hover_text("TableSel alternates bright and warm: the lower half of each quarter plays the original table, the upper half a darker twin. Off keeps the four bright tables only, as in projects made before this option.")
                 .changed()
             {
@@ -1736,6 +1742,50 @@ mod tests {
         };
         frame(ctx, app, vec![Event::PointerMoved(position), pointer(true)]);
         frame(ctx, app, vec![pointer(false)]);
+    }
+
+    #[test]
+    fn step_lock_exposes_timbre_controls_for_the_effective_machine() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        app.cursor.select(0, 0, SubColumn::Note, false);
+        assert_eq!(app.lane_patches[0].machine, MachineKind::KickDrum);
+        frame(&ctx, &mut app, tap(Key::F2, Modifiers::NONE));
+        let visible = |output: &egui::FullOutput, label| {
+            output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label)
+            })
+        };
+        for (machine, project_label, lane_label) in [
+            (
+                MachineKind::ByteBusR2r,
+                "BBUS cycle lock · Project",
+                Some("BBUS grit · Lane 1"),
+            ),
+            (
+                MachineKind::OtisTranswave,
+                "OTIS warm tables · Project",
+                None,
+            ),
+            (
+                MachineKind::Fs77FormantFm,
+                "Oversample FM and Acid · Project",
+                Some("FM and Acid grit · Lane 1"),
+            ),
+        ] {
+            app.patterns[0].lanes[0][0].lock.machine = machine as i16;
+            let output = frame(&ctx, &mut app, Vec::new());
+            assert!(visible(&output, project_label), "{machine:?}");
+            if let Some(label) = lane_label {
+                assert!(visible(&output, label), "{machine:?}");
+            }
+        }
+        click_text(&ctx, &mut app, "FM and Acid grit · Lane 1");
+        assert_eq!(app.instruments.oversample.grit_lanes(), 1);
+        click_text(&ctx, &mut app, "Lane Patch");
+        let output = frame(&ctx, &mut app, Vec::new());
+        assert!(!visible(&output, "Oversample FM and Acid · Project"));
+        assert_eq!(app.lane_patches[0].machine, MachineKind::KickDrum);
     }
 
     #[test]
