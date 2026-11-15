@@ -46,6 +46,7 @@ pub use spec::{
 
 pub const MACHINE_COUNT: usize = 18;
 pub const ALL_LANES_AUDIBLE: u8 = (1 << NUM_LANES) - 1;
+const NOTE_RELEASE_SECONDS: f32 = 0.004;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LaneChannel {
@@ -450,6 +451,7 @@ impl VoiceState {
         sample_bank: &SampleBank,
         bus_word: Option<u8>,
         calibrated: bool,
+        release_on_gate_off: bool,
     ) -> f32 {
         let gate = cv.gate_v[lane] > 2.5;
         let velocity = cv.velocity_v[lane];
@@ -539,8 +541,19 @@ impl VoiceState {
         }
         let dt = 1.0 / sample_rate;
         let decay_lock = lock_param(&lock, 0, 0.35).clamp(0.03, 0.98);
-        let decay_rate = 1.0 - (dt / (0.04 + 0.85 * decay_lock));
+        // The sampler owns its loop/release policy. The original synths
+        // keep their timbral decay during the note and fade after gate-off.
+        let releasing = release_on_gate_off && !gate && machine != MachineKind::VarSampler;
+        let decay_seconds = if releasing {
+            NOTE_RELEASE_SECONDS
+        } else {
+            0.04 + 0.85 * decay_lock
+        };
+        let decay_rate = 1.0 - (dt / decay_seconds);
         self.env *= decay_rate;
+        if releasing && self.env < 1e-7 {
+            self.env = 0.0;
+        }
         self.pitch_env *= 1.0 - (dt / 0.022);
 
         let base_hz = v_oct_to_hz(pitch);
@@ -644,6 +657,7 @@ impl VoiceState {
         sample_bank: &SampleBank,
         bus_word: Option<u8>,
         calibrated: bool,
+        release_on_gate_off: bool,
         samples: &CaptureSamples<'_>,
         routing: &RackRouting,
         routed: &[[f32; 2]; NUM_LANES],
@@ -678,7 +692,9 @@ impl VoiceState {
             return [value * if calibrated { 0.8 } else { 1.0 }; 2];
         }
         if input == LaneInput::Instrument {
-            return [self.render(cv, lane, patch, rate, sample_bank, bus_word, calibrated); 2];
+            return [self.render(
+                cv, lane, patch, rate, sample_bank, bus_word, calibrated, release_on_gate_off,
+            ); 2];
         }
         let sampled = matches!(
             machine,
@@ -696,7 +712,9 @@ impl VoiceState {
         let captured = input == LaneInput::Capture && sampled;
         if !captured && through.is_none() {
             self.capture.finish();
-            return [self.render(cv, lane, patch, rate, sample_bank, bus_word, calibrated); 2];
+            return [self.render(
+                cv, lane, patch, rate, sample_bank, bus_word, calibrated, release_on_gate_off,
+            ); 2];
         }
 
         let switching = self.active_machine != Some(machine);
@@ -806,6 +824,7 @@ pub struct SynthRack {
     pub counter: ByteBusCounter,
     lane_patches: [LanePatch; NUM_LANES],
     voice_calibration: bool,
+    note_release_lanes: u8,
     routing: RackRouting,
     render_order: [usize; NUM_LANES],
     byte_register: byte_route::Register,
@@ -832,6 +851,7 @@ impl SynthRack {
             counter: ByteBusCounter::default(),
             lane_patches: DEFAULT_LANE_PATCHES,
             voice_calibration: false,
+            note_release_lanes: ALL_LANES_AUDIBLE,
             routing: RackRouting::default(),
             render_order: core::array::from_fn(|lane| lane),
             byte_register: byte_route::Register::default(),
@@ -952,6 +972,11 @@ impl SynthRack {
             self.voice_calibration = enabled;
             self.reset_voices();
         }
+    }
+
+    /// Select the lanes where gate-off releases the original synth envelopes.
+    pub fn set_note_release_lanes(&mut self, lanes: u8) {
+        self.note_release_lanes = lanes & ALL_LANES_AUDIBLE;
     }
 
     pub fn set_lane_audible_mask(&mut self, mask: u8) {
@@ -1170,6 +1195,7 @@ impl SynthRack {
                 &self.sample_bank,
                 bus_word,
                 self.voice_calibration,
+                self.note_release_lanes & (1 << lane) != 0,
                 samples,
                 &self.routing,
                 &lane_dry,
@@ -1240,6 +1266,53 @@ fn lane_target(audible_mask: u8, lane: usize) -> f32 {
 mod tests {
     use super::*;
     use leviathan_core::{EngineConfig, NoteCell, Pattern, TrackerEvaluator};
+
+    #[test]
+    fn original_voices_release_at_gate_off_with_one_shot_available() {
+        let render = |machine, gate_frames, release_lanes| {
+            let mut rack = SynthRack::new(48_000.0);
+            rack.set_note_release_lanes(release_lanes);
+            let mut cv = CvFrame::default();
+            cv.gate_v[0] = 10.0;
+            cv.velocity_v[0] = 10.0;
+            cv.locks[0].machine = machine as i16;
+            (0..4_800)
+                .map(|frame| {
+                    if frame == gate_frames {
+                        cv.gate_v[0] = 0.0;
+                    }
+                    rack.render_session(
+                        &cv,
+                        &CaptureSamples::default(),
+                        Some(CaptureTap::Lane(0)),
+                    )
+                    .1
+                })
+                .collect::<std::vec::Vec<_>>()
+        };
+        let tail_energy = |audio: &[[f32; 2]]| {
+            audio[2_400..]
+                .iter()
+                .map(|frame| frame[0] * frame[0])
+                .sum::<f32>()
+        };
+        for machine in [
+            MachineKind::KickDrum,
+            MachineKind::FourOpFm,
+            MachineKind::SubBass,
+            MachineKind::NoiseWash,
+            MachineKind::AcidLead,
+            MachineKind::ChordStab,
+        ] {
+            let short = render(machine, 600, ALL_LANES_AUDIBLE);
+            let held = render(machine, 5_400, ALL_LANES_AUDIBLE);
+            let one_shot = render(machine, 600, ALL_LANES_AUDIBLE & !1);
+            assert_eq!(short[..600], held[..600], "{machine:?}");
+            assert_eq!(held, one_shot, "{machine:?}");
+            assert!(tail_energy(&held) > 0.01, "{machine:?}");
+            assert!(tail_energy(&short) < 1e-5 * tail_energy(&held), "{machine:?}");
+        }
+    }
 
     #[test]
     fn bend_capture_tap_is_the_wet_stem_before_master_processing() {

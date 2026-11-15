@@ -51,6 +51,32 @@ pub struct InstrumentSettings {
     pub take: Option<Arc<Take>>,
     pub kit: Kit,
     pub echo: echo::Params,
+    pub note_gates: NoteGateSettings,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NoteGateSettings {
+    pub enabled: bool,
+    pub one_shot: [bool; NUM_LANES],
+}
+
+impl NoteGateSettings {
+    pub fn release_lanes(self) -> u8 {
+        if !self.enabled {
+            return 0;
+        }
+        self.one_shot
+            .into_iter()
+            .enumerate()
+            .filter(|&(_, one_shot)| !one_shot)
+            .map(|(lane, _)| 1 << lane)
+            .sum()
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl Project {
@@ -104,12 +130,17 @@ struct InstrumentFile {
     kit: Option<KitFile>,
     #[serde(default, with = "EchoParamsDef")]
     echo: echo::Params,
+    #[serde(skip_serializing_if = "NoteGateSettings::is_default")]
+    note_gates: NoteGateSettings,
 }
 
 impl InstrumentFile {
     fn is_default(&self) -> bool {
         self.routing == RackRouting::default()
-            && self.take.is_none() && self.kit.is_none() && self.echo == echo::Params::default()
+            && self.take.is_none()
+            && self.kit.is_none()
+            && self.echo == echo::Params::default()
+            && self.note_gates.is_default()
     }
 }
 
@@ -492,7 +523,13 @@ impl ProjectFile {
             sample_regions,
             custom_shader: self.custom_shader,
             voice_calibration: self.voice_calibration,
-            instruments: InstrumentSettings { routing, take, kit, echo },
+            instruments: InstrumentSettings {
+                routing,
+                take,
+                kit,
+                echo,
+                note_gates: self.instruments.note_gates,
+            },
         })
     }
 }
@@ -582,6 +619,7 @@ pub fn save(path: &Path, project: Project) -> Result<(), String> {
             }),
             kit: KitFile::from_kit(&project.instruments.kit),
             echo: project.instruments.echo,
+            note_gates: project.instruments.note_gates,
         },
     };
     let mut bytes = serde_json::to_vec(&project).map_err(|error| error.to_string())?;

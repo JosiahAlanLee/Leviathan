@@ -405,6 +405,7 @@ pub struct TrackerEvaluator {
     held_vel_v: [f32; NUM_LANES],
     held_locks: [SoundLock; NUM_LANES],
     last_pulse: [Option<(u32, usize, u8)>; NUM_LANES],
+    retrigger_held_notes: bool,
     sequence: u64,
 }
 
@@ -462,6 +463,7 @@ impl TrackerEvaluator {
             held_vel_v: [0.0; NUM_LANES],
             held_locks: [SoundLock::default(); NUM_LANES],
             last_pulse: [None; NUM_LANES],
+            retrigger_held_notes: true,
             sequence: 0,
         }
     }
@@ -470,6 +472,11 @@ impl TrackerEvaluator {
         self.clock = SampleClock::new(&self.config);
         self.cycle_start_beat = 0.0;
         self.last_pulse = [None; NUM_LANES];
+    }
+
+    /// Emit an attack when a new step starts on an already-high gate.
+    pub fn set_retrigger_held_notes(&mut self, enabled: bool) {
+        self.retrigger_held_notes = enabled;
     }
 
     pub fn step_sample(&mut self, pattern: &Pattern) -> CvFrame {
@@ -601,9 +608,12 @@ impl TrackerEvaluator {
             if phase < width {
                 *gate = v_high;
                 hit_mask |= 1 << lane;
-                if count > 1 || cell.micro_offset != 0 {
+                let explicit_pulse = count > 1 || cell.micro_offset != 0;
+                if explicit_pulse || self.retrigger_held_notes {
                     let pulse = Some((bar_count, note_row, pulse));
-                    if pulse != previous_pulse {
+                    // A low-to-high gate already triggers the voice. Signal
+                    // onsets within a continuous gate without shortening it.
+                    if pulse != previous_pulse && (explicit_pulse || previous_pulse.is_some()) {
                         retrigger_mask |= 1 << lane;
                     }
                     self.last_pulse[lane] = pulse;
