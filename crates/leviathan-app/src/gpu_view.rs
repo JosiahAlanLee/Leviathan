@@ -53,6 +53,12 @@ fn block_on_wgpu_error(
     }
 }
 
+/// Each probe texel gets its own row at the copy row alignment. Packing eight
+/// 1x1 copies at 4-byte offsets into one buffer read back wrong on Metal
+/// (Apple M4 Max: one copy landed on another's slot, one slot stayed unwritten).
+const PROBE_STRIDE: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+const PROBE_COUNT: usize = 8;
+
 struct ProbeReadback {
     buffer: wgpu::Buffer,
     pending: Option<(
@@ -66,7 +72,7 @@ impl ProbeReadback {
         Self {
             buffer: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("shader bus probes"),
-                size: 32,
+                size: u64::from(PROBE_STRIDE) * PROBE_COUNT as u64,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             }),
@@ -93,8 +99,8 @@ impl ProbeReadback {
                 wgpu::TexelCopyBufferInfo {
                     buffer: &self.buffer,
                     layout: wgpu::TexelCopyBufferLayout {
-                        offset: (4 * bit) as u64,
-                        bytes_per_row: None,
+                        offset: u64::from(PROBE_STRIDE) * bit as u64,
+                        bytes_per_row: Some(PROBE_STRIDE),
                         rows_per_image: None,
                     },
                 },
@@ -128,7 +134,11 @@ impl ProbeReadback {
         self.pending = None;
         result.ok()?.ok()?;
         let mapped = self.buffer.slice(..).get_mapped_range();
-        let reply = probe.reply(mapped.as_chunks::<4>().0);
+        let texels: [[u8; 4]; PROBE_COUNT] = core::array::from_fn(|bit| {
+            let start = PROBE_STRIDE as usize * bit;
+            mapped[start..start + 4].try_into().unwrap()
+        });
+        let reply = probe.reply(&texels);
         drop(mapped);
         self.buffer.unmap();
         Some(reply)
