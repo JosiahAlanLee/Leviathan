@@ -96,6 +96,18 @@ In **Voice / Trig** (F2), **Lane Patch** shows timbre options for the lane's bas
 
 The audio clock latches a probe result only on the next ByteBus edge, including when the transport follows MIDI clock. A late or missing result holds the last word, with the missed count shown in Scene. An on-time result takes one sixteenth note at the default four pulses per beat, or 125 ms at 120 BPM. The GPU copies eight texels asynchronously from its feedback target. WAV and stem export use the recorded clocked values.
 
+### Replay the return in Rack
+
+After keeping a take, choose its pattern or chain in **Export WAV…** and enable **Include shader ByteBus CV**. Enter a new folder path. The folder contains `master.wav`, `shader-bytebus.wav`, and any requested audio stems. The CV file uses ten discrete 32-bit float channels at the same sample rate and frame count as the master.
+
+| WAV channel | Signal |
+| --- | --- |
+| 1–8 | Held word, least significant bit first |
+| 9 | One-sample clock strobe on each pulse with a valid word, including `00` and repeats |
+| 10 | One-sample reset strobe at the start and when the held word clears |
+
+Play the file at its native sample rate with unity gain in a host that exposes its individual channels. For a software Rack patch, map `0.0` and `1.0` to `0 V` and `10 V`, combine channels 1–9 in order, and send the result to a clocked ByteBus receiver. Route channel 10 separately to the receiver's reset logic. If both strobes appear on the first sample, apply reset before latching the word. The clock continues across chain wraps and stays low during the tail while the data bits hold. [Rack ByteBus cable contract](https://github.com/JosiahAlanLee/Gorgon/blob/22b8d4f0d61e5955deae42f726d57a763b0d8968/spec/bytebus-output.md)
+
 ## Custom WGSL Shaders & SoundLink UDP
 
 - Drop any `.wgsl` file onto the window (or use **Load .wgsl** in **Scene** (F6)) to run custom ping-pong fragment shaders driven by Leviathan's 64-byte `VisualUniforms` and `prev_tex` feedback buffer.

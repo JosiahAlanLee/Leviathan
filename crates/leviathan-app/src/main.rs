@@ -1361,6 +1361,7 @@ impl eframe::App for LeviathanApp {
             ctx,
             self.selected_pattern,
             !self.chain.as_slice().is_empty(),
+            &self.instruments.shader_bus,
         ) {
             let snapshot = self.project_snapshot();
             self.export_ui.start(ctx, snapshot, self.fill_active, request);

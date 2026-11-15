@@ -388,7 +388,8 @@ The Copper Relay walkthrough identified two display gaps addressed in the Voice 
 
 - **Status** — Implemented in [83fa9d0](https://github.com/JosiahAlanLee/Leviathan/commit/83fa9d0a4754af9dc519a678152b2a74fd6e3ef2). Scene (F6) sends `SetShaderRoute`, `ShaderReply`, `ClearShaderField`, `RecordShaderTake` and `FinishShaderTake`. Routing (F4) shows the input and held return for the destination lane.
 - **Instrument** — Sample eight points from the feedback field and latch the byte on the next audio-owned ByteBus edge. A single OT2 lane reads the return as a frame address. Route the held byte back through Lookup to close the loop. Record the held words against the cued transport so WAV and stem export can replay them without a graphics context.
-- **Hardware check** — Play the route on the laptop while watching the missed-pulse count. For a modular patch, evaluate a separate return word with clock and reset against the Rack bridge parity fixtures below.
+- **Recorded modular return** — Implemented in [`2489b0d`](https://github.com/JosiahAlanLee/Leviathan/commit/2489b0d2cc3f2b4689db327c62714185c987e4a9). **Export WAV…** can write a ten-channel CV file from the same replay frames that drive OT2. The file carries eight data bits, a one-sample publication clock, and a separate reset alongside the stereo master.
+- **Playback check** — Play the route on the laptop while watching the missed-pulse count. Replay a kept take in a Rack patch at the export rate. Check repeated words, `00`, reset, and the stopped clock during the tail before choosing a live modular output.
 
 ## External Elektron Engines
 
