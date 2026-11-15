@@ -379,6 +379,8 @@ struct VoiceState {
     bbus: bbus::Voice,
     /// BBUS free-runs its register across note cycles (the original sound).
     bbus_grit: bool,
+    /// OTIS TableSel spans the bright tables and their warm twins.
+    otis_warm_tables: bool,
     fs77: fs77::Voice,
     active_machine: Option<MachineKind>,
     note_pitch: f32,
@@ -412,6 +414,7 @@ impl Default for VoiceState {
             otis_twin: otis_twin::TwinVoice::default(),
             bbus: bbus::Voice::default(),
             bbus_grit: false,
+            otis_warm_tables: true,
             fs77: fs77::Voice::default(),
             active_machine: None,
             note_pitch: 0.0,
@@ -507,8 +510,9 @@ impl VoiceState {
                 }
                 MachineKind::WestCoastLpg => self.west.step(hz, sample_rate, gate, trigger, &params),
                 MachineKind::OtisTranswave => {
+                    let warm = self.otis_warm_tables;
                     self.otis
-                        .step(hz, sample_rate, trigger, &params, calibrated, None)
+                        .step(hz, sample_rate, trigger, &params, calibrated, None, warm)
                 }
                 MachineKind::OtisTwin => {
                     self.otis_twin
@@ -790,7 +794,7 @@ impl VoiceState {
                 let signal = if machine == MachineKind::OtisTranswave {
                     let signal = self
                         .otis
-                        .step(hz, rate, trigger, &parameters, calibrated, source);
+                        .step(hz, rate, trigger, &parameters, calibrated, source, self.otis_warm_tables);
                     if self.otis.is_silent() {
                         self.capture.finish();
                     }
@@ -830,6 +834,7 @@ pub struct SynthRack {
     voice_calibration: bool,
     note_release_lanes: u8,
     bbus_grit_lanes: u8,
+    otis_warm_tables: bool,
     routing: RackRouting,
     render_order: [usize; NUM_LANES],
     byte_register: byte_route::Register,
@@ -858,6 +863,7 @@ impl SynthRack {
             voice_calibration: false,
             note_release_lanes: ALL_LANES_AUDIBLE,
             bbus_grit_lanes: 0,
+            otis_warm_tables: true,
             routing: RackRouting::default(),
             render_order: core::array::from_fn(|lane| lane),
             byte_register: byte_route::Register::default(),
@@ -906,7 +912,7 @@ impl SynthRack {
 
     pub fn reset_voices(&mut self) {
         self.voices = Self::fresh_voices(self.audible_mask, self.channels);
-        self.apply_bbus_grit();
+        self.apply_lane_flags();
         self.counter = ByteBusCounter::default();
     }
 
@@ -986,16 +992,24 @@ impl SynthRack {
     /// (the original, grittier sound). Other lanes restart it every cycle.
     pub fn set_bbus_grit_lanes(&mut self, lanes: u8) {
         self.bbus_grit_lanes = lanes & ALL_LANES_AUDIBLE;
-        self.apply_bbus_grit();
+        self.apply_lane_flags();
     }
 
     pub fn bbus_grit_lanes(&self) -> u8 {
         self.bbus_grit_lanes
     }
 
-    fn apply_bbus_grit(&mut self) {
+    /// Let OTIS TableSel reach the warm twin tables. Off maps it over the four
+    /// bright tables only, as in projects made before the warm tables.
+    pub fn set_otis_warm_tables(&mut self, enabled: bool) {
+        self.otis_warm_tables = enabled;
+        self.apply_lane_flags();
+    }
+
+    fn apply_lane_flags(&mut self) {
         for (lane, voice) in self.voices.iter_mut().enumerate() {
             voice.bbus_grit = self.bbus_grit_lanes & (1 << lane) != 0;
+            voice.otis_warm_tables = self.otis_warm_tables;
         }
     }
 
@@ -1917,8 +1931,10 @@ mod tests {
     fn bbus_grit_lanes_survive_voice_resets() {
         let mut rack = SynthRack::new(48_000.0);
         rack.set_bbus_grit_lanes(0b101);
+        rack.set_otis_warm_tables(false);
         rack.reset_voices();
         assert_eq!(rack.bbus_grit_lanes(), 0b101);
+        assert!(rack.voices.iter().all(|voice| !voice.otis_warm_tables));
         assert!(rack.voices[0].bbus_grit && !rack.voices[1].bbus_grit && rack.voices[2].bbus_grit);
     }
 }

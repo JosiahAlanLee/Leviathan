@@ -17,10 +17,14 @@ const NOTES: [u8; 4] = [36, 48, 60, 72];
 pub const FRAMES: [(usize, usize); 4] = [(0, 15), (1, 0), (2, 7), (3, 12)];
 
 // Decay, TableSel, FramePos, ScanDepth, K1Cutoff, K2Reso, FixedGrit, LoopMode.
-fn variants(table: usize, frame: usize) -> [(&'static str, [f32; 8]); 4] {
-    let t = table as f32 / 3.0;
+fn variants(table: usize, frame: usize) -> [(&'static str, [f32; 8]); 5] {
+    // With warm tables on, TableSel bands are eighths: bright in the lower
+    // half of each quarter, the warm twin in the upper half.
+    let t = (2.0 * table as f32 + 0.5) / 8.0;
+    let w = (2.0 * table as f32 + 1.5) / 8.0;
     let p = frame as f32 / 15.0;
     [
+        ("warm-clean", [1.0, w, p, 0.0, 1.0, 0.0, 0.0, 0.0]),
         ("clean", [1.0, t, p, 0.0, 1.0, 0.0, 0.0, 0.0]),
         ("default-filter", [1.0, t, p, 0.0, 0.65, 0.30, 0.0, 0.0]),
         ("grit25", [1.0, t, p, 0.0, 1.0, 0.0, 0.25, 0.0]),
@@ -46,9 +50,9 @@ fn main() -> std::io::Result<()> {
     let out = std::env::args().nth(1).unwrap_or_else(|| "parity-otis".into());
     let out = Path::new(&out);
     std::fs::create_dir_all(out)?;
-    // All 4 x 16 frames, table-major, little-endian i16.
+    // All 8 x 16 frames (4 bright, then their warm twins), table-major, little-endian i16.
     let mut rom = BufWriter::new(File::create(out.join("transwave-rom.s16"))?);
-    for table in 0..4 {
+    for table in 0..8 {
         for frame in 0..16 {
             for s in transwave_frame(table, frame) {
                 rom.write_all(&s.to_le_bytes())?;

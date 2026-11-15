@@ -63,6 +63,10 @@ Leviathan uses a strict hexagonal ("ports and adapters") layout so external GPU,
 - New sessions restart the **BBUS** register every note cycle (**BBUS cycle lock**, in **Voice / Trig** when the lane plays BBUS). Its sixteen steps are then one period, as when ByteBusLab Parallel Sum's cycle is the pitch, so the voice is pitched and harmonic.
 - **Lane grit** lets one lane's register run free across note cycles: the original sound, whose feedback repeats only every 15–255 cycles and reads as a noisy, digital comb around the pitch. Projects saved before the option load with the lock off, so they sound as before.
 
+## OTIS warm tables
+
+- **OTIS warm tables** (in **Voice / Trig** when the lane plays OTIS) adds a darker twin of each transwave table. **TableSel** then alternates bright and warm: the lower half of each quarter plays the original table, the upper half its twin (formant swept lower, partials rolled off above the fourth harmonic, peak-matched). New sessions turn it on; projects saved earlier keep the four bright tables.
+
 ## Wave 8 Echo, OtisKit and REWORK
 
 - In **Mixer** (F3), set **Echo mix** to send through Echo before Space. Set **Space mix** to zero for Echo alone. **Transport** follows quarter-notes and **ByteBus** measures clock intervals. At 120 BPM, 1× is 500 ms on Transport and 125 ms on the default ByteBus. The panel shows the effective delay and any ESP limit. **LOOP** accumulates the selected Hz shift across repeats. **POST** shifts each outgoing repeat once. Existing projects open with Echo and ESP off.

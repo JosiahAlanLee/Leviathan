@@ -325,6 +325,7 @@ impl LeviathanApp {
                     cycle_lock: true,
                     ..Default::default()
                 },
+                otis: project::OtisSettings { warm_tables: true },
                 ..Default::default()
             },
             capture_port,
@@ -678,6 +679,17 @@ impl LeviathanApp {
         let after = *bbus;
         if after != before {
             self.send_audio(AudioCommand::SetBbus(after));
+        }
+        if self.lane_patches[lane].machine == MachineKind::OtisTranswave {
+            let otis = &mut self.instruments.otis;
+            if ui
+                .checkbox(&mut otis.warm_tables, "OTIS warm tables")
+                .on_hover_text("TableSel alternates bright and warm: the lower half of each quarter plays the original table, the upper half a darker twin. Off keeps the four bright tables only, as in projects made before this option.")
+                .changed()
+            {
+                let otis = *otis;
+                self.send_audio(AudioCommand::SetOtis(otis));
+            }
         }
         ui.separator();
         if self.edit_lane_patch {
@@ -1711,6 +1723,7 @@ mod tests {
         let ctx = egui::Context::default();
         let app = offline_app(&ctx);
         assert!(app.instruments.bbus.cycle_lock);
+        assert!(app.instruments.otis.warm_tables);
         assert_eq!(app.instruments.bbus.grit_lanes(), 0);
     }
 

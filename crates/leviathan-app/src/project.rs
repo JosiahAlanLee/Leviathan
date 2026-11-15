@@ -55,6 +55,22 @@ pub struct InstrumentSettings {
     pub echo: echo::Params,
     pub note_gates: NoteGateSettings,
     pub bbus: BbusSettings,
+    pub otis: OtisSettings,
+}
+
+/// OTIS table set. Off (the default for projects saved before the warm
+/// tables) maps TableSel over the four bright tables; on, each band's upper
+/// half plays a warm twin.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OtisSettings {
+    pub warm_tables: bool,
+}
+
+impl OtisSettings {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// BBUS register timing. Off (the default for projects saved before it
@@ -165,6 +181,8 @@ struct InstrumentFile {
     note_gates: NoteGateSettings,
     #[serde(skip_serializing_if = "BbusSettings::is_default")]
     bbus: BbusSettings,
+    #[serde(skip_serializing_if = "OtisSettings::is_default")]
+    otis: OtisSettings,
 }
 
 impl InstrumentFile {
@@ -175,6 +193,7 @@ impl InstrumentFile {
             && self.echo == echo::Params::default()
             && self.note_gates.is_default()
             && self.bbus.is_default()
+            && self.otis.is_default()
     }
 }
 
@@ -578,6 +597,7 @@ impl ProjectFile {
                 echo,
                 note_gates: self.instruments.note_gates,
                 bbus: self.instruments.bbus,
+                otis: self.instruments.otis,
             },
         })
     }
@@ -670,6 +690,7 @@ pub fn save(path: &Path, project: Project) -> Result<(), String> {
             echo: project.instruments.echo,
             note_gates: project.instruments.note_gates,
             bbus: project.instruments.bbus,
+            otis: project.instruments.otis,
         },
     };
     let mut bytes = serde_json::to_vec(&project).map_err(|error| error.to_string())?;
@@ -869,6 +890,10 @@ mod tests {
         assert_eq!(serde_json::from_str::<BbusSettings>(&json).unwrap(), locked);
         let file = InstrumentFile { bbus: BbusSettings::default(), ..InstrumentFile::default() };
         assert!(!serde_json::to_string(&file).unwrap().contains("bbus"));
+        assert!(!legacy.otis.warm_tables);
+        let warm = OtisSettings { warm_tables: true };
+        let json = serde_json::to_string(&warm).unwrap();
+        assert_eq!(serde_json::from_str::<OtisSettings>(&json).unwrap(), warm);
     }
 
     #[test]

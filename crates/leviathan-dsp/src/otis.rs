@@ -3,7 +3,10 @@ use crate::voice::{approach, choice, sine_cycle};
 use crate::wrap_turns;
 use leviathan_core::SOUND_PARAMS;
 
-const TABLES: usize = 4;
+/// Four bright tables (0-3, shared with VAST K26 and FS77), then a warm twin
+/// of each (4-7).
+const TABLES: usize = 8;
+const BRIGHT_TABLES: usize = 4;
 const FRAMES: usize = 16;
 const SAMPLES: usize = 128;
 const FRACTION_BITS: u32 = 12;
@@ -17,10 +20,16 @@ const fn rom_sine(index: usize) -> f32 {
     sine_cycle((index % SAMPLES) as f32 / SAMPLES as f32)
 }
 
+/// Rolloff for the warm tables: -12 dB per octave above the fourth harmonic.
+const fn warmth(harmonic: usize) -> f32 {
+    let x = harmonic as f32 / 4.0;
+    1.0 / (1.0 + x * x)
+}
+
 const fn make_rom() -> [[[i16; SAMPLES]; FRAMES]; TABLES] {
     let mut rom = [[[0; SAMPLES]; FRAMES]; TABLES];
     let mut table = 0;
-    while table < TABLES {
+    while table < BRIGHT_TABLES {
         let mut frame = 0;
         while frame < FRAMES {
             let scan = frame as f32 / (FRAMES - 1) as f32;
@@ -67,16 +76,103 @@ const fn make_rom() -> [[[i16; SAMPLES]; FRAMES]; TABLES] {
         }
         table += 1;
     }
+    // Warm twins: the same partials rolled off, the formant sweep held lower,
+    // each frame scaled to its bright frame's peak.
+    while table < TABLES {
+        let base = table - BRIGHT_TABLES;
+        let mut frame = 0;
+        while frame < FRAMES {
+            let scan = frame as f32 / (FRAMES - 1) as f32;
+            let mut raw = [0.0f32; SAMPLES];
+            let mut peak = 0.0f32;
+            let mut sample = 0;
+            while sample < SAMPLES {
+                let wave = if base == 3 {
+                    sync_wave(frame, sample, true)
+                } else {
+                    let mut wave = 0.0;
+                    let mut harmonic = 1;
+                    while harmonic <= 16 {
+                        let n = harmonic as f32;
+                        let weight = match base {
+                            0 => {
+                                // Same formant, swept over two thirds of the range.
+                                let offset = (n - (2.0 + 8.0 * scan)) * 0.44;
+                                1.0 / (n * (1.0 + offset * offset))
+                            }
+                            1 => (match harmonic {
+                                1 => 0.45,
+                                3 => 0.35 * (1.0 - scan),
+                                5 => 0.22,
+                                8 => 0.31 * scan,
+                                13 => 0.18 * scan,
+                                _ => 0.0,
+                            }) * (1.0 + 3.0 * warmth(harmonic)) * 0.25,
+                            _ => rom_sine(harmonic * (9 + frame)) / n,
+                        } * match base {
+                            0 => (1.0 + warmth(harmonic)) * 0.5,
+                            1 => 1.0,
+                            _ => warmth(harmonic) * warmth(harmonic),
+                        };
+                        let phase = if base == 2 {
+                            harmonic * (sample + SAMPLES - (9 + frame)) + SAMPLES / 4
+                        } else {
+                            harmonic * sample
+                        };
+                        wave += weight * rom_sine(phase);
+                        harmonic += 1;
+                    }
+                    wave
+                };
+                raw[sample] = wave;
+                if wave.abs() > peak {
+                    peak = wave.abs();
+                }
+                sample += 1;
+            }
+            let mut target = 0.0f32;
+            sample = 0;
+            while sample < SAMPLES {
+                let v = (rom[base][frame][sample] as f32).abs();
+                if v > target {
+                    target = v;
+                }
+                sample += 1;
+            }
+            sample = 0;
+            while sample < SAMPLES {
+                rom[table][frame][sample] = if peak > 0.0 {
+                    (raw[sample] * target / peak) as i16
+                } else {
+                    0
+                };
+                sample += 1;
+            }
+            frame += 1;
+        }
+        table += 1;
+    }
     rom
 }
 
 const fn sync_sample(frame: usize, sample: usize) -> i16 {
+    let ratio = 1.0 + frame as f32 * 0.375;
+    if (frame * 3) % 8 == 0 {
+        return (22_000.0 * rom_sine(sample * ratio as usize)) as i16;
+    }
+    (22_000.0 * sync_wave(frame, sample, false).clamp(-1.4, 1.4)) as i16
+}
+
+const fn sync_wave(frame: usize, sample: usize, warm: bool) -> f32 {
     // A slave sine restarted once per fundamental cycle. Integrate its sine
     // and cosine coefficients and keep sixteen harmonics of the reset wave.
     let ratio = 1.0 + frame as f32 * 0.375;
     let fraction = (frame * 3) % 8 * (SAMPLES / 8);
     if fraction == 0 {
-        return (22_000.0 * rom_sine(sample * ratio as usize)) as i16;
+        // The slave lands on whole cycles: a plain sine at the slave ratio,
+        // which the warm twin keeps but pulls toward the fundamental.
+        let sine = rom_sine(sample * ratio as usize);
+        return if warm { 0.5 * sine + 0.5 * rom_sine(sample) } else { sine };
     }
     let edge_sin = rom_sine(fraction);
     let edge_cos = rom_sine(fraction + SAMPLES / 4);
@@ -88,10 +184,11 @@ const fn sync_sample(frame: usize, sample: usize) -> i16 {
         let cosine = ratio * (1.0 - edge_cos) / denominator;
         let sine = n * edge_sin / denominator;
         let phase = harmonic * sample;
-        wave += cosine * rom_sine(phase + SAMPLES / 4) + sine * rom_sine(phase);
+        let weight = if warm { warmth(harmonic) * warmth(harmonic) * warmth(harmonic) } else { 1.0 };
+        wave += weight * (cosine * rom_sine(phase + SAMPLES / 4) + sine * rom_sine(phase));
         harmonic += 1;
     }
-    (22_000.0 * wave.clamp(-1.4, 1.4)) as i16
+    wave
 }
 
 #[derive(Clone, Debug, Default)]
@@ -107,7 +204,7 @@ pub(super) struct Voice {
 }
 
 const _: () = assert!(core::mem::size_of::<Voice>() <= 128);
-const _: () = assert!(core::mem::size_of_val(&ROM) == 16 * 1024);
+const _: () = assert!(core::mem::size_of_val(&ROM) == 32 * 1024);
 
 impl Voice {
     #[inline]
@@ -119,6 +216,7 @@ impl Voice {
         params: &[f32; SOUND_PARAMS],
         calibrated: bool,
         source: Option<FrameSource<'_>>,
+        warm_tables: bool,
     ) -> f32 {
         let [decay, table, position, depth, k1, k2, grit, loop_mode] = *params;
         if let Some(velocity) = trigger {
@@ -169,7 +267,7 @@ impl Voice {
                     false,
                 )
             } else {
-                scan_sample(choice(table, TABLES), frame, phase) * (1.0 / 32_768.0)
+                scan_sample(table_index(table, warm_tables), frame, phase) * (1.0 / 32_768.0)
             };
         } else {
             self.hold -= 1;
@@ -189,6 +287,19 @@ impl Voice {
 
     pub(super) fn is_silent(&self) -> bool {
         self.amp == 0.0
+    }
+}
+
+/// TableSel to a ROM table. Without warm tables, four bands as before. With
+/// them, each band's lower half is the bright table and its upper half the
+/// warm twin.
+#[inline]
+fn table_index(table: f32, warm_tables: bool) -> usize {
+    if warm_tables {
+        let slot = choice(table, 2 * BRIGHT_TABLES);
+        slot / 2 + BRIGHT_TABLES * (slot % 2)
+    } else {
+        choice(table, BRIGHT_TABLES)
     }
 }
 
@@ -267,6 +378,50 @@ mod tests {
     }
 
     #[test]
+    fn legacy_table_select_is_unchanged_and_warm_twins_interleave() {
+        for i in 0..=1000 {
+            let v = i as f32 / 1000.0;
+            assert_eq!(table_index(v, false), choice(v, 4));
+            let warm = table_index(v, true);
+            assert_eq!(warm % BRIGHT_TABLES, choice(v, 4));
+            assert_eq!(warm >= BRIGHT_TABLES, choice(v, 8) % 2 == 1);
+        }
+        assert_eq!(table_index(0.0, true), 0);
+    }
+
+    #[test]
+    fn warm_twins_are_darker_and_level_matched() {
+        // Energy-weighted mean harmonic of a frame, by direct DFT.
+        let centroid = |frame: &[i16; SAMPLES]| {
+            let (mut weighted, mut total) = (0.0f64, 0.0f64);
+            for h in 1..=16usize {
+                let (mut re, mut im) = (0.0f64, 0.0f64);
+                for (i, &x) in frame.iter().enumerate() {
+                    let turn = (h * i) % SAMPLES;
+                    re += f64::from(x) * f64::from(rom_sine(turn + SAMPLES / 4));
+                    im += f64::from(x) * f64::from(rom_sine(turn));
+                }
+                let power = re * re + im * im;
+                weighted += h as f64 * power;
+                total += power;
+            }
+            weighted / total
+        };
+        let peak = |frame: &[i16; SAMPLES]| frame.iter().map(|x| x.unsigned_abs()).max().unwrap();
+        for table in 0..BRIGHT_TABLES {
+            let (mut bright, mut warm) = (0.0, 0.0);
+            for frame in 0..FRAMES {
+                bright += centroid(&ROM[table][frame]);
+                warm += centroid(&ROM[table + BRIGHT_TABLES][frame]);
+                let (b, w) = (peak(&ROM[table][frame]), peak(&ROM[table + BRIGHT_TABLES][frame]));
+                assert!(b.abs_diff(w) <= 2, "table {table} frame {frame}: peak {b} vs {w}");
+            }
+            let ratio = warm / bright;
+            assert!((0.5..0.75).contains(&ratio), "table {table}: warm/bright {ratio:.2}");
+        }
+    }
+
+    #[test]
     fn scans_are_bounded_and_one_shot_stops_at_the_end() {
         let mut params = MachineKind::OtisTranswave.spec().default_params();
         params[0] = 1.0;
@@ -285,6 +440,7 @@ mod tests {
                     &params,
                     false,
                     None,
+                    false,
                 );
                 assert!((-1.0..=1.0).contains(&sample));
                 energy += sample * sample;
