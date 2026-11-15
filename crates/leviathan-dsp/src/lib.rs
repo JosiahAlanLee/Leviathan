@@ -605,6 +605,14 @@ impl VoiceState {
             self.env = 0.0;
         }
         self.pitch_env *= 1.0 - (dt / 0.022);
+        // Held notes keep decaying; flush before the denormal range, where
+        // every multiply becomes many times slower.
+        if self.env < 1e-20 {
+            self.env = 0.0;
+        }
+        if self.pitch_env < 1e-20 {
+            self.pitch_env = 0.0;
+        }
 
         let base_hz = v_oct_to_hz(pitch);
         let freq = match machine {
@@ -2072,5 +2080,21 @@ mod tests {
             }
         }
         assert!(onsets[0][0].abs() < 0.01);
+    }
+
+    #[test]
+    fn held_legacy_envelopes_reach_zero_instead_of_denormals() {
+        let mut rack = SynthRack::new(8_000.0);
+        rack.set_lane_patch(0, LanePatch::for_machine(MachineKind::SubBass));
+        rack.reset_voices();
+        let mut cv = CvFrame::default();
+        cv.gate_v[0] = 10.0;
+        cv.velocity_v[0] = 10.0;
+        // A held note for 60 s at 8 kHz decays far past 1e-20.
+        for _ in 0..480_000 {
+            rack.render_stereo(&cv);
+        }
+        assert_eq!(rack.voices[0].env, 0.0);
+        assert_eq!(rack.voices[0].pitch_env, 0.0);
     }
 }

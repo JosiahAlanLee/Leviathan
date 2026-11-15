@@ -87,6 +87,11 @@ impl FourOpFmVoice {
 
         let mod_decay = 0.025 + 0.70 * lock_param(lock, 5, 0.28).clamp(0.0, 1.0);
         self.mod_env *= 1.0 - (dt / mod_decay);
+        // A held or idle voice decays forever; flush before the denormal
+        // range, where every multiply becomes many times slower.
+        if self.mod_env < 1e-20 {
+            self.mod_env = 0.0;
+        }
 
         let fb = lock_param(lock, 6, 0.18).clamp(0.0, 1.0) * 0.38;
         let ratios = operator_ratios(mod_ratio, lock, calibrated);
@@ -195,5 +200,18 @@ mod tests {
             *slot = sum;
         }
         assert!((energies[0] - energies[3]).abs() > 0.05);
+    }
+
+    #[test]
+    fn modulation_envelope_reaches_zero_instead_of_denormals() {
+        let mut voice = FourOpFmVoice::default();
+        voice.trigger();
+        let mut lock = SoundLock { mask: 1 << 5, ..SoundLock::default() };
+        lock.values[5] = 1.0; // slowest modulator decay
+        // 40 s at 8 kHz: the slowest decay passes 1e-20 after about 33 s.
+        for _ in 0..320_000 {
+            voice.step_sample(110.0, 8_000.0, 1.0, &lock);
+        }
+        assert_eq!(voice.mod_env, 0.0);
     }
 }
