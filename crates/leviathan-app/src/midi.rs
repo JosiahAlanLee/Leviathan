@@ -1,13 +1,13 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use leviathan_core::SongPlayer;
 use midir::{Ignore, MidiInput, MidiInputConnection};
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 
-const MIDI_QUEUE_CAPACITY: usize = 512;
+pub const MIDI_QUEUE_CAPACITY: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MidiKey {
@@ -22,6 +22,8 @@ pub enum MidiEvent {
     Start,
     Continue,
     Stop,
+    /// MIDI timing clock, 24 per quarter note.
+    Clock,
 }
 
 impl MidiEvent {
@@ -70,7 +72,8 @@ fn parse_packet(bytes: &[u8], mut on_event: impl FnMut(MidiEvent)) {
             0xfa => on_event(MidiEvent::Start),
             0xfb => on_event(MidiEvent::Continue),
             0xfc => on_event(MidiEvent::Stop),
-            0xf8 | 0xf9 | 0xfd..=0xff => {}
+            0xf8 => on_event(MidiEvent::Clock),
+            0xf9 | 0xfd..=0xff => {}
             0xf0 => {
                 in_sysex = true;
                 status = None;
@@ -155,6 +158,8 @@ pub struct MidiTarget {
 struct MidiPacket {
     port_epoch: u64,
     event: MidiEvent,
+    /// When the event arrived; None plays it at the start of the next block.
+    at: Option<Instant>,
 }
 
 struct MidiSender {
@@ -212,8 +217,13 @@ impl MidiReceiver {
     }
 
     pub fn pop(&mut self) -> Option<MidiEvent> {
+        self.pop_timed().map(|(event, _)| event)
+    }
+
+    /// The next event of the current port and its arrival time, if stamped.
+    pub fn pop_timed(&mut self) -> Option<(MidiEvent, Option<Instant>)> {
         let packet = self.queue.pop().ok()?;
-        (packet.port_epoch == self.current_epoch).then_some(packet.event)
+        (packet.port_epoch == self.current_epoch).then_some((packet.event, packet.at))
     }
 
     pub fn discard_pending(&mut self) {
@@ -231,7 +241,7 @@ struct MidiSenders {
 impl MidiSenders {
     fn push(&mut self, packet: MidiPacket) {
         self.audio.push(packet);
-        if !matches!(packet.event, MidiEvent::NoteOff(_)) {
+        if !matches!(packet.event, MidiEvent::NoteOff(_) | MidiEvent::Clock) {
             self.ui.push(packet);
         }
     }
@@ -246,6 +256,9 @@ struct CallbackData {
 }
 
 fn receive_message(_timestamp: u64, bytes: &[u8], data: &mut CallbackData) {
+    // midir's timestamp has no shared epoch with the audio callback; the
+    // arrival instant does, and the callback runs as the bytes arrive.
+    let at = Some(Instant::now());
     parse_packet(bytes, |event| {
         if data.senders.is_none() {
             data.senders = data.handoff.pop().ok();
@@ -254,6 +267,7 @@ fn receive_message(_timestamp: u64, bytes: &[u8], data: &mut CallbackData) {
             senders.push(MidiPacket {
                 port_epoch: data.port_epoch,
                 event,
+                at,
             });
         }
     });
@@ -276,6 +290,10 @@ pub struct MidiControls {
     port_epoch: Arc<AtomicU64>,
     pub events: MidiReceiver,
     pub record_armed: bool,
+    /// Follow an incoming MIDI clock's tempo and phase.
+    pub follow_clock: bool,
+    /// Tempo of the followed clock, from audio telemetry.
+    pub clock_bpm: Option<f32>,
     error: Option<String>,
 }
 
@@ -292,6 +310,8 @@ impl MidiControls {
                 port_epoch,
                 events: ui_events,
                 record_armed: false,
+            follow_clock: true,
+            clock_bpm: None,
                 error: None,
             },
             audio_events,
@@ -409,6 +429,11 @@ impl MidiControls {
         }
         ui.toggle_value(&mut self.record_armed, "MIDI REC")
             .on_hover_text("Write MIDI notes and velocities at the tracker cursor");
+        ui.checkbox(&mut self.follow_clock, "Follow MIDI clock")
+            .on_hover_text("Take tempo from an incoming MIDI clock and stay phase-locked to it. Start and Continue wait for the next clock tick.");
+        if let Some(bpm) = self.clock_bpm.filter(|_| self.follow_clock) {
+            ui.label(format!("Clock {bpm:.1} BPM"));
+        }
         if let Some(error) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
@@ -417,11 +442,22 @@ impl MidiControls {
         }
     }
 
+    /// Inject an event stamped with an arrival time, as a port would.
+    #[cfg(test)]
+    pub fn inject_at(&mut self, event: MidiEvent, at: Instant) {
+        self.idle.as_mut().unwrap().push(MidiPacket {
+            port_epoch: self.port_epoch.load(Ordering::Relaxed),
+            event,
+            at: Some(at),
+        });
+    }
+
     #[cfg(test)]
     pub fn inject(&mut self, event: MidiEvent) {
         self.idle.as_mut().unwrap().push(MidiPacket {
             port_epoch: self.port_epoch.load(Ordering::Relaxed),
             event,
+            at: None,
         });
     }
 }
@@ -514,6 +550,7 @@ mod tests {
             mixed,
             vec![
                 MidiEvent::Start,
+                MidiEvent::Clock,
                 MidiEvent::NoteOn {
                     key: MidiKey {
                         channel: 1,

@@ -1105,6 +1105,7 @@ impl eframe::App for LeviathanApp {
                     *peak = peak.max(gate);
                 }
                 self.latest_cv = telemetry.cv;
+                self.midi.clock_bpm = telemetry.midi_clock_bpm;
                 self.latest_scope = telemetry.scope;
                 self.latest_song = telemetry.song;
                 self.rack_panel.stage = telemetry.capture_stage;
@@ -1274,7 +1275,12 @@ impl eframe::App for LeviathanApp {
                     self.send_audio(AudioCommand::SetBpm(self.bpm));
                 }
                 ui.separator();
+                let follow = self.midi.follow_clock;
                 self.midi.draw(ui);
+                if self.midi.follow_clock != follow {
+                    let follow = self.midi.follow_clock;
+                    self.send_audio(AudioCommand::SetMidiClockFollow(follow));
+                }
                 ui.separator();
                 ui.small(&self.audio_status);
             });
