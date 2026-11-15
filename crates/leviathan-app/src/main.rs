@@ -326,6 +326,7 @@ impl LeviathanApp {
                     ..Default::default()
                 },
                 otis: project::OtisSettings { warm_tables: true },
+                oversample: project::OversampleSettings { enabled: true, ..Default::default() },
                 ..Default::default()
             },
             capture_port,
@@ -679,6 +680,25 @@ impl LeviathanApp {
         let after = *bbus;
         if after != before {
             self.send_audio(AudioCommand::SetBbus(after));
+        }
+        if matches!(
+            self.lane_patches[lane].machine,
+            MachineKind::Fs77FormantFm | MachineKind::FourOpFm | MachineKind::AcidLead
+        ) {
+            let oversample = &mut self.instruments.oversample;
+            let before = *oversample;
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut oversample.enabled, "Oversample FM and Acid")
+                    .on_hover_text("Run FS77 and the 4-Op FM operators at four times the output rate and band-limit Acid's saw, so high notes and deep modulation stop folding back as low, inharmonic tones. Off keeps every lane at the original single rate, as in projects made before this option.");
+                if oversample.enabled {
+                    ui.checkbox(&mut oversample.grit[lane], format!("Lane {} grit", lane + 1))
+                        .on_hover_text("Keep this lane at the original single rate, with its aliasing.");
+                }
+            });
+            let after = *oversample;
+            if after != before {
+                self.send_audio(AudioCommand::SetOversample(after));
+            }
         }
         if self.lane_patches[lane].machine == MachineKind::OtisTranswave {
             let otis = &mut self.instruments.otis;
@@ -1724,6 +1744,7 @@ mod tests {
         let app = offline_app(&ctx);
         assert!(app.instruments.bbus.cycle_lock);
         assert!(app.instruments.otis.warm_tables);
+        assert!(app.instruments.oversample.enabled);
         assert_eq!(app.instruments.bbus.grit_lanes(), 0);
     }
 

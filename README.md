@@ -63,6 +63,10 @@ Leviathan uses a strict hexagonal ("ports and adapters") layout so external GPU,
 - New sessions restart the **BBUS** register every note cycle (**BBUS cycle lock**, in **Voice / Trig** when the lane plays BBUS). Its sixteen steps are then one period, as when ByteBusLab Parallel Sum's cycle is the pitch, so the voice is pitched and harmonic.
 - **Lane grit** lets one lane's register run free across note cycles: the original sound, whose feedback repeats only every 15–255 cycles and reads as a noisy, digital comb around the pitch. Projects saved before the option load with the lock off, so they sound as before.
 
+## Oversampled FM and Acid
+
+- **Oversample FM and Acid** (in **Voice / Trig** on FS77, 4-Op FM and Acid lanes) runs FS77 and the 4-Op FM operators at four times the output rate through a 96-tap decimator and band-limits Acid's saw (polyBLEP), so high notes and deep modulation no longer fold back as low, inharmonic tones. **Lane grit** keeps a lane at the original single rate. New sessions turn it on; projects saved earlier keep the original rendering. Six oversampled FS77 lanes take about a fifth of one core.
+
 ## OTIS warm tables
 
 - **OTIS warm tables** (in **Voice / Trig** when the lane plays OTIS) adds a darker twin of each transwave table. **TableSel** then alternates bright and warm: the lower half of each quarter plays the original table, the upper half its twin (formant swept lower, partials rolled off above the fourth harmonic, peak-matched). New sessions turn it on; projects saved earlier keep the four bright tables.

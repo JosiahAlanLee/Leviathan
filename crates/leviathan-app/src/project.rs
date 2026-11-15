@@ -57,6 +57,35 @@ pub struct InstrumentSettings {
     pub note_gates: NoteGateSettings,
     pub bbus: BbusSettings,
     pub otis: OtisSettings,
+    pub oversample: OversampleSettings,
+}
+
+/// FS77 and 4-Op FM at 4x with a band-limited Acid saw. Off (the default for
+/// projects saved before it) keeps every lane at the original single rate;
+/// on oversamples every lane not marked grit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OversampleSettings {
+    pub enabled: bool,
+    pub grit: [bool; NUM_LANES],
+}
+
+impl OversampleSettings {
+    pub fn grit_lanes(self) -> u8 {
+        if !self.enabled {
+            return (1 << NUM_LANES) - 1;
+        }
+        self.grit
+            .into_iter()
+            .enumerate()
+            .filter(|&(_, grit)| grit)
+            .map(|(lane, _)| 1 << lane)
+            .sum()
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// OTIS table set. Off (the default for projects saved before the warm
@@ -184,6 +213,8 @@ struct InstrumentFile {
     bbus: BbusSettings,
     #[serde(skip_serializing_if = "OtisSettings::is_default")]
     otis: OtisSettings,
+    #[serde(skip_serializing_if = "OversampleSettings::is_default")]
+    oversample: OversampleSettings,
 }
 
 impl InstrumentFile {
@@ -195,6 +226,7 @@ impl InstrumentFile {
             && self.note_gates.is_default()
             && self.bbus.is_default()
             && self.otis.is_default()
+            && self.oversample.is_default()
     }
 }
 
@@ -619,6 +651,7 @@ impl ProjectFile {
                 note_gates: self.instruments.note_gates,
                 bbus: self.instruments.bbus,
                 otis: self.instruments.otis,
+                oversample: self.instruments.oversample,
             },
         })
     }
@@ -712,6 +745,7 @@ pub fn save(path: &Path, project: Project) -> Result<(), String> {
             note_gates: project.instruments.note_gates,
             bbus: project.instruments.bbus,
             otis: project.instruments.otis,
+            oversample: project.instruments.oversample,
         },
     };
     let mut bytes = serde_json::to_vec(&project).map_err(|error| error.to_string())?;
@@ -912,6 +946,11 @@ mod tests {
         let file = InstrumentFile { bbus: BbusSettings::default(), ..InstrumentFile::default() };
         assert!(!serde_json::to_string(&file).unwrap().contains("bbus"));
         assert!(!legacy.otis.warm_tables);
+        assert_eq!(legacy.oversample.grit_lanes(), 0b11_1111);
+        let mut oversample = OversampleSettings { enabled: true, ..OversampleSettings::default() };
+        assert_eq!(oversample.grit_lanes(), 0);
+        oversample.grit[4] = true;
+        assert_eq!(oversample.grit_lanes(), 0b1_0000);
         let warm = OtisSettings { warm_tables: true };
         let json = serde_json::to_string(&warm).unwrap();
         assert_eq!(serde_json::from_str::<OtisSettings>(&json).unwrap(), warm);
