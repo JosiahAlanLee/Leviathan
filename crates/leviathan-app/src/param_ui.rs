@@ -1,5 +1,6 @@
 use eframe::egui;
-use leviathan_dsp::{otis_kit, MachineKind, MachineSpec, TwinLoopMode};
+use leviathan_dsp::otis_kit::{self, VelocityCurve};
+use leviathan_dsp::{MachineKind, MachineSpec, TwinLoopMode};
 
 pub const MODE_GRIT_SLOT: usize = 7;
 const KIT_GAIN_HELP: &str =
@@ -93,41 +94,41 @@ fn draw_mode_grit(ui: &mut egui::Ui, value: &mut f32, inherited: Option<f32>) ->
     changed
 }
 
-fn kit_velocity_db(velocity: u8) -> Option<f32> {
-    otis_kit::velocity_gain_db(f32::from(velocity.min(127)) / 127.0)
+fn kit_velocity_db(velocity: u8, curve: VelocityCurve) -> Option<f32> {
+    otis_kit::velocity_gain_db_with(f32::from(velocity.min(127)) / 127.0, curve)
 }
 
-pub fn format_kit_velocity(velocity: u8) -> String {
-    match kit_velocity_db(velocity) {
+pub fn format_kit_velocity(velocity: u8, curve: VelocityCurve) -> String {
+    match kit_velocity_db(velocity, curve) {
         None => "Silent".into(),
         Some(db) if db == 0.0 => "0 dB".into(),
         Some(db) => format!("{db:.2} dB"),
     }
 }
 
-fn parse_kit_velocity(input: &str) -> Option<u8> {
+fn parse_kit_velocity(input: &str, curve: VelocityCurve) -> Option<u8> {
     let input = input.trim().to_ascii_lowercase().replace('−', "-");
     let value = input.strip_suffix("db").unwrap_or(&input).trim_end();
     if matches!(value, "silent" | "-inf" | "-infinity" | "-∞") {
         return Some(0);
     }
     let db = value.parse::<f32>().ok().filter(|db| db.is_finite())?;
-    let db = db.clamp(kit_velocity_db(1).unwrap(), 0.0);
+    let db = db.clamp(kit_velocity_db(1, curve).unwrap(), 0.0);
     (1..=127).min_by(|&left, &right| {
-        let error = |velocity| (kit_velocity_db(velocity).unwrap() - db).abs();
+        let error = |velocity| (kit_velocity_db(velocity, curve).unwrap() - db).abs();
         error(left).total_cmp(&error(right))
     })
 }
 
-pub fn draw_kit_velocity(ui: &mut egui::Ui, velocity: &mut u8) -> bool {
+pub fn draw_kit_velocity(ui: &mut egui::Ui, velocity: &mut u8, curve: VelocityCurve) -> bool {
     let original = *velocity;
     ui.horizontal_wrapped(|ui| {
         ui.label("Kit velocity gain").on_hover_text(KIT_GAIN_HELP);
         ui.add(
             egui::DragValue::new(velocity)
                 .range(0..=127)
-                .custom_formatter(|value, _| format_kit_velocity(value as u8))
-                .custom_parser(|input| parse_kit_velocity(input).map(f64::from))
+                .custom_formatter(|value, _| format_kit_velocity(value as u8, curve))
+                .custom_parser(|input| parse_kit_velocity(input, curve).map(f64::from))
                 .update_while_editing(false),
         )
         .on_hover_text(KIT_GAIN_HELP);
@@ -141,17 +142,24 @@ mod tests {
 
     #[test]
     fn every_midi_velocity_round_trips_through_the_display() {
-        for velocity in 0..=127 {
-            assert_eq!(
-                parse_kit_velocity(&format_kit_velocity(velocity)),
-                Some(velocity)
-            );
+        for curve in VelocityCurve::ALL {
+            for velocity in 0..=127 {
+                assert_eq!(
+                    parse_kit_velocity(&format_kit_velocity(velocity, curve), curve),
+                    Some(velocity)
+                );
+            }
         }
-        assert_eq!(parse_kit_velocity("−18.75 dB"), Some(94));
-        assert_eq!(parse_kit_velocity("-9.8"), Some(110));
-        assert_eq!(parse_kit_velocity("1e20"), Some(127));
-        assert_eq!(parse_kit_velocity("-1e20"), Some(1));
-        assert_eq!(parse_kit_velocity("-∞ dB"), Some(0));
-        assert_eq!(parse_kit_velocity("NaN"), None);
+        let chip = VelocityCurve::Chip;
+        assert_eq!(parse_kit_velocity("−18.75 dB", chip), Some(94));
+        assert_eq!(parse_kit_velocity("-9.8", chip), Some(110));
+        assert_eq!(parse_kit_velocity("1e20", chip), Some(127));
+        assert_eq!(parse_kit_velocity("-1e20", chip), Some(1));
+        assert_eq!(parse_kit_velocity("-∞ dB", chip), Some(0));
+        assert_eq!(parse_kit_velocity("NaN", chip), None);
+        let soft = VelocityCurve::Soft;
+        assert_eq!(format_kit_velocity(94, soft), "-6.25 dB");
+        assert_eq!(parse_kit_velocity("-6.25 dB", soft), Some(94));
+        assert_eq!(parse_kit_velocity("-1e20", soft), Some(1));
     }
 }

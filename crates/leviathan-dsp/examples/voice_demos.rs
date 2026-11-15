@@ -593,10 +593,9 @@ const K_RIM: u8 = 65;
 const K_TOM: u8 = 66;
 const K_METAL: u8 = 67;
 
-/// OtisKit's hit gain falls 0.375 dB per step below 127 (velocity 94 is
-/// -18.75 dB, 52 is about -44 dB), so musical 0..127 dynamics map into 100..127.
+/// One kit hit. The demo kit uses the soft velocity curve (24 dB of range).
 fn kit_cell(slot: u8, velocity: u8) -> leviathan_core::NoteCell {
-    note(slot, 100 + (u16::from(velocity.min(127)) * 27 / 127) as u8, 0.5)
+    note(slot, velocity, 0.5)
 }
 
 fn kit_machine(e: usize) -> (Pattern, Scene) {

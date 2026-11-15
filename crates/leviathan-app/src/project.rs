@@ -10,7 +10,9 @@ use leviathan_core::{
     ROWS_PER_PATTERN, SOUND_PARAMS,
 };
 use leviathan_dsp::sampler::{SampleBank, SampleRegion, MAX_WAVE_LEN, NUM_BANKS};
-use leviathan_dsp::otis_kit::{Lane as KitLane, Slot as KitSlot, MAX_FRAMES as MAX_KIT_FRAMES, SLOTS};
+use leviathan_dsp::otis_kit::{
+    Lane as KitLane, Slot as KitSlot, VelocityCurve, MAX_FRAMES as MAX_KIT_FRAMES, SLOTS,
+};
 use leviathan_dsp::{default_lane_patches, echo, esp, BenderParams, DelayMode, LanePatch, MachineKind};
 use serde::{Deserialize, Serialize};
 
@@ -250,6 +252,20 @@ struct KitLaneDef {
     bytebus: bool,
     clock: u8,
     drop_samples: bool,
+    // Projects saved before the soft curve existed load on the chip curve.
+    #[serde(default, with = "VelocityCurveDef", skip_serializing_if = "is_chip_curve")]
+    velocity: VelocityCurve,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "VelocityCurve")]
+enum VelocityCurveDef {
+    Chip,
+    Soft,
+}
+
+fn is_chip_curve(curve: &VelocityCurve) -> bool {
+    *curve == VelocityCurve::Chip
 }
 
 #[derive(Serialize, Deserialize)]
@@ -804,6 +820,20 @@ mod tests {
         let oversized = format!("{prefix}{frames}[300,-400],[500,-600]]}}");
         let error = serde_json::from_str::<CaptureFile>(&oversized).err().unwrap();
         assert!(error.to_string().contains("frame budget"));
+    }
+
+    #[test]
+    fn kit_lane_velocity_curve_round_trips_and_legacy_lanes_stay_on_chip() {
+        let legacy: StoredKitLane =
+            serde_json::from_str(r#"{"bytebus":false,"clock":1,"drop_samples":true}"#).unwrap();
+        assert_eq!(legacy.0.velocity, VelocityCurve::Chip);
+        assert_eq!((legacy.0.clock, legacy.0.drop_samples), (1, true));
+        let chip = serde_json::to_string(&StoredKitLane(KitLane::default())).unwrap();
+        assert!(!chip.contains("velocity"), "{chip}");
+        let soft = KitLane { velocity: VelocityCurve::Soft, ..KitLane::default() };
+        let json = serde_json::to_string(&StoredKitLane(soft)).unwrap();
+        assert!(json.contains(r#""velocity":"Soft""#), "{json}");
+        assert_eq!(serde_json::from_str::<StoredKitLane>(&json).unwrap().0, soft);
     }
 
     #[test]

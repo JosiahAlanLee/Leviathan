@@ -393,7 +393,8 @@ pub fn default_scene(patches: [LanePatch; NUM_LANES]) -> Scene {
 // ---- synthetic one-shot kit ------------------------------------------------
 
 /// Eight synthesized one-shots (no recordings): kick, snare, closed hat, open
-/// hat, clap, rim, low tom, metal. Slot n plays from MIDI 60 + n.
+/// hat, clap, rim, low tom, metal. Slot n plays from MIDI 60 + n. Lanes use
+/// the soft velocity curve so tracker dynamics stay audible.
 pub fn synth_kit(clock: u8) -> Kit {
     let rate = RATE as f32;
     let mut noise = 0x1234_5678u32;
@@ -487,6 +488,6 @@ pub fn synth_kit(clock: u8) -> Kit {
     Kit {
         pcm: [kick, snare, closed, open, clap, rim, tom, metal],
         slots: [otis_kit::Slot::default(); otis_kit::SLOTS],
-        lanes: [otis_kit::Lane { bytebus: false, clock, drop_samples: false }; NUM_LANES],
+        lanes: [otis_kit::Lane { clock, velocity: otis_kit::VelocityCurve::Soft, ..Default::default() }; NUM_LANES],
     }
 }
