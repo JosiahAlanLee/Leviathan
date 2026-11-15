@@ -1403,10 +1403,19 @@ mod tests {
         music_frames: usize,
         frames: usize,
     ) -> Vec<(f32, f32)> {
+        render_test_project_live_at(project, 48_000.0, music_frames, frames)
+    }
+
+    fn render_test_project_live_at(
+        project: &Project,
+        rate: f64,
+        music_frames: usize,
+        frames: usize,
+    ) -> Vec<(f32, f32)> {
         let (tx, rx) = rtrb::RingBuffer::new(8);
         let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(16);
         let mut audio = AudioControl::new(tx);
-        let mut worker = RtAudioWorker::new(Pattern::default(), 48_000.0, rx, tel_tx, None);
+        let mut worker = RtAudioWorker::new(Pattern::default(), rate, rx, tel_tx, None);
         audio.send(AudioCommand::ReplaceProject(Arc::new(AudioProject::prepare(
             project, 1,
         ))));
@@ -2688,5 +2697,90 @@ mod tests {
             "beat {beat}, ticks say {}",
             expected + since_last_tick
         );
+    }
+
+    #[test]
+    fn wav_export_matches_live_playback_at_every_sample_rate() {
+        use leviathan_dsp::{echo, MachineKind};
+
+        let ctx = eframe::CreationContext::_new_kittest(eframe::egui::Context::default());
+        let app = crate::LeviathanApp::with_audio(&ctx, |_, _, _, _, _| Err("Offline".into()));
+        let make = || {
+        let mut project = app.project_snapshot();
+        project.bpm = 128.0;
+        let machines = [
+            MachineKind::ByteBusR2r,
+            MachineKind::OtisTranswave,
+            MachineKind::Fs77FormantFm,
+            MachineKind::FourOpFm,
+            MachineKind::OtisKit,
+            MachineKind::AcidLead,
+        ];
+        project.patterns[0] = Pattern { length: 16, ..Pattern::default() };
+        for (lane, machine) in machines.into_iter().enumerate() {
+            project.lane_patches[lane] = LanePatch::for_machine_with_calibration(machine);
+            project.lane_mix.channels[lane].0.delay_send = 0.3;
+            project.lane_mix.channels[lane].0.fx_send = 0.4;
+            for row in (lane % 3..16).step_by(3) {
+                project.patterns[0].lanes[lane][row] = NoteCell {
+                    active: true,
+                    midi: 45 + ((row * 7 + lane * 5) % 24) as u8,
+                    velocity: 90 + (row as u8 % 4) * 9,
+                    gate_fraction: if row % 2 == 0 { 0.5 } else { 1.0 },
+                    ..NoteCell::default()
+                };
+            }
+        }
+        project.instruments.kit.load_factory();
+        project.instruments.echo = echo::Params { echo_mix: 0.4, feedback: 0.5, ..echo::Params::default() };
+        project.bender_params.feedback = 0.4;
+        project
+        };
+
+        let dir = std::env::temp_dir().join(format!("leviathan-rate-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for rate in crate::export::SAMPLE_RATES {
+            let project = make();
+            let destination = dir.join(format!("{rate}.wav"));
+            ExportJob::start(
+                make(),
+                false,
+                ExportRequest {
+                    destination: destination.clone(),
+                    settings: ExportSettings {
+                        encoding: WavEncoding::Float32,
+                        sample_rate: rate,
+                        tail_seconds: 0.01,
+                        ..ExportSettings::default()
+                    },
+                },
+            )
+            .unwrap()
+            .finish()
+            .unwrap();
+            let wav = std::fs::read(&destination).unwrap();
+            let data = wav.windows(4).position(|w| w == b"data").unwrap() + 8;
+            let frames = (wav.len() - data) / 8;
+            // One bar of music, then the tail; compare the music the live
+            // transport renders before it is stopped.
+            let music = (4.0 * 60.0 * f64::from(rate) / project.bpm).floor() as usize - 1;
+            let live = render_test_project_live_at(&project, f64::from(rate), music, music);
+            assert!(frames > music, "{rate}: {frames} frames");
+            let mut energy = 0.0f64;
+            for (n, frame) in wav[data..data + music * 8].chunks_exact(8).enumerate() {
+                let left = f32::from_le_bytes(frame[..4].try_into().unwrap());
+                let right = f32::from_le_bytes(frame[4..].try_into().unwrap());
+                assert_eq!(live[n], (left, right), "{rate} Hz frame {n}");
+                energy += f64::from(left * left + right * right);
+            }
+            assert!(energy > 1.0, "{rate} Hz export is too quiet to compare");
+            // LEVIATHAN_KEEP_EXPORTS=<dir> keeps the WAVs for listening or analysis.
+            if let Some(keep) = std::env::var_os("LEVIATHAN_KEEP_EXPORTS") {
+                let keep = std::path::PathBuf::from(keep);
+                std::fs::create_dir_all(&keep).unwrap();
+                std::fs::copy(&destination, keep.join(format!("export-{rate}.wav"))).unwrap();
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
