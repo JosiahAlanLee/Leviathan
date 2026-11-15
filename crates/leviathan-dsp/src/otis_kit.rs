@@ -15,6 +15,35 @@ pub struct Lane {
     pub bytebus: bool,
     pub clock: u8,
     pub drop_samples: bool,
+    pub velocity: VelocityCurve,
+}
+
+/// How MIDI velocity maps to hit gain. Both curves keep 192 quantized steps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VelocityCurve {
+    /// 0.375 dB per step, 72 dB of range: velocity 94 is -18.75 dB.
+    #[default]
+    Chip,
+    /// 0.125 dB per step, about 24 dB of range: velocity 94 is -6.25 dB.
+    Soft,
+}
+
+impl VelocityCurve {
+    pub const ALL: [Self; 2] = [Self::Chip, Self::Soft];
+
+    pub const fn step_db(self) -> f32 {
+        match self {
+            Self::Chip => 0.375,
+            Self::Soft => 0.125,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Chip => "Chip (72 dB)",
+            Self::Soft => "Soft (24 dB)",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -87,19 +116,31 @@ fn exp2(octaves: f32) -> f32 {
     part * part * part
 }
 
-/// Relative gain in dB for a normalized hit velocity. Silence has no finite gain.
+/// Relative gain in dB for a normalized hit velocity on the chip curve.
+/// Silence has no finite gain.
 #[inline]
 pub fn velocity_gain_db(velocity: f32) -> Option<f32> {
+    velocity_gain_db_with(velocity, VelocityCurve::Chip)
+}
+
+/// Relative gain in dB for a normalized hit velocity on `curve`.
+#[inline]
+pub fn velocity_gain_db_with(velocity: f32, curve: VelocityCurve) -> Option<f32> {
     if !velocity.is_finite() || velocity <= 0.0 {
         None
     } else {
         let steps = (192.0 * (1.0 - velocity.clamp(0.0, 1.0)) + 0.5) as u32;
-        Some(-0.375 * steps as f32)
+        Some(-curve.step_db() * steps as f32)
     }
 }
 
+#[cfg(test)]
 fn log_velocity(velocity: f32) -> f32 {
-    velocity_gain_db(velocity).map_or(0.0, |db| exp2(db / 6.020_6))
+    log_velocity_with(velocity, VelocityCurve::Chip)
+}
+
+fn log_velocity_with(velocity: f32, curve: VelocityCurve) -> f32 {
+    velocity_gain_db_with(velocity, curve).map_or(0.0, |db| exp2(db / 6.020_6))
 }
 
 impl Hit {
@@ -110,6 +151,7 @@ impl Hit {
         velocity: f32,
         clock: u8,
         drop_samples: bool,
+        curve: VelocityCurve,
         rate: f32,
     ) -> Self {
         let chip = CHIP_RATES[usize::from(clock).min(CHIP_RATES.len() - 1)];
@@ -117,7 +159,7 @@ impl Hit {
         let start_frame = ((end_frame as f32 * params.start) as usize).min(end_frame - 1);
         let start = start_frame as u64 * ONE;
         let end = sample.pcm.len() as u64 * ONE;
-        let amp = log_velocity(velocity) * params.level * params.level;
+        let amp = log_velocity_with(velocity, curve) * params.level * params.level;
         let seconds = 0.02 * exp2(8.965_784 * params.decay);
         let decay = if params.decay >= 1.0 {
             1.0
@@ -272,6 +314,7 @@ impl Voice {
                     velocity,
                     clock,
                     settings.drop_samples,
+                    settings.velocity,
                     sample_rate,
                 );
                 if next.generation.is_some() {
@@ -355,6 +398,19 @@ mod tests {
         assert_eq!(velocity_gain_db(1.0), Some(0.0));
         assert_eq!(velocity_gain_db(110.0 / 127.0), Some(-9.75));
         assert_eq!(velocity_gain_db(94.0 / 127.0), Some(-18.75));
+        let soft = |midi: f32| velocity_gain_db_with(midi / 127.0, VelocityCurve::Soft);
+        assert_eq!(soft(0.0), None);
+        assert_eq!(soft(127.0), Some(0.0));
+        assert_eq!(soft(110.0), Some(-3.25));
+        assert_eq!(soft(94.0), Some(-6.25));
+        assert_eq!(soft(1.0), Some(-23.75));
+        for midi in 1..=127 {
+            let v = f32::from(midi as u8) / 127.0;
+            assert_eq!(
+                velocity_gain_db_with(v, VelocityCurve::Soft).map(|db| db * 3.0),
+                velocity_gain_db(v)
+            );
+        }
         let gain_delta = log_velocity(94.0 / 127.0) / log_velocity(110.0 / 127.0);
         assert!((20.0 * f64::from(gain_delta).log10() + 9.0).abs() < 0.01);
     }
@@ -395,6 +451,7 @@ mod tests {
                 1.0,
                 0,
                 false,
+                VelocityCurve::Chip,
                 output_rate,
             );
             assert!(

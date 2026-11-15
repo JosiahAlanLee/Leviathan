@@ -684,6 +684,7 @@ impl LeviathanApp {
             row,
             self.patterns[pattern].lanes[lane][row],
             &self.lane_patches[lane],
+            self.instruments.kit.lanes[lane].velocity,
         ) {
             self.record_inspector_undo_once(ui.ctx(), pattern);
             self.patterns[pattern].lanes[lane][row] = cell;
@@ -1544,7 +1545,10 @@ impl eframe::App for LeviathanApp {
                                             if machine == MachineKind::OtisKit {
                                                 ui.label(format!(
                                                     "Kit hit gain · {}",
-                                                    param_ui::format_kit_velocity(cell.velocity)
+                                                    param_ui::format_kit_velocity(
+                                                        cell.velocity,
+                                                        self.instruments.kit.lanes[lane].velocity,
+                                                    )
                                                 ));
                                             }
                                         });

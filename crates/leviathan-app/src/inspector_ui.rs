@@ -42,6 +42,7 @@ pub fn draw_step(
     row: usize,
     current_cell: NoteCell,
     lane_patch: &LanePatch,
+    kit_curve: leviathan_dsp::otis_kit::VelocityCurve,
 ) -> Option<NoteCell> {
     let mut edit_cell = current_cell;
     let mut cell_dirty = false;
@@ -165,7 +166,7 @@ pub fn draw_step(
     if spec.kind == MachineKind::OtisKit {
         cell_dirty |= ui
             .push_id((lane, row), |ui| {
-                param_ui::draw_kit_velocity(ui, &mut edit_cell.velocity)
+                param_ui::draw_kit_velocity(ui, &mut edit_cell.velocity, kit_curve)
             })
             .inner;
     }
@@ -308,21 +309,21 @@ mod tests {
                     velocity: 0,
                     ..NoteCell::default()
                 };
-                assert!(draw_step(ui, 1, 4, cell, &LanePatch::default()).is_none());
+                assert!(draw_step(ui, 1, 4, cell, &LanePatch::default(), Default::default()).is_none());
                 let mut patch = LanePatch::for_machine(MachineKind::OtisTwin);
                 patch.params[param_ui::MODE_GRIT_SLOT] = 0.28;
                 let saved = patch;
                 assert!(!crate::locks_ui::draw_lane_patch_inspector(ui, 2, &mut patch, false));
                 assert_eq!(patch, saved);
-                assert!(draw_step(ui, 1, 4, cell, &patch).is_none());
+                assert!(draw_step(ui, 1, 4, cell, &patch, Default::default()).is_none());
                 let mut locked = cell;
                 locked.lock.machine = MachineKind::OtisTwin as i16;
                 locked.lock.mask = 1 << param_ui::MODE_GRIT_SLOT;
                 locked.lock.values[param_ui::MODE_GRIT_SLOT] = 0.669_999_96;
-                assert!(draw_step(ui, 2, 5, locked, &LanePatch::default()).is_none());
+                assert!(draw_step(ui, 2, 5, locked, &LanePatch::default(), Default::default()).is_none());
                 locked.lock.machine = MachineKind::OtisKit as i16;
                 locked.velocity = 110;
-                assert!(draw_step(ui, 2, 6, locked, &LanePatch::default()).is_none());
+                assert!(draw_step(ui, 2, 6, locked, &LanePatch::default(), Default::default()).is_none());
                 assert!(draw_automation(ui, 4, AutomationRow::default()).is_none());
             });
         });

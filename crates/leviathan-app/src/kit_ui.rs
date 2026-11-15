@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use eframe::egui;
-use leviathan_dsp::otis_kit::{CHIP_RATES, SLOTS};
+use leviathan_dsp::otis_kit::{VelocityCurve, CHIP_RATES, SLOTS};
 
 use crate::kit::Kit;
 use crate::param_ui::format_kit_velocity;
@@ -36,8 +36,8 @@ impl KitUi {
         ui.heading("OtisKit");
         ui.small(format!(
             "Velocity gain · 110 gives {} · 94 gives {}",
-            format_kit_velocity(110),
-            format_kit_velocity(94),
+            format_kit_velocity(110, kit.lanes[lane].velocity),
+            format_kit_velocity(94, kit.lanes[lane].velocity),
         ))
         .on_hover_text("Step Lock can edit this gain directly in dB. Slot level and mixer gain are separate.");
         let settings = &mut kit.lanes[lane];
@@ -63,6 +63,15 @@ impl KitUi {
                     }
                 });
             ui.checkbox(&mut settings.drop_samples, "Drop-sample");
+            egui::ComboBox::from_id_salt("okit_velocity")
+                .selected_text(settings.velocity.label())
+                .show_ui(ui, |ui| {
+                    for curve in VelocityCurve::ALL {
+                        ui.selectable_value(&mut settings.velocity, curve, curve.label());
+                    }
+                })
+                .response
+                .on_hover_text("Velocity curve for this lane. Chip: 0.375 dB per step, as the hardware. Soft: 0.125 dB per step, so ordinary tracker velocities stay audible.");
         });
         edits.controls = *settings != old;
         ui.separator();
