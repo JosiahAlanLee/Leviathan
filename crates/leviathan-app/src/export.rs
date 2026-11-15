@@ -195,6 +195,8 @@ fn render(
     rack.set_lane_patches(project.lane_patches);
     rack.set_voice_calibration(project.voice_calibration);
     rack.set_note_release_lanes(gates.release_lanes());
+    rack.set_bbus_grit_lanes(project.instruments.bbus.grit_lanes());
+    rack.set_otis_warm_tables(project.instruments.otis.warm_tables);
     rack.set_routing(project.instruments.routing);
     rack.reset_voices();
     rack.set_bender_params(project.bender_params);

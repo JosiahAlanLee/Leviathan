@@ -58,6 +58,15 @@ Leviathan uses a strict hexagonal ("ports and adapters") layout so external GPU,
 - **OTIS** and **OT2** treat the trimmed region as fixed-length frames. Set **samples per frame**, then scan them with **FramePos** or enable **Clock OTIS frames from ByteBus**. **VAST** takes a gated capture sample or a continuous signal from another lane's dry mixer tap. These processors fold stereo input to mono.
 - **Register → Lookup → BBUS** clocks the tracker word through a shared register at ByteBus clock edges. Set the reset seed and choose Identity, Invert, Square or Fold. The clocked output can also select OTIS frames independently of BBUS. Captures and routing save with the project and render in WAV and stem exports.
 
+## BBUS cycle lock
+
+- New sessions restart the **BBUS** register every note cycle (**BBUS cycle lock**, in **Voice / Trig** when the lane plays BBUS). Its sixteen steps are then one period, as when ByteBusLab Parallel Sum's cycle is the pitch, so the voice is pitched and harmonic.
+- **Lane grit** lets one lane's register run free across note cycles: the original sound, whose feedback repeats only every 15–255 cycles and reads as a noisy, digital comb around the pitch. Projects saved before the option load with the lock off, so they sound as before.
+
+## OTIS warm tables
+
+- **OTIS warm tables** (in **Voice / Trig** when the lane plays OTIS) adds a darker twin of each transwave table. **TableSel** then alternates bright and warm: the lower half of each quarter plays the original table, the upper half its twin (formant swept lower, partials rolled off above the fourth harmonic, peak-matched). New sessions turn it on; projects saved earlier keep the four bright tables.
+
 ## Wave 8 Echo, OtisKit and REWORK
 
 - In **Mixer** (F3), set **Echo mix** to send through Echo before Space. Set **Space mix** to zero for Echo alone. **Transport** follows quarter-notes and **ByteBus** measures clock intervals. At 120 BPM, 1× is 500 ms on Transport and 125 ms on the default ByteBus. The panel shows the effective delay and any ESP limit. **LOOP** accumulates the selected Hz shift across repeats. **POST** shifts each outgoing repeat once. Existing projects open with Echo and ESP off.

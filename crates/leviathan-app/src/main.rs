@@ -321,6 +321,11 @@ impl LeviathanApp {
                     enabled: true,
                     ..Default::default()
                 },
+                bbus: project::BbusSettings {
+                    cycle_lock: true,
+                    ..Default::default()
+                },
+                otis: project::OtisSettings { warm_tables: true },
                 ..Default::default()
             },
             capture_port,
@@ -657,6 +662,34 @@ impl LeviathanApp {
         let after = *gates;
         if after != before {
             self.send_audio(AudioCommand::SetNoteGates(after));
+        }
+        let bbus_lane = self.lane_patches[lane].machine == MachineKind::ByteBusR2r;
+        let bbus = &mut self.instruments.bbus;
+        let before = *bbus;
+        if bbus_lane {
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut bbus.cycle_lock, "BBUS cycle lock")
+                    .on_hover_text("Restart the BBUS register every note cycle so it repeats at the note's pitch, like Parallel Sum clocked from an oscillator. Off keeps every lane free-running, as in projects made before this option.");
+                if bbus.cycle_lock {
+                    ui.checkbox(&mut bbus.grit[lane], format!("Lane {} grit", lane + 1))
+                        .on_hover_text("Let this lane's BBUS register run free across note cycles: the original, noisier and more digital sound.");
+                }
+            });
+        }
+        let after = *bbus;
+        if after != before {
+            self.send_audio(AudioCommand::SetBbus(after));
+        }
+        if self.lane_patches[lane].machine == MachineKind::OtisTranswave {
+            let otis = &mut self.instruments.otis;
+            if ui
+                .checkbox(&mut otis.warm_tables, "OTIS warm tables")
+                .on_hover_text("TableSel alternates bright and warm: the lower half of each quarter plays the original table, the upper half a darker twin. Off keeps the four bright tables only, as in projects made before this option.")
+                .changed()
+            {
+                let otis = *otis;
+                self.send_audio(AudioCommand::SetOtis(otis));
+            }
         }
         ui.separator();
         if self.edit_lane_patch {
@@ -1683,6 +1716,15 @@ mod tests {
         };
         frame(ctx, app, vec![Event::PointerMoved(position), pointer(true)]);
         frame(ctx, app, vec![pointer(false)]);
+    }
+
+    #[test]
+    fn new_sessions_start_with_bbus_cycle_lock() {
+        let ctx = egui::Context::default();
+        let app = offline_app(&ctx);
+        assert!(app.instruments.bbus.cycle_lock);
+        assert!(app.instruments.otis.warm_tables);
+        assert_eq!(app.instruments.bbus.grit_lanes(), 0);
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub use bbus::{ByteBusReceiver, ByteBusSource};
 pub use bender::{BenderParams, BENDER_MAX_SHIFT_HZ};
 pub use captured::{CaptureSample, CaptureSamples, CaptureTap};
 pub use master::{DelayMode, MasterPeaks, StereoDelay};
+pub use otis::transwave_frame;
 pub use otis_twin::TwinLoopMode;
 pub use spec::{
     default_lane_patches, machine_spec, LanePatch, MachineSpec, ParamSpec, DEFAULT_LANE_MACHINES,
@@ -376,6 +377,10 @@ struct VoiceState {
     kit: otis_kit::Voice,
     otis_twin: otis_twin::TwinVoice,
     bbus: bbus::Voice,
+    /// BBUS free-runs its register across note cycles (the original sound).
+    bbus_grit: bool,
+    /// OTIS TableSel spans the bright tables and their warm twins.
+    otis_warm_tables: bool,
     fs77: fs77::Voice,
     active_machine: Option<MachineKind>,
     note_pitch: f32,
@@ -408,6 +413,8 @@ impl Default for VoiceState {
             kit: otis_kit::Voice::default(),
             otis_twin: otis_twin::TwinVoice::default(),
             bbus: bbus::Voice::default(),
+            bbus_grit: false,
+            otis_warm_tables: true,
             fs77: fs77::Voice::default(),
             active_machine: None,
             note_pitch: 0.0,
@@ -503,15 +510,16 @@ impl VoiceState {
                 }
                 MachineKind::WestCoastLpg => self.west.step(hz, sample_rate, gate, trigger, &params),
                 MachineKind::OtisTranswave => {
+                    let warm = self.otis_warm_tables;
                     self.otis
-                        .step(hz, sample_rate, trigger, &params, calibrated, None)
+                        .step(hz, sample_rate, trigger, &params, calibrated, None, warm)
                 }
                 MachineKind::OtisTwin => {
                     self.otis_twin
                         .step(hz, sample_rate, gate, trigger, &params, calibrated, None)
                 }
                 MachineKind::ByteBusR2r => {
-                    self.bbus.step(hz, sample_rate, gate, trigger, bus_word, &params)
+                    self.bbus.step(hz, sample_rate, gate, trigger, bus_word, &params, !self.bbus_grit)
                 }
                 MachineKind::Fs77FormantFm => {
                     self.fs77.step(hz, sample_rate, gate, trigger, &params, &mut self.rng)
@@ -786,7 +794,7 @@ impl VoiceState {
                 let signal = if machine == MachineKind::OtisTranswave {
                     let signal = self
                         .otis
-                        .step(hz, rate, trigger, &parameters, calibrated, source);
+                        .step(hz, rate, trigger, &parameters, calibrated, source, self.otis_warm_tables);
                     if self.otis.is_silent() {
                         self.capture.finish();
                     }
@@ -825,6 +833,8 @@ pub struct SynthRack {
     lane_patches: [LanePatch; NUM_LANES],
     voice_calibration: bool,
     note_release_lanes: u8,
+    bbus_grit_lanes: u8,
+    otis_warm_tables: bool,
     routing: RackRouting,
     render_order: [usize; NUM_LANES],
     byte_register: byte_route::Register,
@@ -852,6 +862,8 @@ impl SynthRack {
             lane_patches: DEFAULT_LANE_PATCHES,
             voice_calibration: false,
             note_release_lanes: ALL_LANES_AUDIBLE,
+            bbus_grit_lanes: 0,
+            otis_warm_tables: true,
             routing: RackRouting::default(),
             render_order: core::array::from_fn(|lane| lane),
             byte_register: byte_route::Register::default(),
@@ -900,6 +912,7 @@ impl SynthRack {
 
     pub fn reset_voices(&mut self) {
         self.voices = Self::fresh_voices(self.audible_mask, self.channels);
+        self.apply_lane_flags();
         self.counter = ByteBusCounter::default();
     }
 
@@ -975,6 +988,31 @@ impl SynthRack {
     }
 
     /// Select the lanes where gate-off releases the original synth envelopes.
+    /// Select the lanes where BBUS free-runs its register across note cycles
+    /// (the original, grittier sound). Other lanes restart it every cycle.
+    pub fn set_bbus_grit_lanes(&mut self, lanes: u8) {
+        self.bbus_grit_lanes = lanes & ALL_LANES_AUDIBLE;
+        self.apply_lane_flags();
+    }
+
+    pub fn bbus_grit_lanes(&self) -> u8 {
+        self.bbus_grit_lanes
+    }
+
+    /// Let OTIS TableSel reach the warm twin tables. Off maps it over the four
+    /// bright tables only, as in projects made before the warm tables.
+    pub fn set_otis_warm_tables(&mut self, enabled: bool) {
+        self.otis_warm_tables = enabled;
+        self.apply_lane_flags();
+    }
+
+    fn apply_lane_flags(&mut self) {
+        for (lane, voice) in self.voices.iter_mut().enumerate() {
+            voice.bbus_grit = self.bbus_grit_lanes & (1 << lane) != 0;
+            voice.otis_warm_tables = self.otis_warm_tables;
+        }
+    }
+
     pub fn set_note_release_lanes(&mut self, lanes: u8) {
         self.note_release_lanes = lanes & ALL_LANES_AUDIBLE;
     }
@@ -1887,5 +1925,16 @@ mod tests {
             let cents = 1200.0 * (f64::from(v_oct_to_hz(volts)) / want).log2();
             assert!(cents.abs() < 0.1, "semitone {semitone}: {cents:.3} cents");
         }
+    }
+
+    #[test]
+    fn bbus_grit_lanes_survive_voice_resets() {
+        let mut rack = SynthRack::new(48_000.0);
+        rack.set_bbus_grit_lanes(0b101);
+        rack.set_otis_warm_tables(false);
+        rack.reset_voices();
+        assert_eq!(rack.bbus_grit_lanes(), 0b101);
+        assert!(rack.voices.iter().all(|voice| !voice.otis_warm_tables));
+        assert!(rack.voices[0].bbus_grit && !rack.voices[1].bbus_grit && rack.voices[2].bbus_grit);
     }
 }

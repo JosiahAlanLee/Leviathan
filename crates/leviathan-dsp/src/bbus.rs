@@ -5,6 +5,10 @@ use leviathan_core::{CvFrame, SOUND_PARAMS};
 const PHASE_SCALE: f64 = 4_294_967_296.0;
 const SLOT_BITS: u32 = 28;
 const SLOT_MASK: u8 = 15;
+const SEED: u8 = 0xa5;
+/// The cycle-lock reload, Parallel Sum's default seed. It also keeps the
+/// fundamental strongest at the default macros (0xa5 favours the octave).
+const LOCK_SEED: u8 = 0x00;
 
 /// A tracker byte is current on each sample. A connected clocked source
 /// publishes on rising edges and holds its last byte until disconnection.
@@ -80,7 +84,7 @@ impl Default for Voice {
             phase: 0,
             sub_phase: 0,
             amp: 0.0,
-            register: 0xa5,
+            register: SEED,
             fallback: 0xb8,
             held_fir: 0.0,
             dac: R2r::default(),
@@ -100,6 +104,7 @@ impl Voice {
         trigger: Option<f32>,
         word: Option<u8>,
         params: &[f32; SOUND_PARAMS],
+        cycle_lock: bool,
     ) -> f32 {
         let [decay, mask, tilt, skew, hold, cutoff, color, sub] = *params;
         if let Some(velocity) = trigger {
@@ -131,6 +136,13 @@ impl Voice {
             // eight slots are crossed per host sample, including at wrap.
             while slot != destination {
                 slot = (slot + 1) & SLOT_MASK;
+                if cycle_lock && slot == 0 {
+                    // Restart the register every note cycle so its sixteen
+                    // steps are one period, as when Parallel Sum's cycle is
+                    // the pitch. Free running (grit) lets the feedback wander
+                    // for 15-255 cycles, which reads as a noisy comb.
+                    self.register = LOCK_SEED;
+                }
                 self.register = shift(self.register, feedback, sense, word, slot);
             }
             self.held_fir = parallel_sum(self.register, tilt, color);
@@ -229,12 +241,36 @@ mod tests {
         let word = 0x39;
         let mask = 0xb8 ^ ((2.0 * params[1] * 255.0) as u8).rotate_left(1) ^ word;
         let mut expected = voice.register;
-        voice.step(7_500.0, 48_000.0, true, Some(1.0), Some(word), &params);
+        let mut locked = voice.clone();
+        voice.step(7_500.0, 48_000.0, true, Some(1.0), Some(word), &params, false);
         assert_eq!(voice.phase >> SLOT_BITS, 1);
         for slot in [15, 0, 1] {
             expected = shift(expected, mask, 0, word, slot);
         }
         assert_eq!(voice.register, expected);
+
+        // Cycle lock restarts from the seed as the wrap is crossed.
+        locked.step(7_500.0, 48_000.0, true, Some(1.0), Some(word), &params, true);
+        assert_eq!(locked.register, shift(shift(LOCK_SEED, mask, 0, word, 0), mask, 0, word, 1));
+    }
+
+    #[test]
+    fn cycle_lock_repeats_every_note_cycle_and_grit_does_not() {
+        let params = MachineKind::ByteBusR2r.spec().default_params();
+        // 750 Hz at 48 kHz: 64 samples per note cycle, four per slot.
+        for (lock, periodic) in [(true, true), (false, false)] {
+            for word in [Some(0x01), Some(0x00), None] {
+                let mut voice = Voice::default();
+                let registers: Vec<u8> = (0..64 * 40)
+                    .map(|frame| {
+                        voice.step(750.0, 48_000.0, true, (frame == 0).then_some(1.0), word, &params, lock);
+                        voice.register
+                    })
+                    .collect();
+                let repeats = (64..registers.len() - 64).all(|n| registers[n] == registers[n + 64]);
+                assert_eq!(repeats, periodic, "lock {lock} word {word:?}");
+            }
+        }
     }
 
     #[test]
@@ -251,6 +287,7 @@ mod tests {
 
     #[test]
     fn fixed_zero_standalone_and_other_bus_words_produce_distinct_bounded_signals() {
+        for lock in [false, true] {
         let params = MachineKind::ByteBusR2r.spec().default_params();
         let mut voices = [Voice::default(), Voice::default(), Voice::default()];
         let mut energy = [0.0; 3];
@@ -264,6 +301,7 @@ mod tests {
                     (frame == 0).then_some(0.95),
                     [Some(0), None, Some(0x71)][i],
                     &params,
+                    lock,
                 )
             });
             for (sum, sample) in energy.iter_mut().zip(samples) {
@@ -275,5 +313,6 @@ mod tests {
         }
         assert!(energy.iter().all(|&sum| sum > 0.25), "{energy:?}");
         assert!(delta.iter().all(|&sum| sum > 20.0), "{delta:?}");
+        }
     }
 }
