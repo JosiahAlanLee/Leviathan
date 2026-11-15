@@ -181,6 +181,8 @@ fn render(
         sample_rate: f64::from(plan.settings.sample_rate),
         ..EngineConfig::default()
     });
+    let gates = project.instruments.note_gates;
+    player.evaluator.set_retrigger_held_notes(gates.enabled);
     player.set_chain(project.chain);
     player.launch(plan.target, project.patterns.len());
     player.evaluator.fill_active = fill;
@@ -192,6 +194,7 @@ fn render(
     rack.set_lane_channels(project.lane_mix.dsp_channels());
     rack.set_lane_patches(project.lane_patches);
     rack.set_voice_calibration(project.voice_calibration);
+    rack.set_note_release_lanes(gates.release_lanes());
     rack.set_routing(project.instruments.routing);
     rack.reset_voices();
     rack.set_bender_params(project.bender_params);

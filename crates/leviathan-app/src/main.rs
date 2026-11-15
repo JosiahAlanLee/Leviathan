@@ -316,7 +316,13 @@ impl LeviathanApp {
             applied_play_request: 0,
             cursor,
             sampler_ui: SamplerBankUi::default(),
-            instruments: project::InstrumentSettings::default(),
+            instruments: project::InstrumentSettings {
+                note_gates: project::NoteGateSettings {
+                    enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             capture_port,
             rack_panel: rack_ui::RackPanel::default(),
             kit_ui: kit_ui::KitUi::default(),
@@ -637,8 +643,22 @@ impl LeviathanApp {
             ui.selectable_value(&mut self.edit_lane_patch, false, "Step Lock");
             ui.selectable_value(&mut self.edit_lane_patch, true, "Lane Patch");
         });
-        ui.separator();
         let (lane, row, pattern) = (self.cursor.lane, self.cursor.row, self.selected_pattern);
+        let gates = &mut self.instruments.note_gates;
+        let before = *gates;
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut gates.enabled, "Use note gates")
+                .on_hover_text("Release the original voices at gate-off and give each adjacent step its own attack.");
+            if gates.enabled {
+                ui.checkbox(&mut gates.one_shot[lane], format!("Lane {} one-shot", lane + 1))
+                    .on_hover_text("Let the original voices on this lane finish their full decay.");
+            }
+        });
+        let after = *gates;
+        if after != before {
+            self.send_audio(AudioCommand::SetNoteGates(after));
+        }
+        ui.separator();
         if self.edit_lane_patch {
             if ui
                 .checkbox(&mut self.voice_calibration, "Voice calibration")
@@ -1659,6 +1679,26 @@ mod tests {
         };
         frame(ctx, app, vec![Event::PointerMoved(position), pointer(true)]);
         frame(ctx, app, vec![pointer(false)]);
+    }
+
+    #[test]
+    fn voice_deck_enables_note_gates_and_keeps_lane_one_shot_selection() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        let mut old = app.project_snapshot();
+        assert!(old.instruments.note_gates.enabled);
+        old.instruments.note_gates = Default::default();
+        app.install_project(old);
+        frame(&ctx, &mut app, tap(Key::F2, Modifiers::NONE));
+
+        click_text(&ctx, &mut app, "Use note gates");
+        assert!(app.instruments.note_gates.enabled);
+        click_text(&ctx, &mut app, "Lane 1 one-shot");
+        assert!(app.instruments.note_gates.one_shot[0]);
+        click_text(&ctx, &mut app, "Use note gates");
+        assert!(!app.instruments.note_gates.enabled);
+        click_text(&ctx, &mut app, "Use note gates");
+        assert!(app.project_snapshot().instruments.note_gates.one_shot[0]);
     }
 
     #[test]

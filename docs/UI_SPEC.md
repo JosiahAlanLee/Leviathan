@@ -33,6 +33,8 @@ The telemetry strip shows the edit pattern, transport pattern, row and beat, act
 
 The app uses six lanes, up to 64 rows per pattern, a 16-pattern bank, and a 64-entry chain. Each entry references a pattern. A chain entry's duration is its active rows divided by its rate in rows per beat, including with swing. Feedback submits at most one pass per 60 Hz slot and skips missed slots. This caps feedback updates independently of redraw frequency. Display presentation still depends on the window backend.
 
+**Use note gates** in Voice / Trig (F2) gives each step a distinct attack, even across consecutive 100% gates. The original synth envelopes keep their Decay setting during the gate and move to a short release when it falls. **Lane … one-shot** keeps the full decay on the selected lane and still triggers each step. New projects start with note gates enabled. Projects saved before this control use their original playback until it is enabled. The project stores both choices for live playback and WAV export.
+
 ## Wave 8 controls
 
 The [Wave 8 roadmap](../ROADMAP.md#wave-8-t32t35--otiskit-seeded-rework-and-spoonbender-echo--esp) describes the DSP, sample storage and real-time contracts for T32–T35. The Mixer and Samples decks provide the first controls. Use the desktop workflow below to review them on an integrated GPU and audio device.

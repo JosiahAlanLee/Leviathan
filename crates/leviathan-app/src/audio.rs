@@ -17,7 +17,7 @@ use crate::audition;
 use crate::capture::{Recorder, Stage, Take, TakeBank};
 use crate::kit::{Kit, KitBank, KitSample};
 use crate::midi::{MidiEvent, MidiKey, MidiReceiver, MidiTarget};
-use crate::project::{Project, PATTERN_BANK_CAPACITY};
+use crate::project::{NoteGateSettings, Project, PATTERN_BANK_CAPACITY};
 
 pub enum AudioCommand {
     SetPlaying {
@@ -45,6 +45,7 @@ pub enum AudioCommand {
     SetLaneChannels([LaneChannel; NUM_LANES]),
     SetLanePatch { lane: usize, patch: LanePatch },
     SetVoiceCalibration(bool),
+    SetNoteGates(NoteGateSettings),
     SetRackRouting(RackRouting),
     InstallTake(Arc<Take>),
     ArmCapture,
@@ -94,6 +95,7 @@ impl AudioCommand {
             }
             Self::SetFill(fill) => player.evaluator.fill_active = *fill,
             Self::SetBpm(bpm) => player.evaluator.config.bpm = bpm.clamp(40.0, 240.0),
+            Self::SetNoteGates(gates) => player.evaluator.set_retrigger_held_notes(gates.enabled),
             Self::Reset => player.reset_transport(pattern_count),
             Self::Launch(target) => player.launch(*target, pattern_count),
             Self::SetChain(chain) => player.set_chain(*chain),
@@ -120,6 +122,7 @@ pub struct AudioProject {
     chain: PatternChain,
     sample_bank: SampleBank,
     voice_calibration: bool,
+    note_gates: NoteGateSettings,
     routing: RackRouting,
     take: Option<Arc<Take>>,
     kit: Kit,
@@ -142,6 +145,7 @@ impl AudioProject {
             chain: project.chain,
             sample_bank: project.sample_bank(),
             voice_calibration: project.voice_calibration,
+            note_gates: project.instruments.note_gates,
             routing: project.instruments.routing,
             take: project.instruments.take.clone(),
             kit: project.instruments.kit.clone(),
@@ -156,6 +160,7 @@ impl AudioProject {
             sample_rate,
             ..EngineConfig::default()
         });
+        player.evaluator.set_retrigger_held_notes(self.note_gates.enabled);
         player.set_chain(self.chain);
         if count > 0 {
             player.launch(
@@ -387,6 +392,9 @@ impl RtAudioWorker {
                 AudioCommand::SetVoiceCalibration(enabled) => {
                     self.synth.set_voice_calibration(enabled);
                 }
+                AudioCommand::SetNoteGates(gates) => {
+                    self.synth.set_note_release_lanes(gates.release_lanes());
+                }
                 AudioCommand::SetRackRouting(routing) => {
                     self.synth.set_routing(routing);
                 }
@@ -442,6 +450,7 @@ impl RtAudioWorker {
                     self.synth.set_lane_channels(project.lane_channels);
                     self.synth.set_lane_patches(project.lane_patches);
                     self.synth.set_voice_calibration(project.voice_calibration);
+                    self.synth.set_note_release_lanes(project.note_gates.release_lanes());
                     self.synth.set_routing(project.routing);
                     self.synth.reset_voices();
                     self.synth.reset_byte_route();
@@ -1192,6 +1201,94 @@ mod tests {
             rendered.push(worker.next_stereo());
         }
         rendered
+    }
+
+    #[test]
+    fn note_gate_settings_survive_reload_and_match_live_and_wav() {
+        use crate::project;
+        use leviathan_dsp::MachineKind;
+
+        let ctx = eframe::CreationContext::_new_kittest(eframe::egui::Context::default());
+        let app = crate::LeviathanApp::with_audio(&ctx, |_, _, _, _, _| Err("Offline".into()));
+        let mut source = app.project_snapshot();
+        source.bpm = 120.0;
+        source.lane_patches[0] = LanePatch::for_machine(MachineKind::SubBass);
+        source.patterns[0] = Pattern {
+            length: 2,
+            ..Pattern::default()
+        };
+        let note = NoteCell {
+            active: true,
+            midi: 48,
+            velocity: 64,
+            gate_fraction: 1.0,
+            ..NoteCell::default()
+        };
+        source.patterns[0].lanes[0][0] = note;
+        source.patterns[0].lanes[0][1] = NoteCell { velocity: 115, ..note };
+
+        let dir = std::env::temp_dir().join(format!("leviathan-note-gates-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("song.leviathan.json");
+        source.instruments.note_gates = NoteGateSettings::default();
+        project::save(&path, source).unwrap();
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let music = 12_000;
+        let frames = music + 2_400;
+        let mut loaded = project::load(&path).unwrap();
+        assert_eq!(loaded.instruments.note_gates, NoteGateSettings::default());
+        let legacy = render_test_project_live(&loaded, music, frames);
+        file["version"] = 1.into();
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        let old_v1 = project::load(&path).unwrap();
+        assert_eq!(old_v1.instruments.note_gates, NoteGateSettings::default());
+        assert_eq!(render_test_project_live(&old_v1, music, frames), legacy);
+
+        let mut gates = NoteGateSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        gates.one_shot[2] = true;
+        loaded.instruments.note_gates = gates;
+        project::save(&path, loaded).unwrap();
+        let loaded = project::load(&path).unwrap();
+        assert_eq!(loaded.instruments.note_gates, gates);
+        let live = render_test_project_live(&loaded, music, frames);
+        assert_eq!(live[..6_000], legacy[..6_000]);
+        assert_ne!(live[6_000], legacy[6_000]);
+        let late_energy = |pcm: &[(f32, f32)]| {
+            pcm[music + 1_600..]
+                .iter()
+                .map(|&(left, right)| left * left + right * right)
+                .sum::<f32>()
+        };
+        assert!(late_energy(&live) < late_energy(&legacy) * 0.01);
+
+        let output = dir.join("song.wav");
+        ExportJob::start(
+            loaded,
+            false,
+            ExportRequest {
+                settings: ExportSettings {
+                    tail_seconds: 0.05,
+                    encoding: WavEncoding::Float32,
+                    ..ExportSettings::default()
+                },
+                destination: output.clone(),
+            },
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+        let wav = std::fs::read(output).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        let data = wav.len() - frames * 8;
+        assert_eq!(&wav[data - 8..data - 4], b"data");
+        let read = |bytes: &[u8]| f32::from_le_bytes(bytes.try_into().unwrap());
+        for (frame, &expected) in wav[data..].chunks_exact(8).zip(&live) {
+            assert_eq!((read(&frame[..4]), read(&frame[4..])), expected);
+        }
     }
 
     #[test]

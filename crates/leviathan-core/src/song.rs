@@ -330,6 +330,47 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_full_gate_steps_have_separate_attacks_at_the_swung_onsets() {
+        let mut pattern = Pattern {
+            length: 3,
+            swing: 0.75,
+            ..Pattern::default()
+        };
+        let note = NoteCell {
+            active: true,
+            midi: 60,
+            gate_fraction: 1.0,
+            ..NoteCell::default()
+        };
+        pattern.lanes[0][..3].fill(note);
+        pattern.lanes[0][1].velocity = 73;
+        pattern.lanes[1][0] = note;
+        pattern.lanes[1][1] = NoteCell {
+            probability: 0,
+            ..note
+        };
+        pattern.lanes[1][2] = note;
+        for enabled in [false, true] {
+            let mut player = groove_player();
+            player.evaluator.set_retrigger_held_notes(enabled);
+            for sample in 0..=144 {
+                let (cv, boundary) = player.step_sample(core::slice::from_ref(&pattern));
+                assert_eq!(cv.gate_v[0], 10.0);
+                let other_gate = if (72..96).contains(&sample) { 0.0 } else { 10.0 };
+                assert_eq!(cv.gate_v[1], other_gate);
+                assert_eq!(
+                    cv.retrigger_mask,
+                    u8::from(enabled && matches!(sample, 72 | 96)),
+                );
+                assert_eq!(boundary, matches!(sample, 0 | 144));
+                if sample == 72 {
+                    assert_eq!(cv.velocity_v[0], 73.0 / 127.0 * 10.0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn full_gate_ratchets_have_separate_edges_and_even_onsets() {
         let mut pattern = Pattern {
             length: 1,
