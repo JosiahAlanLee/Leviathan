@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use leviathan_core::rack_routing::RackRouting;
@@ -16,7 +17,7 @@ use leviathan_gpu::{AudioScopeSnapshot, AudioScopeTap};
 use crate::audition;
 use crate::capture::{Recorder, Stage, Take, TakeBank};
 use crate::kit::{Kit, KitBank, KitSample};
-use crate::midi::{MidiEvent, MidiKey, MidiReceiver, MidiTarget};
+use crate::midi::{MidiEvent, MidiKey, MidiReceiver, MidiTarget, MIDI_QUEUE_CAPACITY};
 use crate::project::{
     BbusSettings, NoteGateSettings, OtisSettings, OversampleSettings, Project, PATTERN_BANK_CAPACITY,
 };
@@ -88,6 +89,7 @@ pub enum AudioCommand {
         region: SampleRegion,
     },
     SetMidiTarget(MidiTarget),
+    SetMidiClockFollow(bool),
 }
 
 impl AudioCommand {
@@ -303,6 +305,8 @@ pub struct AudioTelemetry {
     pub routed_byte: Option<u8>,
     pub echo_timing: echo::Timing,
     pub kit_sounding: [u8; NUM_LANES],
+    /// Tempo of an incoming MIDI clock while it is followed and running.
+    pub midi_clock_bpm: Option<f32>,
 }
 
 #[derive(Clone, Copy)]
@@ -335,6 +339,48 @@ struct RtAudioWorker {
     audition: audition::Player,
     recorder: Option<Recorder>,
     last_playing_beat: Option<f64>,
+    /// Stamped MIDI events waiting for their sample within this block.
+    pending_midi: Box<[(u32, MidiEvent)]>,
+    pending_len: usize,
+    pending_next: usize,
+    frame_in_block: u32,
+    last_block_at: Option<Instant>,
+    sample_clock: u64,
+    clock: MidiClock,
+}
+
+/// Follows an external MIDI clock: tempo from the tick interval, phase locked
+/// to the ticks counted since Start or Continue.
+struct MidiClock {
+    follow: bool,
+    last_tick: Option<u64>,
+    interval: Option<f64>,
+    ticks: Option<u64>,
+    base_beat: f64,
+    active_until: u64,
+    armed: Option<MidiEvent>,
+    bpm: Option<f32>,
+}
+
+impl Default for MidiClock {
+    fn default() -> Self {
+        Self {
+            follow: true,
+            last_tick: None,
+            interval: None,
+            ticks: None,
+            base_beat: 0.0,
+            active_until: 0,
+            armed: None,
+            bpm: None,
+        }
+    }
+}
+
+impl MidiClock {
+    fn active(&self, now: u64) -> bool {
+        self.follow && now < self.active_until
+    }
 }
 
 impl RtAudioWorker {
@@ -374,10 +420,30 @@ impl RtAudioWorker {
             audition: audition::Player::default(),
             recorder: None,
             last_playing_beat: None,
+            pending_midi: vec![(0, MidiEvent::Stop); MIDI_QUEUE_CAPACITY].into_boxed_slice(),
+            pending_len: 0,
+            pending_next: 0,
+            frame_in_block: 0,
+            last_block_at: None,
+            sample_clock: 0,
+            clock: MidiClock::default(),
         }
     }
 
+    /// Drain commands and MIDI before a block of `frames`, called at `now`.
+    /// Stamped MIDI events are placed at their offset from the previous
+    /// block's start: a constant one-block latency instead of jitter.
+    fn begin_block(&mut self, frames: usize, now: Instant) {
+        self.drain_commands_inner(Some((frames, now)));
+        self.last_block_at = Some(now);
+    }
+
+    #[cfg(test)]
     fn drain_commands(&mut self) {
+        self.drain_commands_inner(None);
+    }
+
+    fn drain_commands_inner(&mut self, block: Option<(usize, Instant)>) {
         for _ in 0..self.cmd_rx.slots() {
             let Ok(command) = self.cmd_rx.pop() else {
                 break;
@@ -526,10 +592,16 @@ impl RtAudioWorker {
                     self.synth.reset_transport_clocks();
                 }
                 AudioCommand::SetMidiTarget(target) => self.midi_target = target,
+                AudioCommand::SetMidiClockFollow(follow) => {
+                    self.clock.follow = follow;
+                    if !follow {
+                        self.clock = MidiClock { follow, ..MidiClock::default() };
+                    }
+                }
                 _ => {}
             }
         }
-        self.drain_midi();
+        self.drain_midi(block);
         self.takes.release_unused(self.synth.capture_generations());
         self.kit.release_unused(self.synth.kit_generations());
         if let Some(recorder) = &mut self.recorder {
@@ -543,7 +615,7 @@ impl RtAudioWorker {
         }
     }
 
-    fn drain_midi(&mut self) {
+    fn drain_midi(&mut self, block: Option<(usize, Instant)>) {
         let Some(events) = &mut self.midi_events else {
             return;
         };
@@ -551,9 +623,53 @@ impl RtAudioWorker {
         if release {
             self.release_midi(None);
         }
+        // Events left from the last block (none in normal running) play now.
+        while self.pending_next < self.pending_len {
+            let event = self.pending_midi[self.pending_next].1;
+            self.pending_next += 1;
+            self.handle_midi(event);
+        }
+        self.pending_len = 0;
+        self.pending_next = 0;
+        self.frame_in_block = 0;
+        let rate = self.player.evaluator.config.sample_rate;
         for _ in 0..count {
-            let event = self.midi_events.as_mut().and_then(MidiReceiver::pop);
-            match event {
+            let Some((event, at)) = self.midi_events.as_mut().and_then(MidiReceiver::pop_timed)
+            else {
+                continue;
+            };
+            let offset = match (block, at, self.last_block_at) {
+                (Some((frames, _)), Some(at), Some(previous)) if frames > 0 => {
+                    let seconds = at.saturating_duration_since(previous).as_secs_f64();
+                    ((seconds * rate).round() as usize).min(frames - 1) as u32
+                }
+                _ => 0,
+            };
+            if offset == 0 || self.pending_len == self.pending_midi.len() {
+                self.handle_midi(event);
+            } else {
+                self.pending_midi[self.pending_len] = (offset, event);
+                self.pending_len += 1;
+            }
+        }
+    }
+
+    /// Apply events whose sample in this block has come.
+    #[inline]
+    fn apply_due_midi(&mut self) {
+        while self.pending_next < self.pending_len
+            && self.pending_midi[self.pending_next].0 <= self.frame_in_block
+        {
+            let event = self.pending_midi[self.pending_next].1;
+            self.pending_next += 1;
+            self.handle_midi(event);
+        }
+        self.frame_in_block = self.frame_in_block.saturating_add(1);
+    }
+
+    fn handle_midi(&mut self, event: MidiEvent) {
+        {
+            match Some(event) {
                 Some(MidiEvent::NoteOn { key, velocity }) => {
                     self.release_midi(Some(key));
                     let target = self.midi_target;
@@ -574,7 +690,21 @@ impl RtAudioWorker {
                     }
                 }
                 Some(MidiEvent::NoteOff(key)) => self.release_midi(Some(key)),
+                Some(MidiEvent::Clock) => self.on_clock(),
+                Some(event @ (MidiEvent::Start | MidiEvent::Continue))
+                    if self.clock.active(self.sample_clock) =>
+                {
+                    // Start on the next tick, which marks the downbeat.
+                    if event == MidiEvent::Start {
+                        self.player.evaluator.playing = false;
+                    }
+                    self.clock.armed = Some(event);
+                }
                 Some(event) => {
+                    if event == MidiEvent::Stop {
+                        self.clock.armed = None;
+                        self.clock.ticks = None;
+                    }
                     if event.apply_transport(&mut self.player, self.pattern_count) {
                         if matches!(event, MidiEvent::Start | MidiEvent::Stop) {
                             self.cancel_capture();
@@ -589,6 +719,59 @@ impl RtAudioWorker {
                 None => {}
             }
         }
+    }
+
+    fn on_clock(&mut self) {
+        let now = self.sample_clock;
+        let rate = self.player.evaluator.config.sample_rate;
+        if let Some(last) = self.clock.last_tick {
+            let dt = now.saturating_sub(last) as f64;
+            // 24 ticks per beat between 20 and 400 bpm; anything else restarts the estimate.
+            let bpm = 60.0 * rate / (24.0 * dt.max(1.0));
+            if (20.0..=400.0).contains(&bpm) {
+                let interval = self.clock.interval.map_or(dt, |i| i + 0.1 * (dt - i));
+                self.clock.interval = Some(interval);
+            } else {
+                self.clock.interval = None;
+            }
+        }
+        self.clock.last_tick = Some(now);
+        self.clock.active_until = now + (0.5 * rate) as u64;
+        if !self.clock.follow {
+            return;
+        }
+        if let Some(armed) = self.clock.armed.take() {
+            let start = armed == MidiEvent::Start;
+            if start {
+                armed.apply_transport(&mut self.player, self.pattern_count);
+                self.cancel_capture();
+                self.last_playing_beat = None;
+                self.synth.reset_transport_clocks();
+            } else {
+                self.player.evaluator.playing = true;
+            }
+            self.clock.base_beat = self.player.cursor_position(&self.patterns[..self.pattern_count]).0;
+            self.clock.ticks = Some(0);
+            self.tel_divider = 255;
+        } else if let Some(ticks) = &mut self.clock.ticks {
+            if self.player.evaluator.playing {
+                *ticks += 1;
+            }
+        }
+        let Some(interval) = self.clock.interval else { return };
+        let tempo = 60.0 * rate / (24.0 * interval);
+        self.clock.bpm = Some(tempo as f32);
+        let mut bpm = tempo;
+        if let (true, Some(ticks)) = (self.player.evaluator.playing, self.clock.ticks) {
+            // Pull the transport toward the tick count: half the phase
+            // error per beat, at most 5 % of the tempo.
+            let expected = self.clock.base_beat + ticks as f64 / 24.0;
+            let actual = self.player.cursor_position(&self.patterns[..self.pattern_count]).0;
+            bpm *= 1.0 + (0.5 * (expected - actual)).clamp(-0.05, 0.05);
+        }
+        let bpm = bpm.clamp(40.0, 240.0);
+        self.player.evaluator.config.bpm = bpm;
+        self.synth.set_tempo(bpm);
     }
 
     fn release_midi(&mut self, key: Option<MidiKey>) {
@@ -635,6 +818,12 @@ impl RtAudioWorker {
 
     #[inline]
     fn next_stereo(&mut self) -> (f32, f32) {
+        if self.pending_next < self.pending_len {
+            self.apply_due_midi();
+        } else {
+            self.frame_in_block = self.frame_in_block.saturating_add(1);
+        }
+        self.sample_clock += 1;
         let (cv, retrigger) = self
             .player
             .step_sample(&self.patterns[..self.pattern_count]);
@@ -696,6 +885,7 @@ impl RtAudioWorker {
                 routed_byte: self.synth.routed_byte(),
                 echo_timing: self.synth.echo_timing(),
                 kit_sounding: self.synth.kit_sounding(),
+                midi_clock_bpm: self.clock.bpm.filter(|_| self.clock.active(self.sample_clock)),
             };
             // Carry the interval's peaks forward if the UI hasn't drained its ring yet.
             if self.tel_tx.push(telemetry).is_ok() {
@@ -705,6 +895,47 @@ impl RtAudioWorker {
         }
         pair
     }
+}
+
+const PREFERRED_BLOCK_FRAMES: u32 = 256;
+
+fn build_stream<T: cpal::SizedSample + Send + 'static>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    slot: &Arc<Mutex<Option<RtAudioWorker>>>,
+    channels: usize,
+    convert: fn(f32) -> T,
+    silence: T,
+) -> Result<cpal::Stream, String> {
+    let slot = Arc::clone(slot);
+    let mut worker: Option<RtAudioWorker> = None;
+    device
+        .build_output_stream(
+            config,
+            move |data: &mut [T], _| {
+                if worker.is_none() {
+                    worker = slot.try_lock().ok().and_then(|mut held| held.take());
+                }
+                let Some(worker) = worker.as_mut() else {
+                    data.fill(silence);
+                    return;
+                };
+                worker.begin_block(data.len() / channels, Instant::now());
+                for frame in data.chunks_mut(channels) {
+                    let (l, r) = worker.next_stereo();
+                    frame[0] = convert(l);
+                    if channels > 1 {
+                        frame[1] = convert(r);
+                    }
+                    for extra in frame.iter_mut().skip(2) {
+                        *extra = silence;
+                    }
+                }
+            },
+            |err| eprintln!("leviathan audio stream error: {err}"),
+            None,
+        )
+        .map_err(|e| format!("Stream init failed: {e}"))
 }
 
 pub fn try_start_audio(
@@ -723,7 +954,16 @@ pub fn try_start_audio(
         .map_err(|e| format!("Audio config unavailable: {e}"))?;
 
     let sample_format = supported.sample_format();
-    let config: cpal::StreamConfig = supported.into();
+    // Ask for 256-frame blocks (about 5 ms at 48 kHz) where the device allows
+    // it: MIDI plays one block late but on its exact sample, so a short block
+    // keeps that latency small. Fall back to the device's default block.
+    let fixed = match supported.buffer_size() {
+        cpal::SupportedBufferSize::Range { min, max } => {
+            (*min..=*max).contains(&PREFERRED_BLOCK_FRAMES).then_some(PREFERRED_BLOCK_FRAMES)
+        }
+        cpal::SupportedBufferSize::Unknown => Some(PREFERRED_BLOCK_FRAMES),
+    };
+    let mut config: cpal::StreamConfig = supported.into();
     let sample_rate = config.sample_rate as f64;
     let channels = (config.channels as usize).max(1);
 
@@ -735,71 +975,40 @@ pub fn try_start_audio(
         Some(midi_events),
     );
     worker.recorder = Some(recorder);
+    // The callback takes the worker on its first run, so a stream that fails
+    // to build leaves it here for the fallback attempt.
+    let slot = Arc::new(Mutex::new(Some(worker)));
 
-    let err_fn = |err| eprintln!("leviathan audio stream error: {err}");
-
-    let stream = match sample_format {
-        cpal::SampleFormat::F32 => device
-            .build_output_stream(
-                &config,
-                move |data: &mut [f32], _| {
-                    worker.drain_commands();
-                    for frame in data.chunks_mut(channels) {
-                        let (l, r) = worker.next_stereo();
-                        frame[0] = l;
-                        if channels > 1 {
-                            frame[1] = r;
-                        }
-                        for extra in frame.iter_mut().skip(2) {
-                            *extra = 0.0;
-                        }
-                    }
-                },
-                err_fn,
-                None,
-            )
-            .map_err(|e| format!("Stream init failed: {e}"))?,
-        cpal::SampleFormat::I16 => device
-            .build_output_stream(
-                &config,
-                move |data: &mut [i16], _| {
-                    worker.drain_commands();
-                    for frame in data.chunks_mut(channels) {
-                        let (l, r) = worker.next_stereo();
-                        frame[0] = (l.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-                        if channels > 1 {
-                            frame[1] = (r.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-                        }
-                        for extra in frame.iter_mut().skip(2) {
-                            *extra = 0;
-                        }
-                    }
-                },
-                err_fn,
-                None,
-            )
-            .map_err(|e| format!("Stream init failed: {e}"))?,
-        cpal::SampleFormat::U16 => device
-            .build_output_stream(
-                &config,
-                move |data: &mut [u16], _| {
-                    worker.drain_commands();
-                    for frame in data.chunks_mut(channels) {
-                        let (l, r) = worker.next_stereo();
-                        frame[0] = ((l.clamp(-1.0, 1.0) * 0.5 + 0.5) * u16::MAX as f32) as u16;
-                        if channels > 1 {
-                            frame[1] = ((r.clamp(-1.0, 1.0) * 0.5 + 0.5) * u16::MAX as f32) as u16;
-                        }
-                        for extra in frame.iter_mut().skip(2) {
-                            *extra = u16::MAX / 2;
-                        }
-                    }
-                },
-                err_fn,
-                None,
-            )
-            .map_err(|e| format!("Stream init failed: {e}"))?,
-        other => return Err(format!("Unsupported sample format: {other:?}")),
+    let build = |config: &cpal::StreamConfig| -> Result<cpal::Stream, String> {
+        match sample_format {
+            cpal::SampleFormat::F32 => build_stream(&device, config, &slot, channels, |v| v, 0.0f32),
+            cpal::SampleFormat::I16 => build_stream(
+                &device, config, &slot, channels,
+                |v| (v.clamp(-1.0, 1.0) * i16::MAX as f32) as i16, 0i16,
+            ),
+            cpal::SampleFormat::U16 => build_stream(
+                &device, config, &slot, channels,
+                |v| ((v.clamp(-1.0, 1.0) * 0.5 + 0.5) * u16::MAX as f32) as u16, u16::MAX / 2,
+            ),
+            other => Err(format!("Unsupported sample format: {other:?}")),
+        }
+    };
+    let mut block = "device default".to_string();
+    let stream = match fixed {
+        Some(frames) => {
+            config.buffer_size = cpal::BufferSize::Fixed(frames);
+            match build(&config) {
+                Ok(stream) => {
+                    block = format!("{frames}-frame blocks");
+                    stream
+                }
+                Err(_) => {
+                    config.buffer_size = cpal::BufferSize::Default;
+                    build(&config)?
+                }
+            }
+        }
+        None => build(&config)?,
     };
 
     stream
@@ -807,7 +1016,7 @@ pub fn try_start_audio(
         .map_err(|e| format!("Audio play failed: {e}"))?;
     Ok((
         stream,
-        format!("cpal {:.0} Hz ({} ch)", sample_rate, channels),
+        format!("cpal {:.0} Hz ({} ch, {block})", sample_rate, channels),
     ))
 }
 
@@ -2382,5 +2591,102 @@ mod tests {
             assert_eq!(before, after, "round {round}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn midi_worker() -> (RtAudioWorker, MidiControls) {
+        let (midi, events) = MidiControls::new();
+        let (_tx, rx) = rtrb::RingBuffer::new(8);
+        let (tel_tx, _tel_rx) = rtrb::RingBuffer::new(4);
+        (RtAudioWorker::new(Pattern::default(), 48_000.0, rx, tel_tx, Some(events)), midi)
+    }
+
+    #[test]
+    fn stamped_midi_notes_start_on_their_sample_one_block_later() {
+        use std::time::Duration;
+        let key = MidiKey { channel: 0, note: 48 };
+        for (delay_ms, expected) in [(0.0, 0usize), (2.0, 96), (3.5, 168), (5.0, 240)] {
+            let (mut worker, mut midi) = midi_worker();
+            let t0 = Instant::now();
+            worker.begin_block(256, t0);
+            for _ in 0..256 {
+                worker.next_stereo();
+            }
+            midi.inject_at(
+                MidiEvent::NoteOn { key, velocity: 120 },
+                t0 + Duration::from_secs_f64(delay_ms / 1000.0),
+            );
+            worker.begin_block(256, t0 + Duration::from_secs_f64(256.0 / 48_000.0));
+            let first = (0..256).position(|_| worker.next_stereo() != (0.0, 0.0));
+            let first = first.expect("the note sounds within the block");
+            assert!(
+                (expected..=expected + 2).contains(&first),
+                "{delay_ms} ms: first sound at frame {first}, expected {expected}"
+            );
+        }
+        // Unstamped events (tests, injected UI events) play at the block start.
+        let (mut worker, mut midi) = midi_worker();
+        worker.begin_block(256, Instant::now());
+        midi.inject(MidiEvent::NoteOn { key, velocity: 120 });
+        worker.begin_block(256, Instant::now());
+        assert!(worker.next_stereo() != (0.0, 0.0) || worker.next_stereo() != (0.0, 0.0));
+    }
+
+    #[test]
+    fn midi_clock_sets_tempo_and_holds_phase_from_the_first_tick() {
+        use std::time::Duration;
+        let (mut worker, mut midi) = midi_worker();
+        let block = 256usize;
+        let block_seconds = block as f64 / 48_000.0;
+        let bpm = 130.0;
+        let tick = 60.0 / (bpm * 24.0);
+        let t0 = Instant::now();
+        let at = |seconds: f64| t0 + Duration::from_secs_f64(seconds);
+        // Clock runs for half a second before Start, as gear does when stopped.
+        let mut next_tick = 0.0;
+        let start_at = 0.5 + 0.3 * tick;
+        let mut started = false;
+        let mut ticks_after_start = 0u64;
+        let mut first_tick_frame = None;
+        for k in 0..(12.0 / block_seconds) as usize {
+            let now = k as f64 * block_seconds;
+            while next_tick < now {
+                if !started && next_tick > start_at {
+                    midi.inject_at(MidiEvent::Start, at(start_at));
+                    started = true;
+                }
+                midi.inject_at(MidiEvent::Clock, at(next_tick));
+                if started {
+                    ticks_after_start += 1;
+                }
+                next_tick += tick;
+            }
+            worker.begin_block(block, at(now));
+            for frame in 0..block {
+                let was_playing = worker.player.evaluator.playing;
+                worker.next_stereo();
+                if !was_playing && worker.player.evaluator.playing && first_tick_frame.is_none() {
+                    first_tick_frame = Some(k * block + frame);
+                }
+            }
+            if started && ticks_after_start == 0 {
+                assert!(!worker.player.evaluator.playing, "Start waits for the next tick");
+            }
+        }
+        // Start armed until the first tick after it, which plays one block late on its sample.
+        let first_tick_time = (start_at / tick).ceil() * tick;
+        let expected_frame = ((first_tick_time + block_seconds) * 48_000.0).round() as usize;
+        let got = first_tick_frame.expect("transport started");
+        assert!(got.abs_diff(expected_frame) <= 2, "started at {got}, expected {expected_frame}");
+        let tempo = worker.clock.bpm.expect("tempo estimated");
+        assert!((f64::from(tempo) - bpm).abs() < 0.05, "tempo {tempo}");
+        // Phase: the transport sits on the tick count, within a 96th of a beat.
+        let beat = worker.player.cursor_position(&worker.patterns[..worker.pattern_count]).0;
+        let expected = (ticks_after_start - 1) as f64 / 24.0;
+        let since_last_tick = (12.0 - (next_tick - tick) - block_seconds).max(0.0) * bpm / 60.0;
+        assert!(
+            (beat - (expected + since_last_tick)).abs() < 1.0 / 96.0,
+            "beat {beat}, ticks say {}",
+            expected + since_last_tick
+        );
     }
 }

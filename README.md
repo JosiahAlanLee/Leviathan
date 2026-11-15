@@ -96,6 +96,8 @@ In **Voice / Trig** (F2), **Lane Patch** shows timbre options for the lane's bas
 ## MIDI Input
 
 Select an input in the **MIDI** menu (**Refresh MIDI** rescans ports; **Off** disconnects). Holding MIDI notes auditions the active lane's instrument and cursor sound locks in real time, **MIDI REC** step-records incoming notes and velocities at the tracker cursor with full `Ctrl+Z` undo support, and MIDI `Start` / `Continue` / `Stop` messages synchronize transport playback.
+- Incoming MIDI plays on its exact sample, one audio block after it arrives: a steady latency instead of up to a block of jitter. Leviathan asks the device for 256-frame blocks (about 5 ms at 48 kHz) and falls back to the device default.
+- **Follow MIDI clock** (on by default) takes tempo from an incoming clock and stays phase-locked to the ticks counted since Start or Continue, so the transport does not drift against outboard gear. While a clock is running, Start and Continue wait for the next tick. The menu shows the clock's tempo.
 
 ## Quick Start
 
