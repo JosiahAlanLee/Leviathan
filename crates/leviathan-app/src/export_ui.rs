@@ -5,6 +5,7 @@ use eframe::egui;
 
 use crate::export::{ExportJob, ExportRequest, ExportSettings, ExportSource, SAMPLE_RATES};
 use crate::project::Project;
+use crate::shader_bus;
 use crate::wav::WavEncoding;
 
 #[derive(Default)]
@@ -47,7 +48,7 @@ impl ExportUi {
             .clicked()
         {
             if self.path.is_empty() {
-                self.path = default_path(self.settings.stems).to_string();
+                self.path = default_path(self.settings).to_string();
             }
             self.dialog = true;
             self.focus_path = true;
@@ -80,10 +81,12 @@ impl ExportUi {
         ctx: &egui::Context,
         selected: usize,
         has_chain: bool,
+        shader: &shader_bus::Patch,
     ) -> Option<ExportRequest> {
         if !self.dialog {
             return None;
         }
+        let previous_default = default_path(self.settings);
         if !has_chain {
             self.settings.source = ExportSource::Pattern;
         }
@@ -140,7 +143,7 @@ impl ExportUi {
                     ui.end_row();
 
                     ui.label("Tail");
-                    let max_tail = f64::from(self.settings.encoding.max_frames())
+                    let max_tail = f64::from(self.settings.max_frames())
                         / f64::from(self.settings.sample_rate);
                     ui.add(
                         egui::DragValue::new(&mut self.settings.tail_seconds)
@@ -151,16 +154,22 @@ impl ExportUi {
                     ui.end_row();
                 });
 
-            let stems_before = self.settings.stems;
-            if ui
-                .checkbox(&mut self.settings.stems, "Include stems")
-                .on_hover_text("Exports each lane and a shared BEND return when a lane sends to it.")
-                .changed()
-                && self.path == default_path(stems_before)
-            {
-                self.path = default_path(self.settings.stems).to_string();
+            ui.checkbox(&mut self.settings.stems, "Include stems")
+                .on_hover_text("Exports each lane and a shared BEND return when a lane sends to it.");
+            let has_shader_take = shader.take_for(self.settings.source.target(selected)).is_some();
+            if !has_shader_take {
+                self.settings.shader_cv = false;
             }
-            ui.label(if self.settings.stems {
+            ui.add_enabled(
+                has_shader_take,
+                egui::Checkbox::new(&mut self.settings.shader_cv, "Include shader ByteBus CV"),
+            )
+            .on_hover_text("Writes eight data channels, clock and reset beside the master WAV.")
+            .on_disabled_hover_text("Keep a shader take for the selected pattern or chain first.");
+            if self.path == previous_default {
+                self.path = default_path(self.settings).to_string();
+            }
+            ui.label(if self.settings.uses_folder() {
                 "New folder path"
             } else {
                 "WAV file path"
@@ -183,7 +192,7 @@ impl ExportUi {
         if confirmed {
             self.dialog = false;
             let mut destination = PathBuf::from(self.path.trim());
-            if !self.settings.stems
+            if !self.settings.uses_folder()
                 && !destination
                     .extension()
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
@@ -221,9 +230,11 @@ impl ExportUi {
     }
 }
 
-fn default_path(stems: bool) -> &'static str {
-    if stems {
+fn default_path(settings: ExportSettings) -> &'static str {
+    if settings.stems {
         "leviathan-stems"
+    } else if settings.shader_cv {
+        "leviathan-bytebus"
     } else {
         "leviathan.wav"
     }
@@ -267,50 +278,64 @@ mod tests {
 
     #[test]
     fn export_dialog_submits_the_path_and_selected_options() {
-        let ctx = egui::Context::default();
-        let mut dialog = ExportUi {
-            settings: ExportSettings {
-                source: ExportSource::Chain,
-                encoding: WavEncoding::Float32,
-                sample_rate: 96_000,
-                loops: 3,
-                tail_seconds: 1.25,
-                stems: false,
+        let shader = shader_bus::Patch {
+            route: shader_bus::Route {
+                lane: Some(0),
+                ..Default::default()
             },
-            dialog: true,
-            focus_path: true,
-            ..ExportUi::default()
+            take: Some(shader_bus::Take {
+                target: shader_bus::Target::Chain,
+                lane: 0,
+                words: vec![256, 0xa5],
+            }),
+            ..Default::default()
         };
-        let enter = Event::Key {
-            key: Key::Enter,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: Modifiers::NONE,
-        };
-        let mut request = None;
-        for events in [
-            vec![],
-            vec![Event::Text("chain-bounce".to_string())],
-            vec![enter],
+        for (shader_cv, take, destination) in [
+            (false, &shader, "chain-bounce.wav"),
+            (true, &shader, "chain-bounce"),
+            (true, &shader_bus::Patch::default(), "chain-bounce.wav"),
         ] {
-            let _ = ctx.run(
-                RawInput {
-                    events,
-                    ..RawInput::default()
+            let ctx = egui::Context::default();
+            let mut dialog = ExportUi {
+                settings: ExportSettings {
+                    source: ExportSource::Chain,
+                    encoding: WavEncoding::Float32,
+                    sample_rate: 96_000,
+                    loops: 3,
+                    tail_seconds: 1.25,
+                    stems: false,
+                    shader_cv,
                 },
-                |ctx| {
-                    request = dialog.show_dialog(ctx, 2, true);
-                },
-            );
+                dialog: true,
+                focus_path: true,
+                ..ExportUi::default()
+            };
+            let enter = Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            };
+            let mut request = None;
+            for events in [
+                vec![],
+                vec![Event::Text("chain-bounce".to_string())],
+                vec![enter],
+            ] {
+                let _ = ctx.run(RawInput { events, ..Default::default() }, |ctx| {
+                    request = dialog.show_dialog(ctx, 2, true, take);
+                });
+            }
+            let request = request.expect("Enter in the path field submits the export");
+            assert_eq!(request.destination, PathBuf::from(destination));
+            assert_eq!(request.settings.shader_cv, shader_cv && take.take.is_some());
+            assert!(request.settings.source == ExportSource::Chain);
+            assert_eq!(request.settings.encoding, WavEncoding::Float32);
+            assert_eq!(request.settings.sample_rate, 96_000);
+            assert_eq!(request.settings.loops, 3);
+            assert_eq!(request.settings.tail_seconds, 1.25);
+            assert!(!dialog.dialog_open());
         }
-        let request = request.expect("Enter in the path field submits the export");
-        assert_eq!(request.destination, PathBuf::from("chain-bounce.wav"));
-        assert!(request.settings.source == ExportSource::Chain);
-        assert_eq!(request.settings.encoding, WavEncoding::Float32);
-        assert_eq!(request.settings.sample_rate, 96_000);
-        assert_eq!(request.settings.loops, 3);
-        assert_eq!(request.settings.tail_seconds, 1.25);
-        assert!(!dialog.dialog_open());
     }
 }

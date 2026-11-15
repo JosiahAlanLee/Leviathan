@@ -9,10 +9,12 @@ use leviathan_core::{EngineConfig, LaunchTarget, SongPlayer, NUM_LANES};
 use leviathan_dsp::{echo, CaptureSamples, LanePatch, StereoDelay, SynthRack};
 
 use crate::project::Project;
-use crate::wav::{StereoWav, WavEncoding};
+use crate::shader_bus::{ReplayFrame, CV_CHANNELS};
+use crate::wav::{StereoWav, WavEncoding, WavWriter};
 
 pub const SAMPLE_RATES: [u32; 3] = [44_100, 48_000, 96_000];
 const BENDER_STEM_NAME: &str = "bend.wav";
+const SHADER_CV_NAME: &str = "shader-bytebus.wav";
 
 fn stem_filename(lane: usize, patch: &LanePatch) -> String {
     format!("{lane}-{}.wav", patch.machine.slug())
@@ -24,6 +26,15 @@ pub enum ExportSource {
     Chain,
 }
 
+impl ExportSource {
+    pub fn target(self, selected_pattern: usize) -> LaunchTarget {
+        match self {
+            Self::Pattern => LaunchTarget::Pattern(selected_pattern),
+            Self::Chain => LaunchTarget::Chain,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct ExportSettings {
     pub source: ExportSource,
@@ -32,6 +43,7 @@ pub struct ExportSettings {
     pub loops: u32,
     pub tail_seconds: f64,
     pub stems: bool,
+    pub shader_cv: bool,
 }
 
 impl Default for ExportSettings {
@@ -43,6 +55,22 @@ impl Default for ExportSettings {
             loops: 1,
             tail_seconds: 0.5,
             stems: false,
+            shader_cv: false,
+        }
+    }
+}
+
+impl ExportSettings {
+    pub fn uses_folder(self) -> bool {
+        self.stems || self.shader_cv
+    }
+
+    pub fn max_frames(self) -> u32 {
+        let master = self.encoding.max_frames();
+        if self.shader_cv {
+            master.min(WavEncoding::Float32.max_frames_for(CV_CHANNELS as u16))
+        } else {
+            master
         }
     }
 }
@@ -70,16 +98,16 @@ impl RenderPlan {
         {
             return Err(invalid("Invalid WAV export settings"));
         }
-        let (target, duration) = match settings.source {
-            ExportSource::Pattern => {
-                let index = project.selected_pattern;
+        let target = settings.source.target(project.selected_pattern);
+        let duration = match target {
+            LaunchTarget::Pattern(index) => {
                 let pattern = project
                     .patterns
                     .get(index)
                     .ok_or_else(|| invalid("Select a pattern to export"))?;
-                (LaunchTarget::Pattern(index), pattern.duration_beats())
+                pattern.duration_beats()
             }
-            ExportSource::Chain => {
+            LaunchTarget::Chain => {
                 let entries = project.chain.as_slice();
                 if entries.is_empty() {
                     return Err(invalid("Add a pattern to the chain before exporting it"));
@@ -92,15 +120,18 @@ impl RenderPlan {
                         .ok_or_else(|| invalid("Pattern chain contains a missing pattern"))?;
                     duration += pattern.duration_beats();
                 }
-                (LaunchTarget::Chain, duration)
+                duration
             }
         };
+        if settings.shader_cv && project.instruments.shader_bus.take_for(target).is_none() {
+            return Err(invalid("Select the pattern or chain of the recorded shader take"));
+        }
 
         let beats = duration * f64::from(settings.loops);
         let rate = f64::from(settings.sample_rate);
         let estimate = (beats * (60.0 * rate) / project.bpm).ceil();
         let tail = (settings.tail_seconds * rate).round();
-        let max_frames = settings.encoding.max_frames();
+        let max_frames = settings.max_frames();
         if estimate + tail > f64::from(max_frames) {
             return Err(invalid("Export exceeds RIFF/WAV size"));
         }
@@ -174,7 +205,7 @@ fn render(
     fill: bool,
     plan: RenderPlan,
     progress: &AtomicU32,
-    mut write: impl FnMut([f32; 2], &[[f32; 2]; NUM_LANES], [f32; 2]) -> io::Result<()>,
+    mut write: impl FnMut([f32; 2], &[[f32; 2]; NUM_LANES], [f32; 2], ReplayFrame) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut player = SongPlayer::new(EngineConfig {
         bpm: project.bpm,
@@ -242,7 +273,8 @@ fn render(
             player.evaluator.playing = false;
         }
         let (cv, retrigger) = player.step_sample(&project.patterns);
-        samples.ot2_frame = shader.step(&cv, ppqn);
+        let return_frame = shader.step(&cv, ppqn);
+        samples.ot2_frame = return_frame.address;
         if retrigger {
             rack.retrigger_gates();
         }
@@ -251,7 +283,7 @@ fn render(
         } else {
             (rack.render_session_with_echo(&cv, &samples, None, &mut echo_storage).0, [0.0; 2])
         };
-        write([left, right], &stems, wet)?;
+        write([left, right], &stems, wet, return_frame)?;
         if frame & 1023 == 1023 {
             progress.store(frame + 1, Ordering::Relaxed);
         }
@@ -267,7 +299,7 @@ fn write_outputs(
     destination: &Path,
     progress: &AtomicU32,
 ) -> io::Result<()> {
-    if plan.settings.stems {
+    if plan.settings.uses_folder() {
         require_new_folder(destination)?;
     }
     let stage = StagingDirectory::new(destination)?;
@@ -291,7 +323,18 @@ fn write_outputs(
             bender_writer = Some(create_writer(BENDER_STEM_NAME)?);
         }
     }
-    render(project, fill, plan, progress, |master, stems, wet| {
+    let mut shader_cv_writer = if plan.settings.shader_cv {
+        let file = File::create(stage.path.join(SHADER_CV_NAME))?;
+        Some(WavWriter::<_, CV_CHANNELS>::new(
+            BufWriter::new(file),
+            WavEncoding::Float32,
+            plan.settings.sample_rate,
+            plan.frames,
+        )?)
+    } else {
+        None
+    };
+    render(project, fill, plan, progress, |master, stems, wet, return_frame| {
         master_writer.write_frame(master)?;
         for (writer, &stem) in lane_writers.iter_mut().zip(stems) {
             writer.write_frame(stem)?;
@@ -299,12 +342,18 @@ fn write_outputs(
         if let Some(writer) = &mut bender_writer {
             writer.write_frame(wet)?;
         }
+        if let Some(writer) = &mut shader_cv_writer {
+            writer.write_frame(return_frame.cv_samples())?;
+        }
         Ok(())
     })?;
     for writer in std::iter::once(master_writer).chain(lane_writers).chain(bender_writer) {
         writer.finish()?.get_ref().sync_all()?;
     }
-    if plan.settings.stems {
+    if let Some(writer) = shader_cv_writer {
+        writer.finish()?.get_ref().sync_all()?;
+    }
+    if plan.settings.uses_folder() {
         stage.publish(destination)?;
     } else {
         fs::rename(stage.path.join("master.wav"), destination)?;
@@ -316,7 +365,7 @@ fn require_new_folder(path: &Path) -> io::Result<()> {
     if path.try_exists()? {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            "Choose a new folder for stem export",
+            "Choose a new folder for multiple WAV files",
         ));
     }
     Ok(())
@@ -424,7 +473,7 @@ mod tests {
             assert_eq!(plan.frames, expected_frames);
             let mut wav = StereoWav::new(Vec::new(), encoding, sample_rate, plan.frames).unwrap();
             let written = AtomicU32::new(0);
-            render(&project, false, plan, &written, |master, _, _| {
+            render(&project, false, plan, &written, |master, _, _, _| {
                 wav.write_frame(master)
             })
             .unwrap();
@@ -439,6 +488,114 @@ mod tests {
             assert_eq!(decoded.original_sr, sample_rate);
             assert!(decoded.peaks.iter().any(|&peak| peak > 0.01));
             assert_eq!(written.load(Ordering::Relaxed), expected_frames);
+        }
+    }
+
+    #[test]
+    fn shader_cv_bounce_matches_the_rack_bus_at_each_output_rate() {
+        use crate::shader_bus::{Take, Target};
+        use leviathan_dsp::{ByteBusReceiver, ByteBusSource};
+
+        let temp = StagingDirectory::new(&std::env::temp_dir().join("leviathan-test")).unwrap();
+        let mut snapshot = project();
+        snapshot.lane_patches[0] = LanePatch::for_machine(MachineKind::OtisTwin);
+        snapshot.patterns[0].rate = PlaybackRate::OneX;
+        snapshot.patterns[0].length = 4;
+        snapshot.patterns[1].rate = PlaybackRate::TwoX;
+        snapshot.patterns[1].length = 3;
+        let cv_settings = ExportSettings {
+            source: ExportSource::Chain,
+            shader_cv: true,
+            ..Default::default()
+        };
+        assert!(RenderPlan::new(&snapshot, cv_settings).is_err());
+        let patch = &mut snapshot.instruments.shader_bus;
+        patch.route.lane = Some(0);
+        patch.take = Some(Take {
+            target: Target::Chain,
+            lane: 0,
+            words: vec![256, 0xa5, 0xa5, 0, 256, 0xff, 0x80],
+        });
+        let wrong_source = ExportSettings {
+            source: ExportSource::Pattern,
+            ..cv_settings
+        };
+        assert!(RenderPlan::new(&snapshot, wrong_source).is_err());
+
+        for rate in SAMPLE_RATES {
+            let settings = ExportSettings {
+                sample_rate: rate,
+                loops: 2,
+                tail_seconds: 0.005,
+                ..cv_settings
+            };
+            let plan = RenderPlan::new(&snapshot, settings).unwrap();
+            let bundle = temp.path.join(format!("cv-{rate}"));
+            write_outputs(&snapshot, false, plan, &bundle, &AtomicU32::new(0)).unwrap();
+            let plain = temp.path.join(format!("master-{rate}.wav"));
+            let plain_settings = ExportSettings { shader_cv: false, ..settings };
+            let plain_plan = RenderPlan::new(&snapshot, plain_settings).unwrap();
+            write_outputs(&snapshot, false, plain_plan, &plain, &AtomicU32::new(0)).unwrap();
+            assert_eq!(
+                fs::read(bundle.join("master.wav")).unwrap(),
+                fs::read(plain).unwrap()
+            );
+            assert_eq!(fs::read_dir(&bundle).unwrap().count(), 2);
+
+            let bytes = fs::read(bundle.join(SHADER_CV_NAME)).unwrap();
+            assert_eq!(&bytes[0..4], b"RIFF");
+            assert_eq!(&bytes[8..16], b"WAVEfmt ");
+            let read_u32 = |at| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let read_u16 = |at| u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
+            assert_eq!(read_u32(4) as usize + 8, bytes.len());
+            assert_eq!(read_u32(16), 40);
+            assert_eq!(read_u16(20), 0xfffe);
+            assert_eq!(read_u16(22), 10);
+            assert_eq!(read_u32(24), rate);
+            assert_eq!(read_u16(32), 40);
+            assert_eq!(read_u16(34), 32);
+            assert_eq!(read_u32(40), 0);
+            assert_eq!(read_u32(44), 3);
+            assert_eq!(&bytes[60..64], b"fact");
+            assert_eq!(read_u32(68), plan.frames);
+            assert_eq!(&bytes[72..76], b"data");
+            assert_eq!(read_u32(76), plan.frames * 40);
+            assert_eq!(bytes.len() - 80, plan.frames as usize * 40);
+
+            // The loop wraps at 5.5 pulses. Keep the clock continuous and
+            // carry the last word through the tail with the clock stopped.
+            let mut receiver = ByteBusReceiver::default();
+            let words = [
+                None, Some(0xa5), Some(0xa5), Some(0), None, Some(0xff),
+                Some(0x80), Some(0x80), Some(0x80), Some(0x80), Some(0x80),
+            ];
+            let mut pulse = 0;
+            let mut expected = None;
+            for (sample, frame) in bytes[80..].chunks_exact(40).enumerate() {
+                let channels: [f32; 10] = std::array::from_fn(|index| {
+                    f32::from_le_bytes(frame[index * 4..index * 4 + 4].try_into().unwrap())
+                });
+                let mut clock = false;
+                let mut reset = false;
+                if pulse < words.len() && sample == (pulse * rate as usize).div_ceil(8) {
+                    expected = words[pulse];
+                    clock = expected.is_some();
+                    reset = pulse == 0 || pulse == 4;
+                    pulse += 1;
+                }
+                let bits = expected.unwrap_or(0);
+                for (bit, &value) in channels[..8].iter().enumerate() {
+                    assert_eq!(value, f32::from((bits >> bit) & 1), "{rate} Hz bit {bit} at {sample}");
+                }
+                assert_eq!(channels[8], if clock { 1.0 } else { 0.0 }, "{rate} Hz clock at {sample}");
+                assert_eq!(channels[9], if reset { 1.0 } else { 0.0 }, "{rate} Hz reset at {sample}");
+                if reset {
+                    let _ = receiver.step(ByteBusSource::Standalone, &[0.0; 9]);
+                }
+                let volts = std::array::from_fn(|index| channels[index] * 10.0);
+                assert_eq!(receiver.step(ByteBusSource::Clocked, &volts), expected);
+            }
+            assert_eq!(pulse, words.len());
         }
     }
 

@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use leviathan_core::{rack_routing::ByteRoute, CvFrame, LaunchTarget, NUM_LANES};
+use leviathan_core::{encode_bytebus_frame, rack_routing::ByteRoute, CvFrame, LaunchTarget, NUM_LANES};
 use leviathan_dsp::{ByteBusReceiver, ByteBusSource};
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 // allocates this buffer, on the host.
 const MAX_PULSES: usize = 32_768;
 const UNSET: u16 = 256;
+pub const CV_CHANNELS: usize = 10;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -54,14 +55,18 @@ impl Patch {
                 .is_none_or(|take| take.is_valid(pattern_count))
     }
 
-    pub fn replay(&self, target: LaunchTarget) -> Replay<'_> {
-        let take = self.take.as_ref().filter(|take| {
+    pub fn take_for(&self, target: LaunchTarget) -> Option<&Take> {
+        self.take.as_ref().filter(|take| {
             self.route.lane == Some(take.lane) && take.target == Target::from(target)
-        });
+        })
+    }
+
+    pub fn replay(&self, target: LaunchTarget) -> Replay<'_> {
         Replay {
-            take,
+            take: self.take_for(target),
             pulse: None,
             held: None,
+            started: false,
         }
     }
 }
@@ -319,19 +324,51 @@ pub struct Replay<'a> {
     take: Option<&'a Take>,
     pulse: Option<u64>,
     held: Option<u8>,
+    started: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ReplayFrame {
+    pub address: Option<(usize, u8)>,
+    clock: bool,
+    reset: bool,
+}
+
+impl ReplayFrame {
+    /// Channels 1–9 carry the Rack cable at normalized levels, and channel
+    /// 10 is a separate reset strobe. The file does not describe DAC volts.
+    pub fn cv_samples(self) -> [f32; CV_CHANNELS] {
+        let word = self.address.map_or(0, |(_, word)| word);
+        let cable = encode_bytebus_frame(word, self.clock);
+        let mut samples = [0.0; CV_CHANNELS];
+        for (sample, voltage) in samples.iter_mut().zip(cable) {
+            *sample = if voltage > 0.0 { 1.0 } else { 0.0 };
+        }
+        samples[9] = if self.reset { 1.0 } else { 0.0 };
+        samples
+    }
 }
 
 impl Replay<'_> {
-    pub fn step(&mut self, cv: &CvFrame, ppqn: u32) -> Option<(usize, u8)> {
-        let take = self.take?;
-        if let Some(pulse) = new_pulse(&mut self.pulse, cv, ppqn) {
+    pub fn step(&mut self, cv: &CvFrame, ppqn: u32) -> ReplayFrame {
+        let Some(take) = self.take else {
+            return ReplayFrame::default();
+        };
+        let first = !std::mem::replace(&mut self.started, true);
+        let previous = self.held;
+        let edge = new_pulse(&mut self.pulse, cv, ppqn);
+        if let Some(pulse) = edge {
             self.held = take
                 .words
                 .get(pulse as usize)
                 .or_else(|| take.words.last())
                 .and_then(|&word| u8::try_from(word).ok());
         }
-        Some((usize::from(take.lane), self.held?))
+        ReplayFrame {
+            address: self.held.map(|word| (usize::from(take.lane), word)),
+            clock: edge.is_some() && self.held.is_some(),
+            reset: first || (previous.is_some() && self.held.is_none()),
+        }
     }
 }
 
@@ -456,12 +493,12 @@ mod tests {
             .enumerate()
         {
             assert_eq!(
-                replay.step(&edge(pulse as u32, 3), 4),
+                replay.step(&edge(pulse as u32, 3), 4).address,
                 expected.map(|word| (2, word))
             );
         }
         assert_eq!(
-            patch.replay(LaunchTarget::Pattern(0)).step(&edge(1, 3), 4),
+            patch.replay(LaunchTarget::Pattern(0)).step(&edge(1, 3), 4).address,
             None
         );
     }

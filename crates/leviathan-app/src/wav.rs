@@ -243,55 +243,90 @@ impl WavEncoding {
         }
     }
 
-    fn riff_overhead(self) -> u32 {
-        match self {
-            Self::Pcm16 => 36,
-            Self::Float32 => 50,
+    fn format_size(self, channels: u16) -> u32 {
+        if channels > 2 {
+            40
+        } else if self == Self::Float32 {
+            18
+        } else {
+            16
         }
     }
 
-    fn frame_bytes(self) -> u16 {
-        self.bits() / 8 * 2
+    fn riff_overhead(self, channels: u16) -> u32 {
+        let fact_bytes = if self == Self::Float32 { 12 } else { 0 };
+        20 + self.format_size(channels) + fact_bytes
+    }
+
+    fn frame_bytes(self, channels: u16) -> u32 {
+        u32::from(self.bits() / 8) * u32::from(channels)
     }
 
     pub fn max_frames(self) -> u32 {
-        (u32::MAX - self.riff_overhead()) / u32::from(self.frame_bytes())
+        self.max_frames_for(2)
+    }
+
+    pub fn max_frames_for(self, channels: u16) -> u32 {
+        (u32::MAX - self.riff_overhead(channels))
+            .checked_div(self.frame_bytes(channels))
+            .unwrap_or(0)
     }
 }
 
-pub struct StereoWav<W: Write> {
+pub type StereoWav<W> = WavWriter<W, 2>;
+
+pub struct WavWriter<W: Write, const CHANNELS: usize> {
     writer: W,
     encoding: WavEncoding,
     remaining: u32,
 }
 
-impl<W: Write> StereoWav<W> {
+impl<W: Write, const CHANNELS: usize> WavWriter<W, CHANNELS> {
     pub fn new(mut writer: W, encoding: WavEncoding, rate: u32, frames: u32) -> io::Result<Self> {
-        if frames > encoding.max_frames() {
+        let invalid_channels = || {
+            io::Error::new(io::ErrorKind::InvalidInput, "Invalid WAV channel count")
+        };
+        let channels = u16::try_from(CHANNELS).map_err(|_| invalid_channels())?;
+        if channels == 0 {
+            return Err(invalid_channels());
+        }
+        let block_align = u16::try_from(encoding.frame_bytes(channels))
+            .map_err(|_| invalid_channels())?;
+        if frames > encoding.max_frames_for(channels) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Export exceeds RIFF/WAV size"));
         }
-        let block_align = encoding.frame_bytes();
         let byte_rate = rate
             .checked_mul(u32::from(block_align))
             .filter(|&bytes| bytes > 0)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid WAV sample rate"))?;
         let data_size = frames * u32::from(block_align);
         let float = encoding == WavEncoding::Float32;
-        let format_tag = if float { 3_u16 } else { 1_u16 };
-        let format_size = if float { 18_u32 } else { 16_u32 };
+        let extensible = channels > 2;
+        let subformat = if float { 3_u16 } else { 1_u16 };
+        let format_tag = if extensible { 0xfffe } else { subformat };
+        let format_size = encoding.format_size(channels);
 
         writer.write_all(b"RIFF")?;
-        writer.write_all(&(encoding.riff_overhead() + data_size).to_le_bytes())?;
+        writer.write_all(&(encoding.riff_overhead(channels) + data_size).to_le_bytes())?;
         writer.write_all(b"WAVEfmt ")?;
         writer.write_all(&format_size.to_le_bytes())?;
         writer.write_all(&format_tag.to_le_bytes())?;
-        writer.write_all(&2_u16.to_le_bytes())?;
+        writer.write_all(&channels.to_le_bytes())?;
         writer.write_all(&rate.to_le_bytes())?;
         writer.write_all(&byte_rate.to_le_bytes())?;
         writer.write_all(&block_align.to_le_bytes())?;
         writer.write_all(&encoding.bits().to_le_bytes())?;
-        if float {
+        if extensible {
+            writer.write_all(&22_u16.to_le_bytes())?;
+            writer.write_all(&encoding.bits().to_le_bytes())?;
+            // Discrete channels in file order, with no speaker positions.
+            writer.write_all(&0_u32.to_le_bytes())?;
+            writer.write_all(&u32::from(subformat).to_le_bytes())?;
+            writer.write_all(&[0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71])?;
+        } else if float {
             writer.write_all(&0_u16.to_le_bytes())?;
+        }
+        if float {
             writer.write_all(b"fact")?;
             writer.write_all(&4_u32.to_le_bytes())?;
             writer.write_all(&frames.to_le_bytes())?;
@@ -301,24 +336,22 @@ impl<W: Write> StereoWav<W> {
         Ok(Self { writer, encoding, remaining: frames })
     }
 
-    pub fn write_frame(&mut self, frame: [f32; 2]) -> io::Result<()> {
+    pub fn write_frame(&mut self, frame: [f32; CHANNELS]) -> io::Result<()> {
         if self.remaining == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Too many WAV frames"));
         }
-        let [left, right] = frame.map(|s| if s.is_finite() { s } else { 0.0 });
-        let mut bytes = [0; 8];
+        let frame = frame.map(|s| if s.is_finite() { s } else { 0.0 });
         match self.encoding {
             WavEncoding::Pcm16 => {
-                let pcm16 = |s: f32| (s.clamp(-1.0, 1.0) * 32_768.0).round() as i16;
-                bytes[..2].copy_from_slice(&pcm16(left).to_le_bytes());
-                bytes[2..4].copy_from_slice(&pcm16(right).to_le_bytes());
+                let bytes = frame.map(|s| {
+                    ((s.clamp(-1.0, 1.0) * 32_768.0).round() as i16).to_le_bytes()
+                });
+                self.writer.write_all(bytes.as_flattened())?;
             }
             WavEncoding::Float32 => {
-                bytes[..4].copy_from_slice(&left.to_le_bytes());
-                bytes[4..8].copy_from_slice(&right.to_le_bytes());
+                self.writer.write_all(frame.map(f32::to_le_bytes).as_flattened())?;
             }
         }
-        self.writer.write_all(&bytes[..usize::from(self.encoding.frame_bytes())])?;
         self.remaining -= 1;
         Ok(())
     }
