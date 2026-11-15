@@ -2291,4 +2291,96 @@ mod tests {
             crate::capture::Outcome::Cancelled
         ));
     }
+
+    #[test]
+    fn every_voice_option_survives_save_and_reload_sample_for_sample() {
+        use crate::project;
+        use leviathan_dsp::otis_kit::{FilterTaper, VelocityCurve};
+        use leviathan_dsp::MachineKind;
+
+        let ctx = eframe::CreationContext::_new_kittest(eframe::egui::Context::default());
+        let app = crate::LeviathanApp::with_audio(&ctx, |_, _, _, _, _| Err("Offline".into()));
+        let machines = [
+            MachineKind::ByteBusR2r,
+            MachineKind::OtisTranswave,
+            MachineKind::Fs77FormantFm,
+            MachineKind::FourOpFm,
+            MachineKind::OtisKit,
+            MachineKind::AcidLead,
+        ];
+        let dir = std::env::temp_dir().join(format!("leviathan-options-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut seed = 0x2545_f491_u32;
+        let mut coin = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed & 1 == 1
+        };
+        for round in 0..6 {
+            let mut source = app.project_snapshot();
+            source.bpm = 140.0;
+            source.voice_calibration = coin();
+            source.patterns[0] = Pattern { length: 2, ..Pattern::default() };
+            for (lane, machine) in machines.into_iter().enumerate() {
+                source.lane_patches[lane] = if source.voice_calibration {
+                    LanePatch::for_machine_with_calibration(machine)
+                } else {
+                    LanePatch::for_machine(machine)
+                };
+                for row in [0, 3, 6, 9] {
+                    source.patterns[0].lanes[lane][row] = NoteCell {
+                        active: true,
+                        midi: 48 + (row as u8 * 5 + lane as u8 * 3) % 24,
+                        velocity: 70 + row as u8 * 5,
+                        gate_fraction: if row == 3 { 1.0 } else { 0.5 },
+                        ..NoteCell::default()
+                    };
+                }
+            }
+            let instruments = &mut source.instruments;
+            instruments.kit.load_factory();
+            instruments.bbus.cycle_lock = coin();
+            instruments.bbus.grit[0] = coin();
+            instruments.otis.warm_tables = coin();
+            instruments.oversample.enabled = coin();
+            instruments.oversample.grit[2] = coin();
+            instruments.note_gates.enabled = coin();
+            let kit_lane = &mut instruments.kit.lanes[4];
+            kit_lane.raw_output = coin();
+            kit_lane.filter_taper = if coin() { FilterTaper::Squared } else { FilterTaper::Linear };
+            kit_lane.velocity = if coin() { VelocityCurve::Soft } else { VelocityCurve::Chip };
+            kit_lane.clock = round as u8 % 3;
+
+            let (music, frames) = (24_000, 30_000);
+            let before = render_test_project_live(&source, music, frames);
+            let path = dir.join(format!("round-{round}.leviathan.json"));
+            let expected = (
+                source.voice_calibration,
+                source.instruments.bbus,
+                source.instruments.otis,
+                source.instruments.oversample,
+                source.instruments.note_gates,
+                source.instruments.kit.lanes,
+            );
+            project::save(&path, source).unwrap();
+            let loaded = project::load(&path).unwrap();
+            assert_eq!(
+                (
+                    loaded.voice_calibration,
+                    loaded.instruments.bbus,
+                    loaded.instruments.otis,
+                    loaded.instruments.oversample,
+                    loaded.instruments.note_gates,
+                    loaded.instruments.kit.lanes,
+                ),
+                expected,
+                "round {round}"
+            );
+            let after = render_test_project_live(&loaded, music, frames);
+            assert!(before.iter().any(|&(l, r)| l != 0.0 || r != 0.0), "round {round} is silent");
+            assert_eq!(before, after, "round {round}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
