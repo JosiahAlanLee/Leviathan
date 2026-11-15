@@ -213,6 +213,12 @@ fn scan_sample(table: usize, frame: u32, phase: u32) -> f32 {
     pair[0] + frame_frac * (pair[1] - pair[0])
 }
 
+/// One 128-sample frame of the generated transwave banks, for offline
+/// comparison and export. `table` and `frame` are clamped.
+pub fn transwave_frame(table: usize, frame: usize) -> [i16; SAMPLES] {
+    ROM[table.min(TABLES - 1)][frame.min(FRAMES - 1)]
+}
+
 /// Read-only tap of the generated transwave banks for other voices.
 #[inline]
 pub(super) fn sample_rom(table: usize, frame: f32, phase: f32) -> f32 {

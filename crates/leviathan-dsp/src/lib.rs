@@ -38,6 +38,7 @@ pub use bbus::{ByteBusReceiver, ByteBusSource};
 pub use bender::{BenderParams, BENDER_MAX_SHIFT_HZ};
 pub use captured::{CaptureSample, CaptureSamples, CaptureTap};
 pub use master::{DelayMode, MasterPeaks, StereoDelay};
+pub use otis::transwave_frame;
 pub use otis_twin::TwinLoopMode;
 pub use spec::{
     default_lane_patches, machine_spec, LanePatch, MachineSpec, ParamSpec, DEFAULT_LANE_MACHINES,
