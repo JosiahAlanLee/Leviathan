@@ -294,7 +294,8 @@ impl LeviathanApp {
             export_ui: ExportUi::default(),
             gen_ui: GenUi::default(),
             project_generation: 0,
-            voice_calibration: false,
+            // New sessions use calibrated voicing; saved projects keep theirs.
+            voice_calibration: true,
             inspector_drag_recorded: false,
             deck: Deck::default(),
             edit_lane_patch: false,
@@ -307,7 +308,7 @@ impl LeviathanApp {
             delay_mode: DelayMode::default(),
             bender_params: BenderParams::default(),
             lane_mix: LaneMix::default(),
-            lane_patches: default_lane_patches(),
+            lane_patches: calibrated_lane_patches(),
             master_meters: MasterMeters::default(),
             sound_link: SoundLinkBridge::default(),
             midi,
@@ -349,6 +350,12 @@ impl LeviathanApp {
             transport_position: (0.0, 0),
             viewport,
         };
+        // The audio engine starts from the rack's legacy defaults: give it
+        // the session's calibrated voicing and factory patches.
+        app.send_audio(AudioCommand::SetVoiceCalibration(app.voice_calibration));
+        for (lane, patch) in app.lane_patches.into_iter().enumerate() {
+            app.send_audio(AudioCommand::SetLanePatch { lane, patch });
+        }
         app.sync_midi_target();
         app
     }
@@ -1672,6 +1679,11 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+/// The default lane machines with their calibrated factory patches.
+fn calibrated_lane_patches() -> [LanePatch; NUM_LANES] {
+    default_lane_patches().map(|patch| LanePatch::for_machine_with_calibration(patch.machine))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1746,6 +1758,12 @@ mod tests {
         assert!(app.instruments.otis.warm_tables);
         assert!(app.instruments.oversample.enabled);
         assert_eq!(app.instruments.bbus.grit_lanes(), 0);
+        assert!(app.voice_calibration);
+        for (patch, default) in app.lane_patches.iter().zip(default_lane_patches()) {
+            assert_eq!(*patch, LanePatch::for_machine_with_calibration(default.machine));
+        }
+        // Saved with calibration on, so the session reopens the same way.
+        assert!(app.project_snapshot().voice_calibration);
     }
 
     #[test]
