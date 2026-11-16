@@ -108,6 +108,25 @@ After keeping a take, choose its pattern or chain in **Export WAV…** and enabl
 
 Play the file at its native sample rate with unity gain in a host that exposes its individual channels. For a software Rack patch, map `0.0` and `1.0` to `0 V` and `10 V`, combine channels 1–9 in order, and send the result to a clocked ByteBus receiver. Route channel 10 separately to the receiver's reset logic. If both strobes appear on the first sample, apply reset before latching the word. The clock continues across chain wraps and stays low during the tail while the data bits hold. [Rack ByteBus cable contract](https://github.com/JosiahAlanLee/Gorgon/blob/22b8d4f0d61e5955deae42f726d57a763b0d8968/spec/bytebus-output.md)
 
+### Send the return live
+
+Set `LEVIATHAN_SHADER_CV_OUT` to the exact name of an output device with at least twelve 32-bit float channels. From a macOS or Linux shell, use the loopback device's name in the launch command.
+
+```bash
+LEVIATHAN_SHADER_CV_OUT="My 16-channel loopback" cargo run -p leviathan-app --release
+```
+
+The transport strip shows the selected device, sample rate, and **Shader CV 3–12** when the stream opens. If the name is unavailable, the strip lists the audio outputs Leviathan found. Select a return lane in **Scene** (F6) and play.
+
+| Device channel | Signal |
+| --- | --- |
+| 1–2 | Stereo master |
+| 3–10 | Held shader return, least significant bit first |
+| 11 | One-sample publication clock |
+| 12 | Separate one-sample reset |
+
+For a Rack loopback, keep the device and Rack at the same sample rate and preserve channel order at unity gain. Combine device channels 3–11 in order into a clocked ByteBus input with rails of `0 V` and `10 V`. Route channel 12 separately. A pause holds the byte with the clock low. Reset or a route change clears the held word. **Clear field** releases it on the next clock edge and emits reset if a word was held. Physical CV playback depends on the interface's DC response and received pulse width.
+
 ## Custom WGSL Shaders & SoundLink UDP
 
 - Drop any `.wgsl` file onto the window (or use **Load .wgsl** in **Scene** (F6)) to run custom ping-pong fragment shaders driven by Leviathan's 64-byte `VisualUniforms` and `prev_tex` feedback buffer.

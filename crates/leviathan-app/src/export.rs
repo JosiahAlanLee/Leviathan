@@ -9,7 +9,7 @@ use leviathan_core::{EngineConfig, LaunchTarget, SongPlayer, NUM_LANES};
 use leviathan_dsp::{echo, CaptureSamples, LanePatch, StereoDelay, SynthRack};
 
 use crate::project::Project;
-use crate::shader_bus::{ReplayFrame, CV_CHANNELS};
+use crate::shader_bus::{ReturnFrame, CV_CHANNELS};
 use crate::wav::{StereoWav, WavEncoding, WavWriter};
 
 pub const SAMPLE_RATES: [u32; 3] = [44_100, 48_000, 96_000];
@@ -205,7 +205,7 @@ fn render(
     fill: bool,
     plan: RenderPlan,
     progress: &AtomicU32,
-    mut write: impl FnMut([f32; 2], &[[f32; 2]; NUM_LANES], [f32; 2], ReplayFrame) -> io::Result<()>,
+    mut write: impl FnMut([f32; 2], &[[f32; 2]; NUM_LANES], [f32; 2], ReturnFrame) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut player = SongPlayer::new(EngineConfig {
         bpm: project.bpm,
