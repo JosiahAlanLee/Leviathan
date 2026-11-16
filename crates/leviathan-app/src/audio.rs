@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::env::VarError;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -990,6 +991,68 @@ impl RtAudioWorker {
 const PREFERRED_BLOCK_FRAMES: u32 = 256;
 const SHADER_CV_OUTPUT_CHANNELS: usize = 2 + shader_bus::CV_CHANNELS;
 const SHADER_CV_DEVICE_ENV: &str = "LEVIATHAN_SHADER_CV_OUT";
+const SHADER_CV_RATE_ENV: &str = "LEVIATHAN_SHADER_CV_RATE";
+/// Device names shown when the requested shader CV output is missing.
+const SHADER_CV_LISTED_OUTPUTS: usize = 6;
+/// Longest device name shown in that list; ALSA descriptions run long.
+const SHADER_CV_LISTED_NAME_CHARS: usize = 28;
+
+/// Parses `LEVIATHAN_SHADER_CV_RATE`. A device's default rate can differ from
+/// the rate its audio server runs at (PipeWire's ALSA device reports 44.1 kHz
+/// while the graph runs at 48 kHz), and a resampler smears one-sample strobes
+/// and rings the 0/1 rails, so the rate can be pinned.
+fn shader_cv_rate(value: Option<&str>) -> Result<Option<u32>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.trim().parse::<u32>() {
+        Ok(rate) if (8_000..=384_000).contains(&rate) => Ok(Some(rate)),
+        _ => Err(format!("{SHADER_CV_RATE_ENV} must be a sample rate in Hz, got {value:?}")),
+    }
+}
+
+fn shader_cv_settings(
+    var: impl Fn(&str) -> Result<String, VarError>,
+) -> Result<Option<(String, Option<u32>)>, String> {
+    let name = match var(SHADER_CV_DEVICE_ENV) {
+        Ok(name) => name,
+        Err(VarError::NotPresent) => return Ok(None),
+        Err(VarError::NotUnicode(_)) => {
+            return Err("Shader CV output device name must be UTF-8".into());
+        }
+    };
+    let rate = match var(SHADER_CV_RATE_ENV) {
+        Ok(value) => shader_cv_rate(Some(&value))?,
+        Err(VarError::NotPresent) => None,
+        Err(VarError::NotUnicode(_)) => return Err(format!("{SHADER_CV_RATE_ENV} must be UTF-8")),
+    };
+    Ok(Some((name, rate)))
+}
+
+/// Unique output names in enumeration order, at most `SHADER_CV_LISTED_OUTPUTS`
+/// of them, so a long ALSA list stays on one status line.
+fn summarize_outputs(names: &[String]) -> String {
+    let mut unique: Vec<&str> = Vec::new();
+    for name in names {
+        if !unique.contains(&name.as_str()) {
+            unique.push(name);
+        }
+    }
+    let shown = unique.len().min(SHADER_CV_LISTED_OUTPUTS);
+    let clip = |name: &str| -> String {
+        if name.chars().count() > SHADER_CV_LISTED_NAME_CHARS {
+            let head: String = name.chars().take(SHADER_CV_LISTED_NAME_CHARS - 1).collect();
+            format!("{}…", head.trim_end())
+        } else {
+            name.to_owned()
+        }
+    };
+    let mut summary = unique[..shown].iter().map(|name| clip(name)).collect::<Vec<_>>().join(", ");
+    if unique.len() > shown {
+        summary.push_str(&format!(" … +{} more", unique.len() - shown));
+    }
+    summary
+}
 
 fn build_stream<T: cpal::SizedSample + Send + 'static>(
     device: &cpal::Device,
@@ -1040,6 +1103,7 @@ fn shader_cv_config(
 fn select_shader_cv_output(
     host: &cpal::Host,
     name: &str,
+    rate: Option<u32>,
 ) -> Result<(cpal::Device, cpal::SupportedStreamConfig), String> {
     let devices = host
         .output_devices()
@@ -1052,25 +1116,34 @@ fn select_shader_cv_output(
         };
         if description.name() == name {
             if selected.is_some() {
-                return Err(format!("More than one shader CV output is named {name:?}"));
+                return Err(format!(
+                    "More than one shader CV output is named {name:?}; choose a device with a unique name"
+                ));
             }
             selected = Some(device);
         }
         names.push(description.name().to_owned());
     }
     let device = selected.ok_or_else(|| {
-        let available = names.join(", ");
+        let available = summarize_outputs(&names);
         format!("Shader CV output {name:?} unavailable · Outputs [{available}]")
     })?;
-    let preferred_rate = device
-        .default_output_config()
-        .map_or(48_000, |config| config.sample_rate());
+    let preferred_rate = rate.unwrap_or_else(|| {
+        device
+            .default_output_config()
+            .map_or(48_000, |config| config.sample_rate())
+    });
     let configs = device
         .supported_output_configs()
         .map_err(|e| format!("Shader CV output formats unavailable ({e})"))?;
     let config = shader_cv_config(configs, preferred_rate).ok_or_else(|| {
         format!("Shader CV output {name:?} needs at least {SHADER_CV_OUTPUT_CHANNELS} float channels")
     })?;
+    if let Some(rate) = rate {
+        if config.sample_rate() != rate {
+            return Err(format!("Shader CV output {name:?} cannot run at {rate} Hz"));
+        }
+    }
     Ok((device, config))
 }
 
@@ -1081,14 +1154,10 @@ pub fn try_start_audio(
     midi_events: MidiReceiver,
     recorder: Recorder,
 ) -> Result<(cpal::Stream, String), String> {
+    let shader_output = shader_cv_settings(|name| std::env::var(name))?;
     let host = cpal::default_host();
-    let shader_device = match std::env::var(SHADER_CV_DEVICE_ENV) {
-        Ok(name) => Some(name),
-        Err(std::env::VarError::NotPresent) => None,
-        Err(_) => return Err("Shader CV output device name must be UTF-8".into()),
-    };
-    let (device, supported) = if let Some(name) = &shader_device {
-        select_shader_cv_output(&host, name)?
+    let (device, supported) = if let Some((name, rate)) = &shader_output {
+        select_shader_cv_output(&host, name, *rate)?
     } else {
         let device = host
             .default_output_device()
@@ -1098,7 +1167,7 @@ pub fn try_start_audio(
             .map_err(|e| format!("Audio config unavailable: {e}"))?;
         (device, supported)
     };
-    let shader_cv = shader_device.is_some();
+    let shader_cv = shader_output.is_some();
     let sample_format = supported.sample_format();
     // Ask for 256-frame blocks (about 5 ms at 48 kHz) where the device allows
     // it: MIDI plays one block late but on its exact sample, so a short block
@@ -1161,7 +1230,7 @@ pub fn try_start_audio(
         .play()
         .map_err(|e| format!("Audio play failed: {e}"))?;
     let mut label = format!("cpal {sample_rate:.0} Hz ({channels} ch, {block})");
-    if let Some(name) = shader_device {
+    if let Some((name, _)) = shader_output {
         label.push_str(&format!(" · {name} · Shader CV 3–{SHADER_CV_OUTPUT_CHANNELS}"));
     }
     Ok((stream, label))
@@ -1175,6 +1244,46 @@ mod tests {
     use crate::midi::MidiControls;
     use crate::wav::{sample_peaks, DecodedWav, WavEncoding};
     use leviathan_core::PlaybackRate;
+
+    #[test]
+    fn shader_cv_rate_override_parses_hz() {
+        assert_eq!(shader_cv_rate(None), Ok(None));
+        assert_eq!(shader_cv_rate(Some("48000")), Ok(Some(48_000)));
+        assert_eq!(shader_cv_rate(Some(" 96000 ")), Ok(Some(96_000)));
+        for bad in ["", "48k", "0", "1000000", "-48000"] {
+            assert!(shader_cv_rate(Some(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn shader_cv_rate_requires_a_selected_cv_output() {
+        let disabled = shader_cv_settings(|key| {
+            assert_eq!(key, SHADER_CV_DEVICE_ENV);
+            Err(VarError::NotPresent)
+        });
+        assert_eq!(disabled, Ok(None));
+
+        let selected = |rate: &str| {
+            shader_cv_settings(|key| match key {
+                SHADER_CV_DEVICE_ENV => Ok("CV loopback".into()),
+                SHADER_CV_RATE_ENV => Ok(rate.to_owned()),
+                _ => unreachable!("Unexpected environment key {key}"),
+            })
+        };
+        assert!(selected("1000").is_err());
+        assert_eq!(selected("48000"), Ok(Some(("CV loopback".into(), Some(48_000)))));
+    }
+
+    #[test]
+    fn missing_output_lists_unique_names_briefly() {
+        let names: Vec<String> = ["A", "B", "A", "C", "B"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(summarize_outputs(&names), "A, B, C");
+        let many: Vec<String> = (0..30).map(|i| format!("dev{}", i % 12)).collect();
+        let summary = summarize_outputs(&many);
+        assert_eq!(summary, "dev0, dev1, dev2, dev3, dev4, dev5 … +6 more");
+        let long = vec!["Discard all samples (playback) or generate zero samples (capture)".to_string()];
+        assert_eq!(summarize_outputs(&long), "Discard all samples (playba…");
+    }
 
     #[test]
     fn shader_cv_output_uses_float_channels_at_the_device_rate() {

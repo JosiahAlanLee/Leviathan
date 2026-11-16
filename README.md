@@ -116,7 +116,23 @@ Set `LEVIATHAN_SHADER_CV_OUT` to the exact name of an output device with at leas
 LEVIATHAN_SHADER_CV_OUT="My 16-channel loopback" cargo run -p leviathan-app --release
 ```
 
-The transport strip shows the selected device, sample rate, and **Shader CV 3–12** when the stream opens. If the name is unavailable, the strip lists the audio outputs Leviathan found. Select a return lane in **Scene** (F6) and play.
+The transport strip shows the selected device, sample rate, and **Shader CV 3–12** when the stream opens. If the name is unavailable, the strip lists a few of the output names Leviathan found. Select a return lane in **Scene** (F6) and play.
+
+When a CV output is selected, `LEVIATHAN_SHADER_CV_RATE` requests a specific client stream rate in Hz. Leave it unset to use the device's advertised default rate. The strip reports an error if the selected device cannot provide the requested rate.
+
+On Linux, ALSA does not list PipeWire sinks by name, so select `PipeWire Sound Server`. It plays to the current default sink: make the twelve-channel loopback the default output before launching, and switch it back afterwards. This example uses a null sink on a 48 kHz graph (read the graph rate with `pw-metadata -n settings | grep clock.rate`).
+
+```bash
+pactl load-module module-null-sink sink_name=leviathan-cv channels=12 format=float32le rate=48000
+pactl set-default-sink leviathan-cv
+LEVIATHAN_SHADER_CV_OUT="PipeWire Sound Server" \
+LEVIATHAN_SHADER_CV_RATE=48000 \
+cargo run -p leviathan-app --release
+```
+
+Before pressing Play, confirm the stream reached the loopback: `pactl list sink-inputs` should show Leviathan's twelve-channel stream on `leviathan-cv`, not a physical interface. Routing one process with `PIPEWIRE_NODE=leviathan-cv` (plus `node.dont-fallback` / `node.dont-reconnect` in `PIPEWIRE_ALSA`) leaves the default untouched where WirePlumber honours the stream target, but WirePlumber 0.4.8 linked the stream to the default interface anyway, so check before playing.
+
+With Leviathan playing, check the running driver node's **RATE** and the stream's negotiated **FORMAT** in `pw-top`. Match the client rate, active graph rate, loopback format, and Rack rate to preserve the one-sample strobes. If the graph runs at a different rate, recreate the example sink and relaunch at that rate. [PipeWire ALSA settings](https://docs.pipewire.org/page_man_pipewire-client_conf_5.html) · [pw-top fields](https://docs.pipewire.org/page_man_pw-top_1.html)
 
 | Device channel | Signal |
 | --- | --- |
