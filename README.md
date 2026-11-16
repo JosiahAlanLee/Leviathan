@@ -116,7 +116,17 @@ Set `LEVIATHAN_SHADER_CV_OUT` to the exact name of an output device with at leas
 LEVIATHAN_SHADER_CV_OUT="My 16-channel loopback" cargo run -p leviathan-app --release
 ```
 
-The transport strip shows the selected device, sample rate, and **Shader CV 3–12** when the stream opens. If the name is unavailable, the strip lists the audio outputs Leviathan found. Select a return lane in **Scene** (F6) and play.
+The transport strip shows the selected device, sample rate, and **Shader CV 3–12** when the stream opens. If the name is unavailable, the strip lists a few of the output names Leviathan found. Select a return lane in **Scene** (F6) and play.
+
+The CV stream opens at the device's default rate. Set `LEVIATHAN_SHADER_CV_RATE` (in Hz) to open it at the rate the audio server actually runs, so the bits and one-sample strobes are not resampled. If the device cannot run at that rate, the strip says so and no stream opens.
+
+On Linux, ALSA does not list PipeWire sinks by name and repeats many hardware names, so use `PipeWire Sound Server` as the device. It plays to the current default sink, so first make your multichannel loopback (or a twelve-channel null sink) the default output, never a physical interface you do not mean to drive. PipeWire's ALSA device reports 44.1 kHz; read the graph rate with `pw-metadata -n settings | grep clock.rate` and pass it:
+
+```bash
+pactl load-module module-null-sink sink_name=leviathan-cv channels=12 format=float32le rate=48000
+pactl set-default-sink leviathan-cv
+LEVIATHAN_SHADER_CV_OUT="PipeWire Sound Server" LEVIATHAN_SHADER_CV_RATE=48000 cargo run -p leviathan-app --release
+```
 
 | Device channel | Signal |
 | --- | --- |
