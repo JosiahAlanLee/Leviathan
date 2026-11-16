@@ -215,6 +215,7 @@ pub struct Clock {
     status: Status,
     pending: Option<Reply>,
     clear_at_edge: bool,
+    reset_pending: bool,
     recorder: Option<Arc<Recorder>>,
 }
 
@@ -225,6 +226,7 @@ impl Clock {
             self.invalidate();
             self.status.latched = None;
             self.status.missed = 0;
+            self.reset_pending = true;
         }
         self.route = route;
     }
@@ -247,6 +249,7 @@ impl Clock {
         self.status.latched = None;
         self.status.missed = 0;
         self.clear_at_edge = false;
+        self.reset_pending |= self.route.lane.is_some();
     }
 
     pub fn record(&mut self, recorder: Arc<Recorder>) {
@@ -279,7 +282,7 @@ impl Clock {
             return false;
         };
         if std::mem::take(&mut self.clear_at_edge) {
-            self.status.latched = None;
+            self.reset_pending |= self.status.latched.take().is_some();
         }
         let due = pulse.checked_sub(1);
         if let Some(reply) = self.pending.take().filter(|r| Some(r.request.pulse) == due) {
@@ -318,6 +321,10 @@ impl Clock {
     pub fn frame(&self) -> Option<(usize, u8)> {
         Some((usize::from(self.route.lane?), self.status.latched?.word))
     }
+
+    pub fn output_frame(&mut self, edge: bool) -> ReturnFrame {
+        ReturnFrame::new(self.frame(), edge, std::mem::take(&mut self.reset_pending))
+    }
 }
 
 pub struct Replay<'a> {
@@ -328,15 +335,23 @@ pub struct Replay<'a> {
 }
 
 #[derive(Clone, Copy, Default)]
-pub struct ReplayFrame {
+pub struct ReturnFrame {
     pub address: Option<(usize, u8)>,
     clock: bool,
     reset: bool,
 }
 
-impl ReplayFrame {
-    /// Channels 1–9 carry the Rack cable at normalized levels, and channel
-    /// 10 is a separate reset strobe. The file does not describe DAC volts.
+impl ReturnFrame {
+    fn new(address: Option<(usize, u8)>, edge: bool, reset: bool) -> Self {
+        Self {
+            address,
+            clock: edge && address.is_some(),
+            reset,
+        }
+    }
+
+    /// Channels 1–9 carry the Rack cable at normalized levels and channel
+    /// 10 carries the separate reset strobe. Both rails use 0.0 or 1.0.
     pub fn cv_samples(self) -> [f32; CV_CHANNELS] {
         let word = self.address.map_or(0, |(_, word)| word);
         let cable = encode_bytebus_frame(word, self.clock);
@@ -350,9 +365,9 @@ impl ReplayFrame {
 }
 
 impl Replay<'_> {
-    pub fn step(&mut self, cv: &CvFrame, ppqn: u32) -> ReplayFrame {
+    pub fn step(&mut self, cv: &CvFrame, ppqn: u32) -> ReturnFrame {
         let Some(take) = self.take else {
-            return ReplayFrame::default();
+            return ReturnFrame::default();
         };
         let first = !std::mem::replace(&mut self.started, true);
         let previous = self.held;
@@ -364,11 +379,11 @@ impl Replay<'_> {
                 .or_else(|| take.words.last())
                 .and_then(|&word| u8::try_from(word).ok());
         }
-        ReplayFrame {
-            address: self.held.map(|word| (usize::from(take.lane), word)),
-            clock: edge.is_some() && self.held.is_some(),
-            reset: first || (previous.is_some() && self.held.is_none()),
-        }
+        ReturnFrame::new(
+            self.held.map(|word| (usize::from(take.lane), word)),
+            edge.is_some(),
+            first || (previous.is_some() && self.held.is_none()),
+        )
     }
 }
 
@@ -516,6 +531,9 @@ mod tests {
             ..Default::default()
         };
         assert!(clock.step(&edge(0, 0), 4, lookup));
+        let startup = clock.output_frame(true).cv_samples();
+        assert_eq!(startup[..9], [0.0; 9]);
+        assert_eq!(startup[9], 1.0);
         let sent = clock.status().request.unwrap();
         assert_eq!(sent.word, 0xbb);
         let reply = Reply {
@@ -525,12 +543,29 @@ mod tests {
         };
         clock.reply(reply);
         assert!(clock.step(&edge(1, 0), 4, lookup));
+        let published = clock.output_frame(true).cv_samples();
+        assert_eq!(published, [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]);
         assert_eq!(clock.status().request.unwrap().word, 0xaa);
+
+        assert!(!clock.step(&CvFrame::default(), 4, lookup));
+        let paused = clock.output_frame(false).cv_samples();
+        assert_eq!(paused[..8], published[..8]);
+        assert_eq!(paused[8..], [0.0; 2]);
+        assert!(!clock.step(&edge(1, 0), 4, lookup));
+        assert_eq!(clock.output_frame(false).cv_samples(), paused);
+
         clock.reset_transport();
         assert!(clock.step(&edge(0, 0), 4, lookup));
+        assert_eq!(clock.output_frame(true).cv_samples(), startup);
+        assert_eq!(clock.output_frame(false).cv_samples(), [0.0; CV_CHANNELS]);
         clock.reply(reply);
         assert!(clock.step(&edge(1, 0), 4, lookup));
         assert_eq!(clock.frame(), None);
         assert_eq!(clock.status().request.unwrap().word, 0xbb);
+
+        clock.set_route(Route::default());
+        assert!(!clock.step(&edge(2, 0), 4, lookup));
+        assert_eq!(clock.output_frame(false).cv_samples(), startup);
+        assert_eq!(clock.output_frame(false).cv_samples(), [0.0; CV_CHANNELS]);
     }
 }

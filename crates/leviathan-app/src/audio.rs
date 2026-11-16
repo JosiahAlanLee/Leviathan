@@ -860,7 +860,7 @@ impl RtAudioWorker {
     }
 
     #[inline]
-    fn next_stereo(&mut self) -> (f32, f32) {
+    fn next_output(&mut self) -> ((f32, f32), shader_bus::ReturnFrame) {
         if self.pending_next < self.pending_len {
             self.apply_due_midi();
         } else {
@@ -890,9 +890,10 @@ impl RtAudioWorker {
         let shader_edge =
             self.shader
                 .step(&cv, self.player.evaluator.config.ppqn, self.shader_lookup);
+        let shader_return = self.shader.output_frame(shader_edge);
         let mut samples = self.takes.samples();
         samples.kit = Some(&self.kit);
-        samples.ot2_frame = self.shader.frame();
+        samples.ot2_frame = shader_return.address;
         let (pair, capture) = self.synth.render_session_with_echo(
             &render_cv, &samples, tap, &mut self.echo_storage,
         );
@@ -942,21 +943,64 @@ impl RtAudioWorker {
                 self.synth.clear_master_peaks();
             }
         }
-        pair
+        (pair, shader_return)
+    }
+
+    #[cfg(test)]
+    fn next_stereo(&mut self) -> (f32, f32) {
+        self.next_output().0
+    }
+
+    fn render_output<T: Copy>(
+        &mut self,
+        data: &mut [T],
+        channels: usize,
+        shader_cv: bool,
+        convert: fn(f32) -> T,
+        silence: T,
+    ) {
+        debug_assert!(channels > 0 && (!shader_cv || channels >= SHADER_CV_OUTPUT_CHANNELS));
+        self.begin_block(data.len() / channels, Instant::now());
+        let used_channels = if shader_cv {
+            SHADER_CV_OUTPUT_CHANNELS
+        } else {
+            channels.min(2)
+        };
+        let mut frames = data.chunks_exact_mut(channels);
+        for frame in &mut frames {
+            let ((left, right), shader_return) = self.next_output();
+            frame[0] = convert(left);
+            if let Some(channel) = frame.get_mut(1) {
+                *channel = convert(right);
+            }
+            if shader_cv {
+                for (channel, value) in frame[2..used_channels]
+                    .iter_mut()
+                    .zip(shader_return.cv_samples())
+                {
+                    *channel = convert(value);
+                }
+            }
+            frame[used_channels..].fill(silence);
+        }
+        frames.into_remainder().fill(silence);
     }
 }
 
 const PREFERRED_BLOCK_FRAMES: u32 = 256;
+const SHADER_CV_OUTPUT_CHANNELS: usize = 2 + shader_bus::CV_CHANNELS;
+const SHADER_CV_DEVICE_ENV: &str = "LEVIATHAN_SHADER_CV_OUT";
 
 fn build_stream<T: cpal::SizedSample + Send + 'static>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     slot: &Arc<Mutex<Option<RtAudioWorker>>>,
-    channels: usize,
+    shader_cv: bool,
     convert: fn(f32) -> T,
     silence: T,
 ) -> Result<cpal::Stream, String> {
     let slot = Arc::clone(slot);
+    let channels = usize::from(config.channels).max(1);
     let mut worker: Option<RtAudioWorker> = None;
     device
         .build_output_stream(
@@ -969,22 +1013,65 @@ fn build_stream<T: cpal::SizedSample + Send + 'static>(
                     data.fill(silence);
                     return;
                 };
-                worker.begin_block(data.len() / channels, Instant::now());
-                for frame in data.chunks_mut(channels) {
-                    let (l, r) = worker.next_stereo();
-                    frame[0] = convert(l);
-                    if channels > 1 {
-                        frame[1] = convert(r);
-                    }
-                    for extra in frame.iter_mut().skip(2) {
-                        *extra = silence;
-                    }
-                }
+                worker.render_output(data, channels, shader_cv, convert, silence);
             },
             |err| eprintln!("leviathan audio stream error: {err}"),
             None,
         )
         .map_err(|e| format!("Stream init failed: {e}"))
+}
+
+fn shader_cv_config(
+    configs: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
+    preferred_rate: u32,
+) -> Option<cpal::SupportedStreamConfig> {
+    configs
+        .filter(|config| {
+            config.sample_format() == cpal::SampleFormat::F32
+                && usize::from(config.channels()) >= SHADER_CV_OUTPUT_CHANNELS
+        })
+        .map(|config| {
+            let rate = preferred_rate.clamp(config.min_sample_rate(), config.max_sample_rate());
+            config.with_sample_rate(rate)
+        })
+        .min_by_key(|config| (config.sample_rate().abs_diff(preferred_rate), config.channels()))
+}
+
+fn select_shader_cv_output(
+    host: &cpal::Host,
+    name: &str,
+) -> Result<(cpal::Device, cpal::SupportedStreamConfig), String> {
+    let devices = host
+        .output_devices()
+        .map_err(|e| format!("Audio outputs unavailable ({e})"))?;
+    let mut names = Vec::new();
+    let mut selected = None;
+    for device in devices {
+        let Ok(description) = device.description() else {
+            continue;
+        };
+        if description.name() == name {
+            if selected.is_some() {
+                return Err(format!("More than one shader CV output is named {name:?}"));
+            }
+            selected = Some(device);
+        }
+        names.push(description.name().to_owned());
+    }
+    let device = selected.ok_or_else(|| {
+        let available = names.join(", ");
+        format!("Shader CV output {name:?} unavailable · Outputs [{available}]")
+    })?;
+    let preferred_rate = device
+        .default_output_config()
+        .map_or(48_000, |config| config.sample_rate());
+    let configs = device
+        .supported_output_configs()
+        .map_err(|e| format!("Shader CV output formats unavailable ({e})"))?;
+    let config = shader_cv_config(configs, preferred_rate).ok_or_else(|| {
+        format!("Shader CV output {name:?} needs at least {SHADER_CV_OUTPUT_CHANNELS} float channels")
+    })?;
+    Ok((device, config))
 }
 
 pub fn try_start_audio(
@@ -995,13 +1082,23 @@ pub fn try_start_audio(
     recorder: Recorder,
 ) -> Result<(cpal::Stream, String), String> {
     let host = cpal::default_host();
-    let Some(device) = host.default_output_device() else {
-        return Err("Offline UI clock (no audio device)".to_string());
+    let shader_device = match std::env::var(SHADER_CV_DEVICE_ENV) {
+        Ok(name) => Some(name),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => return Err("Shader CV output device name must be UTF-8".into()),
     };
-    let supported = device
-        .default_output_config()
-        .map_err(|e| format!("Audio config unavailable: {e}"))?;
-
+    let (device, supported) = if let Some(name) = &shader_device {
+        select_shader_cv_output(&host, name)?
+    } else {
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| "Offline UI clock (no audio device)".to_string())?;
+        let supported = device
+            .default_output_config()
+            .map_err(|e| format!("Audio config unavailable: {e}"))?;
+        (device, supported)
+    };
+    let shader_cv = shader_device.is_some();
     let sample_format = supported.sample_format();
     // Ask for 256-frame blocks (about 5 ms at 48 kHz) where the device allows
     // it: MIDI plays one block late but on its exact sample, so a short block
@@ -1030,13 +1127,13 @@ pub fn try_start_audio(
 
     let build = |config: &cpal::StreamConfig| -> Result<cpal::Stream, String> {
         match sample_format {
-            cpal::SampleFormat::F32 => build_stream(&device, config, &slot, channels, |v| v, 0.0f32),
+            cpal::SampleFormat::F32 => build_stream(&device, config, &slot, shader_cv, |v| v, 0.0f32),
             cpal::SampleFormat::I16 => build_stream(
-                &device, config, &slot, channels,
+                &device, config, &slot, shader_cv,
                 |v| (v.clamp(-1.0, 1.0) * i16::MAX as f32) as i16, 0i16,
             ),
             cpal::SampleFormat::U16 => build_stream(
-                &device, config, &slot, channels,
+                &device, config, &slot, shader_cv,
                 |v| ((v.clamp(-1.0, 1.0) * 0.5 + 0.5) * u16::MAX as f32) as u16, u16::MAX / 2,
             ),
             other => Err(format!("Unsupported sample format: {other:?}")),
@@ -1063,10 +1160,11 @@ pub fn try_start_audio(
     stream
         .play()
         .map_err(|e| format!("Audio play failed: {e}"))?;
-    Ok((
-        stream,
-        format!("cpal {:.0} Hz ({} ch, {block})", sample_rate, channels),
-    ))
+    let mut label = format!("cpal {sample_rate:.0} Hz ({channels} ch, {block})");
+    if let Some(name) = shader_device {
+        label.push_str(&format!(" · {name} · Shader CV 3–{SHADER_CV_OUTPUT_CHANNELS}"));
+    }
+    Ok((stream, label))
 }
 
 #[cfg(test)]
@@ -1077,6 +1175,33 @@ mod tests {
     use crate::midi::MidiControls;
     use crate::wav::{sample_peaks, DecodedWav, WavEncoding};
     use leviathan_core::PlaybackRate;
+
+    #[test]
+    fn shader_cv_output_uses_float_channels_at_the_device_rate() {
+        use cpal::{SampleFormat, SupportedBufferSize, SupportedStreamConfigRange};
+
+        let format = |channels, max_rate, format| {
+            SupportedStreamConfigRange::new(
+                channels, 44_100, max_rate, SupportedBufferSize::Unknown, format,
+            )
+        };
+        let configs = [
+            format(8, 48_000, SampleFormat::F32),
+            format(12, 48_000, SampleFormat::I16),
+            format(12, 44_100, SampleFormat::F32),
+            format(16, 96_000, SampleFormat::F32),
+            format(32, 96_000, SampleFormat::F32),
+        ];
+        assert!(shader_cv_config(configs[..2].iter().cloned(), 48_000).is_none());
+        let selected = shader_cv_config(configs.iter().cloned(), 48_000).unwrap();
+        assert_eq!(selected.sample_format(), SampleFormat::F32);
+        assert_eq!(selected.channels(), 16);
+        assert_eq!(selected.sample_rate(), 48_000);
+
+        let selected = shader_cv_config(configs.into_iter(), 44_100).unwrap();
+        assert_eq!(selected.channels(), 12);
+        assert_eq!(selected.sample_rate(), 44_100);
+    }
 
     #[test]
     fn captures_four_beats_in_stereo_then_loads_and_exports_the_same_take() {
@@ -1553,28 +1678,27 @@ mod tests {
                 playing: true,
                 request: 1,
             });
-            worker.drain_commands();
             let mut responded = None;
-            let mut live = Vec::with_capacity(frames);
-            for sample in 0..frames {
-                live.push(worker.next_stereo());
-                if sample % 113 == 0 {
-                    if let Some(request) = worker
-                        .shader
-                        .status()
-                        .request
-                        .filter(|&r| Some(r) != responded)
-                    {
-                        responded = Some(request);
-                        if request.pulse != 2 {
-                            let word = if request.pulse % 2 == 0 { 0 } else { 255 };
-                            audio.send(AudioCommand::ShaderReply(shader_bus::Reply {
-                                request,
-                                word,
-                                rotation: 0,
-                            }));
-                        }
-                        worker.drain_commands();
+            const DEVICE_CHANNELS: usize = 16;
+            let mut live = vec![[f32::NAN; DEVICE_CHANNELS]; frames];
+            for block in live.chunks_mut(113) {
+                worker.render_output(block.as_flattened_mut(), DEVICE_CHANNELS, true, |v| v, 0.0);
+                if let Some(request) = worker
+                    .shader
+                    .status()
+                    .request
+                    .filter(|&r| Some(r) != responded)
+                {
+                    responded = Some(request);
+                    if request.pulse == 3 {
+                        audio.send(AudioCommand::ClearShaderField);
+                    } else if request.pulse != 2 {
+                        let word = if request.pulse % 2 == 0 { 0 } else { 255 };
+                        audio.send(AudioCommand::ShaderReply(shader_bus::Reply {
+                            request,
+                            word,
+                            rotation: 0,
+                        }));
                     }
                 }
             }
@@ -1582,11 +1706,11 @@ mod tests {
             worker.drain_commands();
             assert!(recording.is_done());
             let take = recording.snapshot().unwrap();
-            assert_eq!(take.words, [256, 0, 255, 255, 255, 0, 255, 0]);
+            assert_eq!(take.words, [256, 0, 255, 255, 256, 0, 255, 0]);
             assert!(live[6000..24_000]
                 .iter()
                 .zip(&dry[6000..])
-                .any(|(a, b)| (a.0 - b.0).abs() > 1e-4));
+                .any(|(a, b)| (a[0] - b.0).abs() > 1e-4));
             song.instruments.shader_bus.take = Some(take.clone());
             project::save(&song_path, song).unwrap();
             let reopened = project::load(&song_path).unwrap();
@@ -1601,6 +1725,7 @@ mod tests {
                         source: ExportSource::Chain,
                         encoding: WavEncoding::Float32,
                         stems: true,
+                        shader_cv: true,
                         tail_seconds: 0.0,
                         ..Default::default()
                     },
@@ -1617,10 +1742,38 @@ mod tests {
                 let left = f32::from_le_bytes(frame[..4].try_into().unwrap());
                 let right = f32::from_le_bytes(frame[4..].try_into().unwrap());
                 assert_eq!(
-                    (left, right),
-                    live[index],
+                    [left, right],
+                    live[index][..2],
                     "capture {from_capture}, sample {index}"
                 );
+            }
+            let cv = std::fs::read(destination.join("shader-bytebus.wav")).unwrap();
+            let cv_frame_bytes = shader_bus::CV_CHANNELS * std::mem::size_of::<f32>();
+            let cv_start = cv.len() - frames * cv_frame_bytes;
+            assert_eq!(&cv[cv_start - 8..cv_start - 4], b"data");
+            for (index, (frame, live)) in cv[cv_start..]
+                .chunks_exact(cv_frame_bytes)
+                .zip(live)
+                .enumerate()
+            {
+                for (channel, bytes) in frame.chunks_exact(4).enumerate() {
+                    let value = f32::from_le_bytes(bytes.try_into().unwrap());
+                    assert_eq!(
+                        value, live[channel + 2],
+                        "capture {from_capture}, CV ch {channel}, sample {index}"
+                    );
+                }
+                assert_eq!(
+                    live[SHADER_CV_OUTPUT_CHANNELS..],
+                    [0.0; DEVICE_CHANNELS - SHADER_CV_OUTPUT_CHANNELS]
+                );
+            }
+
+            let mut stereo_only = [[f32::NAN; DEVICE_CHANNELS]; 16];
+            worker.render_output(stereo_only.as_flattened_mut(), DEVICE_CHANNELS, false, |v| v, 0.0);
+            assert_eq!(worker.shader.frame(), Some((0, 255)));
+            for frame in stereo_only {
+                assert_eq!(frame[2..], [0.0; DEVICE_CHANNELS - 2]);
             }
         }
         std::fs::remove_dir_all(directory).unwrap();
