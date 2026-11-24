@@ -376,4 +376,260 @@ mod tests {
         }
         assert!(energy > 10.0);
     }
+
+    fn lock_with(values: [f32; 8]) -> SoundLock {
+        SoundLock {
+            machine: 4,
+            mask: (1 << 1) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7),
+            values,
+        }
+    }
+
+    #[test]
+    fn from_norm_boundaries_map_to_expected_modes() {
+        assert_eq!(SampleLoopMode::from_norm(-1.0), SampleLoopMode::OneShot);
+        assert_eq!(SampleLoopMode::from_norm(0.0), SampleLoopMode::OneShot);
+        assert_eq!(SampleLoopMode::from_norm(0.32), SampleLoopMode::OneShot);
+        assert_eq!(SampleLoopMode::from_norm(0.33), SampleLoopMode::ForwardLoop);
+        assert_eq!(SampleLoopMode::from_norm(0.65), SampleLoopMode::ForwardLoop);
+        assert_eq!(SampleLoopMode::from_norm(0.66), SampleLoopMode::PingPongLoop);
+        assert_eq!(SampleLoopMode::from_norm(1.0), SampleLoopMode::PingPongLoop);
+        assert_eq!(SampleLoopMode::from_norm(1.5), SampleLoopMode::PingPongLoop);
+    }
+
+    #[test]
+    fn default_bank_has_rom_waves_and_regions() {
+        let bank = SampleBank::new();
+        for b in 0..NUM_BANKS {
+            assert_eq!(bank.lengths[b], ROM_WAVE_LEN);
+            assert_eq!(bank.c4_rates[b], C4_HZ * 128.0);
+            assert_eq!(bank.regions[b], SampleRegion::default());
+        }
+        assert!(bank.waves[0].iter().any(|&s| s != 0));
+        assert_eq!(SampleBank::default().lengths, bank.lengths);
+    }
+
+    #[test]
+    fn reset_rom_bank_restores_defaults() {
+        let mut bank = SampleBank::new();
+        bank.load_pcm(0, &[1, 2, 3, 4]);
+        bank.set_region(0, SampleRegion { trim_start: 0.5, trim_end: 1.0, loop_enabled: true });
+        bank.reset_rom_bank(0);
+        assert_eq!(bank.lengths[0], ROM_WAVE_LEN);
+        assert_eq!(bank.c4_rates[0], C4_HZ * 128.0);
+        // Regions are not reset by reset_rom_bank.
+        assert!(bank.regions[0].loop_enabled);
+    }
+
+    #[test]
+    fn reset_rom_bank_out_of_range_is_noop() {
+        let mut bank = SampleBank::new();
+        bank.load_pcm(0, &[7, 7, 7]);
+        let before = bank.lengths[0];
+        bank.reset_rom_bank(NUM_BANKS);
+        bank.reset_rom_bank(usize::MAX);
+        assert_eq!(bank.lengths[0], before);
+    }
+
+    #[test]
+    fn load_pcm_out_of_range_bank_is_noop() {
+        let mut bank = SampleBank::new();
+        let before = bank.lengths;
+        bank.load_pcm(NUM_BANKS, &[1, 2, 3]);
+        bank.load_pcm(usize::MAX, &[1, 2, 3]);
+        assert_eq!(bank.lengths, before);
+    }
+
+    #[test]
+    fn load_pcm_empty_is_noop() {
+        let mut bank = SampleBank::new();
+        let before = bank.lengths;
+        bank.load_pcm(0, &[]);
+        bank.load_pcm_with_rate(0, &[], 24_000.0);
+        assert_eq!(bank.lengths, before);
+    }
+
+    #[test]
+    fn load_pcm_truncates_to_max_wave_len() {
+        let mut bank = SampleBank::new();
+        let samples = vec![1234i16; MAX_WAVE_LEN + 100];
+        bank.load_pcm(0, &samples);
+        assert_eq!(bank.lengths[0], MAX_WAVE_LEN);
+        assert_eq!(bank.waves[0][MAX_WAVE_LEN - 1], 1234);
+    }
+
+    #[test]
+    fn load_pcm_zeroes_tail_after_short_load() {
+        let mut bank = SampleBank::new();
+        bank.load_pcm(0, &[100, -200, 300, -400]);
+        assert_eq!(bank.lengths[0], 4);
+        assert!(bank.waves[0][4..].iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn load_pcm_with_rate_clamps_c4_rate() {
+        let mut bank = SampleBank::new();
+        bank.load_pcm_with_rate(0, &[1, 2, 3], 100.0);
+        assert_eq!(bank.c4_rates[0], 500.0);
+        bank.load_pcm_with_rate(0, &[1, 2, 3], 1.0e9);
+        assert_eq!(bank.c4_rates[0], 192_000.0);
+        bank.load_pcm_with_rate(0, &[1, 2, 3], 48_000.0);
+        assert_eq!(bank.c4_rates[0], 48_000.0);
+    }
+
+    #[test]
+    fn set_region_rejects_invalid_region() {
+        let mut bank = SampleBank::new();
+        let before = bank.regions[0];
+        bank.set_region(0, SampleRegion { trim_start: -0.1, trim_end: 1.0, loop_enabled: true });
+        bank.set_region(0, SampleRegion { trim_start: 0.5, trim_end: 1.5, loop_enabled: false });
+        assert_eq!(bank.regions[0], before);
+        let valid = SampleRegion { trim_start: 0.25, trim_end: 0.75, loop_enabled: true };
+        bank.set_region(0, valid);
+        assert_eq!(bank.regions[0], valid);
+    }
+
+    #[test]
+    fn set_region_out_of_range_bank_is_noop() {
+        let mut bank = SampleBank::new();
+        let before = bank.regions;
+        bank.set_region(NUM_BANKS, SampleRegion { trim_start: 0.0, trim_end: 1.0, loop_enabled: true });
+        assert_eq!(bank.regions, before);
+    }
+
+    #[test]
+    fn region_frames_always_nonempty_and_in_range() {
+        for &trim_start in &[0.0_f32, 0.25, 0.5, 0.9, 1.0] {
+            for &trim_end in &[0.0_f32, 0.25, 0.5, 0.9, 1.0] {
+                for &len in &[1_usize, 2, 8, 1024] {
+                    let region = SampleRegion { trim_start, trim_end, loop_enabled: false };
+                    let range = region.frames(len);
+                    assert!(range.end > range.start, "empty range for {:?} len {}", region, len);
+                    assert!(range.end <= len, "range end {} exceeds len {}", range.end, len);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_bank_defaults_to_middle_bank() {
+        let lock = SoundLock::default();
+        assert_eq!(selected_bank(&lock), 2);
+    }
+
+    #[test]
+    fn selected_bank_maps_slot_3_to_bank() {
+        for (value, expected) in [
+            (0.0, 0), (0.24, 0), (0.25, 1), (0.5, 2), (0.75, 3), (0.999, 3), (1.0, 3),
+        ] {
+            let lock = lock_with([0.0, 0.0, 0.0, value, 0.0, 0.0, 0.0, 0.0]);
+            assert_eq!(selected_bank(&lock), expected, "value {value}");
+        }
+    }
+
+    #[test]
+    fn voice_step_is_finite_and_bounded() {
+        let bank = SampleBank::new();
+        let lock = lock_with([0.0, 0.42, 0.0, 0.5, 0.0, 0.85, 0.15, 0.55]);
+        let mut voice = VarClockSamplerVoice::default();
+        voice.trigger(&bank, &lock);
+        for _ in 0..128 {
+            let s = voice.step_sample(&bank, C4_HZ, 48_000.0, &lock);
+            assert!(s.is_finite() && s.abs() <= 1.0);
+        }
+    }
+
+    #[test]
+    fn voice_is_deterministic_for_same_inputs() {
+        let bank = SampleBank::new();
+        let lock = lock_with([0.0, 0.42, 0.0, 0.5, 0.0, 0.85, 0.15, 0.55]);
+        let mut voice_a = VarClockSamplerVoice::default();
+        let mut voice_b = VarClockSamplerVoice::default();
+        voice_a.trigger(&bank, &lock);
+        voice_b.trigger(&bank, &lock);
+        for _ in 0..128 {
+            let sa = voice_a.step_sample(&bank, C4_HZ, 48_000.0, &lock);
+            let sb = voice_b.step_sample(&bank, C4_HZ, 48_000.0, &lock);
+            assert_eq!(sa.to_bits(), sb.to_bits());
+        }
+    }
+
+    #[test]
+    fn voice_step_handles_zero_pitch_and_host_sr() {
+        let bank = SampleBank::new();
+        let lock = lock_with([0.0, 0.42, 0.0, 0.5, 0.0, 0.85, 0.15, 0.55]);
+        let mut voice = VarClockSamplerVoice::default();
+        voice.trigger(&bank, &lock);
+        let s = voice.step_sample(&bank, 0.0, 0.0, &lock);
+        assert!(s.is_finite() && s.abs() <= 1.0);
+    }
+
+    #[test]
+    fn voice_step_handles_extreme_lock_values() {
+        let bank = SampleBank::new();
+        let lock = lock_with([0.0, 1.0, 0.0, 1.0, 0.8, 1.0, 1.0, 1.0]);
+        let mut voice = VarClockSamplerVoice::default();
+        voice.trigger(&bank, &lock);
+        for _ in 0..128 {
+            let s = voice.step_sample(&bank, 8000.0, 48_000.0, &lock);
+            assert!(s.is_finite() && s.abs() <= 1.0);
+        }
+    }
+
+    #[test]
+    fn voice_halts_after_one_shot_and_retrigger_resets_state() {
+        let mut bank = SampleBank::new();
+        bank.load_pcm(0, &[4096, 8192, 12288, 16384, -4096, -8192, -12288, -16384]);
+        bank.set_region(0, SampleRegion { trim_start: 0.0, trim_end: 1.0, loop_enabled: true });
+        let lock = lock_with([0.0, 0.42, 0.0, 0.0, 0.0, 0.85, 0.15, 0.55]);
+        let mut voice = VarClockSamplerVoice::default();
+        voice.trigger(&bank, &lock);
+        let mut halted = false;
+        for _ in 0..4096 {
+            let s = voice.step_sample_gated(&bank, C4_HZ, 48_000.0, &lock, false);
+            if s == 0.0 {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "voice should halt after OneShot completes");
+        let s = voice.step_sample_gated(&bank, C4_HZ, 48_000.0, &lock, false);
+        assert_eq!(s, 0.0);
+        // Re-trigger resets the voice.
+        voice.trigger(&bank, &lock);
+        let s = voice.step_sample_gated(&bank, C4_HZ, 48_000.0, &lock, true);
+        assert!(s.is_finite() && s.abs() <= 1.0);
+    }
+
+    #[test]
+    fn voice_retrigger_resets_to_fresh_state() {
+        let bank = SampleBank::new();
+        let lock = lock_with([0.0, 0.42, 0.0, 0.5, 0.0, 0.85, 0.15, 0.55]);
+        let mut voice = VarClockSamplerVoice::default();
+        voice.trigger(&bank, &lock);
+        for _ in 0..64 {
+            voice.step_sample(&bank, C4_HZ, 48_000.0, &lock);
+        }
+        voice.trigger(&bank, &lock);
+        let mut fresh = VarClockSamplerVoice::default();
+        fresh.trigger(&bank, &lock);
+        for _ in 0..64 {
+            let sa = voice.step_sample(&bank, C4_HZ, 48_000.0, &lock);
+            let sb = fresh.step_sample(&bank, C4_HZ, 48_000.0, &lock);
+            assert_eq!(sa.to_bits(), sb.to_bits());
+        }
+    }
+
+    #[test]
+    fn voice_with_invalid_region_uses_default_region() {
+        let mut bank = SampleBank::new();
+        // Invalid regions are rejected, so the default region is kept.
+        bank.set_region(0, SampleRegion { trim_start: 2.0, trim_end: 3.0, loop_enabled: true });
+        assert_eq!(bank.regions[0], SampleRegion::default());
+        let lock = lock_with([0.0, 0.42, 0.0, 0.0, 0.0, 0.85, 0.15, 0.55]);
+        let mut voice = VarClockSamplerVoice::default();
+        voice.trigger(&bank, &lock);
+        let s = voice.step_sample(&bank, C4_HZ, 48_000.0, &lock);
+        assert!(s.is_finite() && s.abs() <= 1.0);
+    }
 }
