@@ -20,7 +20,9 @@ impl Default for SampleRegion {
 
 impl SampleRegion {
     pub fn is_valid(self) -> bool {
-        (0.0..=1.0).contains(&self.trim_start) && (0.0..=1.0).contains(&self.trim_end)
+        (0.0..=1.0).contains(&self.trim_start)
+            && (0.0..=1.0).contains(&self.trim_end)
+            && self.trim_start <= self.trim_end
     }
 
     /// The half-open trim range always includes at least one frame.
@@ -161,9 +163,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "possible bug: is_valid accepts an inverted trim range (trim_start > trim_end)"]
     fn sample_region_is_valid_rejects_inverted_range() {
         assert!(!SampleRegion { trim_start: 0.8, trim_end: 0.2, loop_enabled: false }.is_valid());
+    }
+
+    #[test]
+    fn sample_region_is_valid_at_equal_trims() {
+        assert!(SampleRegion { trim_start: 0.5, trim_end: 0.5, loop_enabled: false }.is_valid());
     }
 
     #[test]

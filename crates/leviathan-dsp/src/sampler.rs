@@ -340,13 +340,9 @@ mod tests {
         region.trim_start = 1.0;
         region.trim_end = 0.25;
         assert_eq!(region.frames(8), 7..8);
+        let previous = bank.regions[0];
         bank.set_region(0, region);
-        voice.trigger(&bank, &lock);
-        for _ in 0..32 {
-            let sample = voice.step_sample_gated(&bank, 8000.0, 8000.0, &lock, true);
-            assert_eq!(sample, -1.0);
-            assert_eq!(voice.pos_q16 >> 16, 7);
-        }
+        assert_eq!(bank.regions[0], previous);
         region.trim_start = 0.25;
         assert_eq!(region.frames(8), 2..3);
     }

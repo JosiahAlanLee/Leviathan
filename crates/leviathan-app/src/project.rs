@@ -1260,6 +1260,13 @@ mod tests {
             {"trim_start": 0.0, "trim_end": 1.0, "loop_enabled": false}
         ]);
         assert!(project_error(&json).contains("invalid sample trim"));
+        json["sample_regions"] = serde_json::json!([
+            {"trim_start": 0.8, "trim_end": 0.2, "loop_enabled": false},
+            {"trim_start": 0.0, "trim_end": 1.0, "loop_enabled": false},
+            {"trim_start": 0.0, "trim_end": 1.0, "loop_enabled": false},
+            {"trim_start": 0.0, "trim_end": 1.0, "loop_enabled": false}
+        ]);
+        assert!(project_error(&json).contains("invalid sample trim"));
         json.as_object_mut().unwrap().remove("sample_regions");
         json["solo_mask"] = serde_json::json!(0x80);
         assert!(project_error(&json).contains("mute or solo mask"));
