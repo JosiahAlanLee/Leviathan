@@ -538,4 +538,136 @@ mod tests {
         assert!(peak > 0.005, "{peak}");
         assert!((0.998..1.002).contains(&(energy(&bus) / captured)));
     }
+
+    #[test]
+    fn default_params_are_valid_and_map_shift_hz() {
+        let params = BenderParams::default();
+        assert!(params.is_valid());
+        assert_eq!(params.shift_hz(), (2.0 * 0.5 - 1.0) * BENDER_MAX_SHIFT_HZ);
+        let min = BenderParams { shift_norm: 0.0, ..params };
+        let max = BenderParams { shift_norm: 1.0, ..params };
+        assert_eq!(min.shift_hz(), -BENDER_MAX_SHIFT_HZ);
+        assert_eq!(max.shift_hz(), BENDER_MAX_SHIFT_HZ);
+    }
+
+    #[test]
+    fn params_is_valid_accepts_only_unit_interval_values() {
+        let base = BenderParams::default();
+        assert!(base.is_valid());
+        assert!(BenderParams { shift_norm: 0.0, ..base }.is_valid());
+        assert!(BenderParams { shift_norm: 1.0, ..base }.is_valid());
+        assert!(!BenderParams { shift_norm: -0.01, ..base }.is_valid());
+        assert!(!BenderParams { shift_norm: 1.01, ..base }.is_valid());
+        assert!(!BenderParams { feedback: -0.01, ..base }.is_valid());
+        assert!(!BenderParams { feedback: 1.01, ..base }.is_valid());
+        assert!(!BenderParams { decay: f32::NAN, ..base }.is_valid());
+        assert!(!BenderParams { decay: f32::INFINITY, ..base }.is_valid());
+    }
+
+    #[test]
+    fn non_finite_sample_rate_falls_back_to_48khz() {
+        for rate in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let bus = SpoonBenderBus::new(rate);
+            assert_eq!(bus.sample_rate(), 48_000.0);
+        }
+        let bus = SpoonBenderBus::new(100.0);
+        assert_eq!(bus.sample_rate(), 8_000.0);
+    }
+
+    #[test]
+    fn invalid_params_are_ignored_by_set_params() {
+        let mut bus = SpoonBenderBus::new(48_000.0);
+        let before = bus.shift_target;
+        bus.set_params(BenderParams { shift_norm: 2.0, ..BenderParams::default() });
+        assert_eq!(bus.shift_target, before);
+        let before_feedback = bus.feedback_target;
+        bus.set_params(BenderParams { feedback: f32::NAN, ..BenderParams::default() });
+        assert_eq!(bus.feedback_target, before_feedback);
+    }
+
+    #[test]
+    fn zero_input_with_default_state_returns_silence() {
+        let mut bus = SpoonBenderBus::new(48_000.0);
+        assert_eq!(bus.process([0.0; 2]), [0.0; 2]);
+        assert_eq!(bus.process([0.0; 2]), [0.0; 2]);
+    }
+
+    #[test]
+    fn non_finite_input_is_treated_as_zero() {
+        let mut bus = SpoonBenderBus::new(48_000.0);
+        let out = bus.process([f32::NAN, f32::INFINITY]);
+        assert_eq!(out, [0.0; 2]);
+    }
+
+    #[test]
+    fn output_stays_finite_and_bounded_over_a_tone_burst() {
+        let rate = 48_000.0;
+        let mut bus = SpoonBenderBus::new(rate);
+        for i in 0..4_800 {
+            let x = 0.5 * sine(i as f32 * 440.0 / rate);
+            let wet = bus.process([x, -0.3 * x]);
+            assert!(wet.iter().all(|s| s.is_finite()));
+            assert!(wet.iter().all(|s| (-1.0..=1.0).contains(s)));
+        }
+    }
+
+    #[test]
+    fn same_inputs_are_deterministic() {
+        let rate = 48_000.0;
+        let mut a = SpoonBenderBus::new(rate);
+        let mut b = SpoonBenderBus::new(rate);
+        for i in 0..2_400 {
+            let x = 0.4 * sine(i as f32 * 220.0 / rate);
+            let input = [x, 0.2 * x];
+            let out_a = a.process(input);
+            let out_b = b.process(input);
+            assert_eq!(out_a, out_b);
+        }
+    }
+
+    #[test]
+    fn set_sample_rate_resets_state_and_updates_rate() {
+        let mut bus = SpoonBenderBus::new(48_000.0);
+        for i in 0..500 {
+            let x = 0.2 * sine(i as f32 * 200.0 / 48_000.0);
+            bus.process([x, x]);
+        }
+        bus.set_sample_rate(96_000.0);
+        assert_eq!(bus.sample_rate(), 96_000.0);
+        assert_eq!(bus.quiet_frames, u32::MAX);
+        assert_eq!(bus.freeze, 0.0);
+    }
+
+    #[test]
+    fn loop_gain_is_bounded_and_monotone_in_feedback() {
+        let low = loop_gain(0.0, 0.0);
+        let mid = loop_gain(0.5, 0.5);
+        let high = loop_gain(1.0, 1.0);
+        assert!(low < mid && mid < high);
+        assert!(high <= 0.975);
+    }
+
+    #[test]
+    fn loop_damping_is_in_unit_interval() {
+        for decay in [0.0, 0.5, 1.0] {
+            for rate in [8_000.0, 48_000.0, 96_000.0] {
+                let damping = loop_damping(decay, rate);
+                assert!((0.0..=1.0).contains(&damping));
+            }
+        }
+    }
+
+    #[test]
+    fn reset_clears_state_and_restores_quiet_path() {
+        let rate = 48_000.0;
+        let mut bus = SpoonBenderBus::new(rate);
+        for i in 0..1_000 {
+            let x = 0.3 * sine(i as f32 * 330.0 / rate);
+            bus.process([x, x]);
+        }
+        bus.reset();
+        assert_eq!(bus.quiet_frames, u32::MAX);
+        assert_eq!(bus.freeze, 0.0);
+        assert_eq!(bus.process([0.0; 2]), [0.0; 2]);
+    }
 }
