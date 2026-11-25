@@ -581,7 +581,8 @@ impl ProjectFile {
         if !self.lane_mix.is_valid() {
             return Err("Invalid lane mute or solo mask or mixer settings".to_string());
         }
-        let routing = self.instruments.routing;
+        let mut routing = self.instruments.routing;
+        normalize_legacy_trim(&mut routing.region);
         if routing.render_order().is_none() {
             return Err("Invalid or cyclic instrument routing".to_string());
         }
@@ -619,12 +620,11 @@ impl ProjectFile {
             chain.push(id);
         }
         let mut samples = core::array::from_fn(|_| None);
-        let sample_regions = self.sample_regions.map(|region| region.0);
-        for (bank, region) in sample_regions.iter().enumerate() {
-            if !region.is_valid() {
-                return Err(format!("Bank B{bank}: invalid sample trim"));
-            }
+        let mut sample_regions = self.sample_regions.map(|region| region.0);
+        for region in &mut sample_regions {
+            normalize_legacy_trim(region);
         }
+        validate_sample_trims(&sample_regions)?;
         for (bank, sample) in self.sample_banks.into_iter().enumerate() {
             samples[bank] = sample
                 .map(SampleFile::decode)
@@ -664,6 +664,26 @@ impl ProjectFile {
             },
         })
     }
+}
+
+// Before trim ordering was validated, an in-bounds inversion played
+// one frame at trim_start. Keep that slice when opening older saves.
+fn normalize_legacy_trim(region: &mut SampleRegion) {
+    if (0.0..=1.0).contains(&region.trim_start)
+        && (0.0..=1.0).contains(&region.trim_end)
+        && region.trim_start > region.trim_end
+    {
+        region.trim_end = region.trim_start;
+    }
+}
+
+fn validate_sample_trims(regions: &[SampleRegion; NUM_BANKS]) -> Result<(), String> {
+    for (bank, region) in regions.iter().enumerate() {
+        if !region.is_valid() {
+            return Err(format!("Bank B{bank}: invalid sample trim"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_pattern(pattern: &Pattern) -> Result<(), &'static str> {
@@ -717,6 +737,7 @@ pub fn load(path: &Path) -> Result<Project, String> {
 }
 
 pub fn save(path: &Path, project: Project) -> Result<(), String> {
+    validate_sample_trims(&project.sample_regions)?;
     if project.instruments.routing.render_order().is_none() {
         return Err("Invalid or cyclic instrument routing".to_string());
     }
@@ -931,6 +952,74 @@ mod tests {
             restored.c4_rate_hz.to_bits(),
             samples[2].as_ref().unwrap().c4_rate_hz.to_bits()
         );
+    }
+
+    #[test]
+    fn legacy_inverted_trims_reopen_and_invalid_saves_leave_the_file_intact() {
+        let path = std::env::temp_dir()
+            .join(format!("leviathan-trim-rt-{}.json", std::process::id()));
+        let inverted = SampleRegion {
+            trim_start: 0.8,
+            trim_end: 0.2,
+            loop_enabled: true,
+        };
+        let equal = SampleRegion {
+            trim_start: 1.0,
+            trim_end: 1.0,
+            loop_enabled: false,
+        };
+        let mut sample_regions = core::array::from_fn(|_| StoredSampleRegion::default());
+        sample_regions[0] = StoredSampleRegion(inverted);
+        sample_regions[1] = StoredSampleRegion(equal);
+        let mut instruments = InstrumentFile::default();
+        instruments.routing.region = inverted;
+        let legacy = ProjectFile {
+            version: PROJECT_VERSION,
+            bpm: 120.0,
+            master_send: 0.0,
+            delay_mode: Default::default(),
+            bender_params: Default::default(),
+            lane_patches: None,
+            lane_mix: LaneMix::default(),
+            patterns: vec![Pattern::default()],
+            selected_pattern: 0,
+            chain: vec![],
+            sample_banks: core::array::from_fn(|_| None),
+            sample_regions,
+            custom_shader: None,
+            voice_calibration: false,
+            instruments,
+        };
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let project = load(&path).unwrap();
+        let repaired = SampleRegion {
+            trim_end: inverted.trim_start,
+            ..inverted
+        };
+        assert_eq!(project.sample_regions[0], repaired);
+        assert_eq!(project.sample_regions[1], equal);
+        assert_eq!(project.sample_bank().regions[0], repaired);
+        assert_eq!(project.instruments.routing.region, repaired);
+        for len in [1, 8, 32_768] {
+            assert_eq!(repaired.frames(len), inverted.frames(len));
+            assert_eq!(repaired.frames(len).len(), 1);
+        }
+
+        save(&path, project).unwrap();
+        let stored = fs::read(&path).unwrap();
+        let encoded: ProjectFile = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(encoded.sample_regions[0].0, repaired);
+        assert_eq!(encoded.instruments.routing.region, repaired);
+
+        let mut reopened = load(&path).unwrap();
+        assert_eq!(reopened.sample_regions[0], repaired);
+        reopened.sample_regions[0] = inverted;
+        assert_eq!(
+            save(&path, reopened).unwrap_err(),
+            "Bank B0: invalid sample trim"
+        );
+        assert_eq!(fs::read(&path).unwrap(), stored);
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -1261,7 +1350,7 @@ mod tests {
         ]);
         assert!(project_error(&json).contains("invalid sample trim"));
         json["sample_regions"] = serde_json::json!([
-            {"trim_start": 0.8, "trim_end": 0.2, "loop_enabled": false},
+            {"trim_start": 0.8, "trim_end": -0.2, "loop_enabled": false},
             {"trim_start": 0.0, "trim_end": 1.0, "loop_enabled": false},
             {"trim_start": 0.0, "trim_end": 1.0, "loop_enabled": false},
             {"trim_start": 0.0, "trim_end": 1.0, "loop_enabled": false}
