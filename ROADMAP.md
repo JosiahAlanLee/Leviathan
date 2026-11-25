@@ -306,11 +306,11 @@ Use the public behavioral references and original Rust under the [clean-room pol
 
 | Area | Remaining functions |
 |---|---|
-| **OTIS and BEND** | OtisKit, reverse playback, seeded REWORK, clock-ratio echo, and ESP are scheduled in [Wave 8](#wave-8-t32t35--otiskit-seeded-rework-and-spoonbender-echo--esp). External stereo input, saved kit patch selection, frame export to Lookup, and retrospective capture remain follow-ups. [OtisLab](https://github.com/JosiahAlanLee/DSP_Emulation/tree/a369a4a16898068be769622231241722dc674e0f/vcv/otislab/docs) · [Spoon Bender](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/spoonbender/docs/MANUAL.md) |
+| **OTIS and BEND** | [Wave 8](#wave-8-t32t35--otiskit-seeded-rework-and-spoonbender-echo--esp) shipped OtisKit, reverse playback, seeded REWORK, clock-ratio Echo, and ESP. See [Wave 9](#proposed-wave-9) for frame export to Lookup and retrospective capture. External stereo input and saved kit patch selection remain follow-ups. [OtisLab](https://github.com/JosiahAlanLee/DSP_Emulation/tree/a369a4a16898068be769622231241722dc674e0f/vcv/otislab/docs) · [Spoon Bender](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/spoonbender/docs/MANUAL.md) |
 | **CZish and DAC Stage** | Per-cycle wave alternation, six eight-stage envelopes and single-tone SysEx. Apply the existing T25 converter profiles as an insert, then add variable clock rates, HOLD and CLEAN reconstruction, and encoded-word publication and XOR masking. [CZishLab](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/czish/README.md) |
 | **PVX** | Reuse audio routing for a filter insert. Add independent AR/ADSR envelopes, filter and envelope taps, and selectable oversampling with FIR decimation. [PVX](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/pvx/README.md) |
 | **Séance** | A spectral audio send with phase-preserving Freeze and Wipe first, then seeded Scramble, two-source Cross, and Bridge's eight-band activity and mask. Test dry-path latency compensation and render parity. [Séance](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/seance/docs/MANUAL.md) |
-| **ByteBus and GorgonBridge** | After T31, assess Adapter and Converter, Counter and Counter 2, Lookup2, Switch, Pipeline, Fan, Lattice, patchable Parallel Sum, Wheel, Roulette, and Namagiri as individual follow-ups. Rack also has a live ByteBus overlay for FILL and lane mutes, four-channel audio capture, and Ping latency measurement. [ByteBusLab](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/bytebus/README.md) · [GorgonBridge manual](https://github.com/JosiahAlanLee/Gorgon/blob/22b8d4f0d61e5955deae42f726d57a763b0d8968/rack/docs/MANUAL.md) |
+| **ByteBus and GorgonBridge** | [Wave 9](#proposed-wave-9) starts with independent native routes and a Rack loopback. Rack also has a live ByteBus overlay for FILL and lane mutes, four-channel audio capture, and Ping latency measurement. [ByteBusLab](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/bytebus/README.md) · [GorgonBridge manual](https://github.com/JosiahAlanLee/Gorgon/blob/22b8d4f0d61e5955deae42f726d57a763b0d8968/rack/docs/MANUAL.md) |
 
 ## Wave 8 (T32–T35 — OtisKit, Seeded REWORK, and SpoonBender Echo / ESP)
 
@@ -390,8 +390,54 @@ The Copper Relay walkthrough identified two display gaps addressed in the Voice 
 - **Instrument** — Sample eight points from the feedback field and latch the byte on the next audio-owned ByteBus edge. A single OT2 lane reads the return as a frame address. Route the held byte back through Lookup to close the loop. Record the held words against the cued transport so WAV and stem export can replay them without a graphics context.
 - **Recorded modular return** — Implemented in [`2489b0d`](https://github.com/JosiahAlanLee/Leviathan/commit/2489b0d2cc3f2b4689db327c62714185c987e4a9). **Export WAV…** can write a ten-channel CV file from the same replay frames that drive OT2. The file carries eight data bits, a one-sample publication clock, and a separate reset alongside the stereo master.
 - **Live modular return** — Implemented in [`55756ba`](https://github.com/JosiahAlanLee/Leviathan/commit/55756ba870a25e263008b76051222a1fe0903211). Set `LEVIATHAN_SHADER_CV_OUT` to a named float output device. The audio callback sends the stereo master on channels 1–2 and the ten CV signals on channels 3–12. OT2 and the output use the same latched word on the same sample.
-- **Playback check** — Compare the live and recorded streams in a Rack loopback at the same sample rate. Check repeated words, `00`, reset, transport wraps, and held data during a pause. Check the missed-pulse count on the laptop and measure the received clock width on the intended CV interface.
-- **Modular input** — Prototype a separate clocked ByteBus input to the shader Lookup. Preserve a valid `00` and test input loss and reset at the audio clock boundary.
+- **Next steps** — Verify reception in [Rack loopback](#rack-loopback), then add [clocked modular input](#2-clocked-modular-input) to shader Lookup.
+
+## Proposed Wave 9
+
+T31 shares one held Register/Lookup word across BBUS, captured-frame scanning, and OtisKit. Shader return can override the OT2 frame address on its selected lane. Independent routes let a kit phrase and a transwave scan run at different rates. Use the existing [clean-room references](CLEANROOM.md), store route settings in core, keep the bounded evaluator in `#![no_std]` DSP, and run the same evaluator for playback and export. [Shared route](crates/leviathan-dsp/src/lib.rs#L1322) · [ByteBusLab contracts](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/bytebus/README.md)
+
+Close out the [ESP edge-case pass](https://github.com/JosiahAlanLee/Leviathan/pull/50). When revisiting the merged tests, prime the delay before checking echo reset, require a nonzero retrigger after the sampler halts, and hold decay fixed while sweeping Bender feedback.
+
+### 1. Independent routes and Counter
+
+- **Configuration** — Give each of two routes a transport clock divider, reset seed, source, and one lane destination. Start with Tracker Word through Register, or a looping Counter with increment, modulus 2–256, and carry on wrap. Reuse the T31 Lookup maps. In Routing (F4), show the held hex word and the selected owner of each OT2 or OtisKit destination. Offer shader return as an owner for OT2. Unassigned destinations use their saved T31 settings. Apply a route edit at the audio command boundary and preserve the sibling route's phase. [Counter behavior](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/bytebus/docs/COUNTER.md#counting)
+- **Timing** — Deliver the word to the destination on the publication sample. Represent the word, its validity, and the publication event independently. Hold through pause, continue through ordinary chain wraps, and reseed on project load, explicit reset, or seek. If a route reset and clock coincide, publish the seed and advance at the next pulse.
+- **Resume case** — In T31, pausing on a high clock, editing `2A` to `B7`, and resuming in the same pulse can latch the edit immediately. Shader return deduplicates by pulse ordinal. Gorgon can explicitly republish on resume. Count each native transport pulse once, and keep received publications distinct from the native count. [T31 register](crates/leviathan-dsp/src/byte_route.rs#L12) · [Shader clock](crates/leviathan-app/src/shader_bus.rs#L198) · [Gorgon publication contract](https://github.com/JosiahAlanLee/Gorgon/blob/22b8d4f0d61e5955deae42f726d57a763b0d8968/spec/bytebus-output.md#acquisition-and-publication)
+
+Build one editable demo with a programmed kick and bass and two routes seeded at `00`. OtisKit reads the held slot on each programmed hit.
+
+| Destination | Clock | Counter |
+|---|---|---|
+| OT2 frame position | Every transport pulse | Increment 16, modulus 256 |
+| OtisKit slot | Every second transport pulse | Increment 1, modulus 6 |
+
+The 16- and 12-pulse phrases realign after 48 pulses, three bars at 4 PPQN in 4/4. Check the expected words and carries, valid and repeated `00` publications, same-pulse resume, reset, seek, and mixed-rate chain wraps. Change one divider during playback and check the other route's phase. Save and reopen the demo, compare the live and exported word and audio traces at 44.1, 48, and 96 kHz, and run the legacy PCM fixture.
+
+### Rack loopback
+
+Run this alongside the first native route PR. Record a live take through a Rack receiver, then send its bounced CV WAV through the same receiver at the same sample rate. PR #44 measured exact `0`/`1` rails and 88 one-sample clocks at the 48 kHz PipeWire sink. Compare decoded words, clock width, and reset strobes on the receiving side after measuring the loopback latency. Include repeated words, `00`, pause, and transport wraps. Record missed pulses and test the intended physical interface separately. A direct physical mapping needs eight data lines, clock, and reset. [PipeWire measurement](https://github.com/JosiahAlanLee/Leviathan/pull/44) · [Playback setup](README.md#replay-the-return-in-rack)
+
+### 2. Clocked modular input
+
+Give shader Lookup the first modular input source. Latch on the received clock and consume the held word on Leviathan's transport clock. Record accepted words and resets on the song timeline so the same OT2 addresses can be replayed from a saved project in WAV export. Validate the channel map and clock rate at stream setup, and keep input buffering bounded.
+
+Test valid `00`, repeated publications, a stopped source clock, stream loss, and a fresh connection. Define the coincident reset/publication case at the input boundary. The CV replay contract clears the receiver before latching a valid publication on that sample. Use Adapter or Converter profiles where the measured device needs format conversion, bit remapping, or voltage calibration. Gorgon's score mute and FILL input is a separate destination with its own timing rules. [CV replay contract](README.md#replay-the-return-in-rack) · [Adapter](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/bytebus/docs/ADAPTER.md) · [Score bus input](https://github.com/JosiahAlanLee/Gorgon/blob/22b8d4f0d61e5955deae42f726d57a763b0d8968/spec/bus-io.md)
+
+### 3. ByteBus processor ports
+
+| Order | Port | Playable acceptance |
+|---|---|---|
+| 1 | Editable 256-byte Lookup table and OTIS frame export | Snapshot the chosen stored frame off the callback and use it as a control pattern. Use the documented periodic resampling and byte quantization, and verify save/reopen and export. [OTIS table format](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/otislab/docs/BYTE_BUS.md#export-a-frame-to-lookup) |
+| 2 | Pipeline delay/loop, then Switch A/B | Let the kit answer its own delayed slot phrase. Verify delay in publication edges, loop release, and a switch on a known edge. Add bit spread when a patch uses it. [Pipeline](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/bytebus/docs/PIPELINE.md) |
+| 3 | Counter 2, then Namagiri | Verify exact rational phase and carry in a long 12-against-16 render. Use Namagiri for editable tracker notes and a routable phase byte. [Counter 2](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/bytebus/docs/COUNTER2.md) · [Namagiri](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/bytebus/docs/NAMAGIRI.md) |
+
+Evaluate Lookup2 with a patch that needs two bytes. Use Rack patches for Fan, Lattice, Wheel, and Roulette, with Adapter or Converter where the clocked input needs a different signal format. Try a feedback mask and register tap on the existing BBUS voice when a patch needs Parallel Sum control.
+
+### Audio workflow follow-ups
+
+1. **Retrospective BEND capture.** Keep recent stereo audio from the BEND tap before the master limiter. Publish it into the existing T28 take slot at its recorded rate, within the current take limit. Preallocate the rolling storage on the host, exchange buffers at a callback boundary, and publish through the existing generation mechanism. Test wrap, rate changes, old voices retaining their generations, save/reload, and use of the take in OT2 or REWORK. [Spoon Bender capture behavior](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/spoonbender/SPEC.md#7-capture-to-otis-retroactive)
+2. **Gate-free insert.** Try one PVX insert on an existing lane source and check source order and live/WAV parity. Use that experience before adding the T25 DAC profiles as an insert or opening up independent VAST stages. [Vastish chain](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/vastish/docs/CHAIN.md)
+3. **Spectral effects and external engines.** Treat Séance Freeze/Wipe as a latency-bearing send and verify dry-path alignment and render parity before expanding it. Specify the event timing and machine mappings for the external Elektron bridge in its own proposal. [Séance](https://github.com/JosiahAlanLee/DSP_Emulation/blob/a369a4a16898068be769622231241722dc674e0f/vcv/seance/docs/MANUAL.md) · [External Elektron engines](#external-elektron-engines)
 
 ## External Elektron Engines
 
