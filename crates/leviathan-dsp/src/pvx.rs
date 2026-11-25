@@ -159,4 +159,95 @@ mod tests {
         let bandpass = power_ratio(0.70);
         assert!(bandpass > lowpass * 3.0, "LP {lowpass}, BP {bandpass}");
     }
+
+    #[test]
+    fn step_without_trigger_is_silent() {
+        let params = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
+        let mut voice = Voice::default();
+        let mut rng = 123;
+        for _ in 0..100 {
+            let sample = voice.step(220.0, 48_000.0, None, &params, &mut rng);
+            assert_eq!(sample, 0.0);
+        }
+    }
+
+    #[test]
+    fn trigger_envelope_decays_to_silence() {
+        let params = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.0];
+        let mut voice = Voice::default();
+        let mut rng = 123;
+        let first = voice.step(220.0, 48_000.0, Some(1.0), &params, &mut rng);
+        assert!(first.abs() > 0.0);
+        let mut last = 0.0;
+        for _ in 0..50_000 {
+            last = voice.step(220.0, 48_000.0, None, &params, &mut rng);
+        }
+        assert!(last.abs() < 1e-3, "last={last}");
+    }
+
+    #[test]
+    fn zero_velocity_trigger_is_silent() {
+        let params = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
+        let mut voice = Voice::default();
+        let mut rng = 9;
+        let sample = voice.step(220.0, 48_000.0, Some(0.0), &params, &mut rng);
+        assert_eq!(sample, 0.0);
+    }
+
+    #[test]
+    fn retrigger_restarts_envelope_after_decay() {
+        let params = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
+        let mut voice = Voice::default();
+        let mut rng = 17;
+        for _ in 0..50_000 {
+            voice.step(220.0, 48_000.0, None, &params, &mut rng);
+        }
+        let sample = voice.step(220.0, 48_000.0, Some(1.0), &params, &mut rng);
+        assert!(sample.abs() > 0.0, "retrigger should produce audible output");
+    }
+
+    #[test]
+    fn same_inputs_give_identical_output() {
+        let params = [0.8, 0.6, 0.7, 0.4, 0.3, 0.5, 0.8, 0.4];
+        let mut voice_a = Voice::default();
+        let mut voice_b = Voice::default();
+        let mut rng_a = 42;
+        let mut rng_b = 42;
+        for i in 0..2000 {
+            let trig = (i % 100 == 0).then_some(0.7);
+            let a = voice_a.step(330.0, 48_000.0, trig, &params, &mut rng_a);
+            let b = voice_b.step(330.0, 48_000.0, trig, &params, &mut rng_b);
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn phases_stay_wrapped_over_many_steps() {
+        let params = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
+        let mut voice = Voice::default();
+        let mut rng = 7;
+        for i in 0..20_000 {
+            let trig = (i % 500 == 0).then_some(1.0);
+            let sample = voice.step(440.0, 48_000.0, trig, &params, &mut rng);
+            assert!(sample.is_finite());
+            assert!((0.0..1.0).contains(&voice.master_phase));
+            assert!((0.0..1.0).contains(&voice.slave_phase));
+            assert!((0.0..1.0).contains(&voice.sub_phase));
+        }
+    }
+
+    #[test]
+    fn out_of_range_interval_stays_bounded() {
+        for interval in [-1.0, 2.0] {
+            let params = [0.5, interval, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
+            let mut voice = Voice::default();
+            let mut rng = 11;
+            for i in 0..2000 {
+                let trig = (i % 200 == 0).then_some(0.9);
+                let sample = voice.step(220.0, 48_000.0, trig, &params, &mut rng);
+                assert!(sample.is_finite());
+                assert!((-1.0..=1.0).contains(&sample));
+            }
+        }
+    }
 }
