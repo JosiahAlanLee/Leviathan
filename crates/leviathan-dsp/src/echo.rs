@@ -509,4 +509,167 @@ mod tests {
         }
         assert!(peaks[1] > 0.1);
     }
+
+    #[test]
+    fn is_valid_accepts_default_and_rejects_out_of_range() {
+        assert!(Params::default().is_valid());
+        let bad = Params {
+            echo_mix: -0.1,
+            ..Params::default()
+        };
+        assert!(!bad.is_valid());
+        let bad = Params {
+            feedback: 1.11,
+            ..Params::default()
+        };
+        assert!(!bad.is_valid());
+        let bad = Params {
+            shift_hz: 200.1,
+            ..Params::default()
+        };
+        assert!(!bad.is_valid());
+        let bad = Params {
+            ratio: 10,
+            ..Params::default()
+        };
+        assert!(!bad.is_valid());
+        let bad = Params {
+            time: f32::NAN,
+            ..Params::default()
+        };
+        assert!(!bad.is_valid());
+        let boundary = Params {
+            echo_mix: 0.0,
+            space_mix: 1.0,
+            time: 1.0,
+            tone: 1.0,
+            spread: 1.0,
+            feedback: 1.10,
+            shift_hz: 200.0,
+            ratio: 9,
+            ..Params::default()
+        };
+        assert!(boundary.is_valid());
+    }
+
+    #[test]
+    fn free_seconds_is_bounded_and_saturates_at_two() {
+        assert_eq!(Params { time: 1.0, ..Params::default() }.free_seconds(), 2.0);
+        assert_eq!(Params { time: 2.5, ..Params::default() }.free_seconds(), 2.0);
+        let zero = Params { time: 0.0, ..Params::default() }.free_seconds();
+        assert_eq!(zero, 0.001);
+        let mid = Params { time: 0.5, ..Params::default() }.free_seconds();
+        assert!((0.001..=2.0).contains(&mid));
+    }
+
+    #[test]
+    fn capacity_is_clamped_to_the_configured_range() {
+        assert_eq!(capacity(48_000.0), 2 * 78_125 + 2);
+        assert_eq!(capacity(96_000.0), 2 * 96_000 + 2);
+        assert_eq!(capacity(1_000_000.0), 2 * 96_000 + 2);
+        assert_eq!(capacity(1.0), 2 * 78_125 + 2);
+    }
+
+    #[test]
+    fn max_seconds_respects_memory_and_two_second_cap() {
+        let params = Params::default();
+        // Default: esp Off, limit_64k true, so memory is not 64k-capped.
+        let max = params.max_seconds(48_000.0);
+        assert!((0.001..=2.0).contains(&max));
+        assert_eq!(max, 2.0);
+        let limited = Params {
+            esp: crate::esp::Mode::Rate336,
+            limit_64k: true,
+            ..Params::default()
+        };
+        let max = limited.max_seconds(44_100.0);
+        let rate = crate::esp::Mode::Rate336.rate().unwrap();
+        assert_eq!(max, (32_768.0 / rate).min(2.0));
+    }
+
+    #[test]
+    fn clock_reset_clears_period_and_awaiting_clock() {
+        let mut clock = Clock::default();
+        let mut cv = CvFrame {
+            run_v: 10.0,
+            ..CvFrame::default()
+        };
+        cv.bytebus_v[8] = 10.0;
+        clock.step(&cv, 48_000.0);
+        cv.bytebus_v[8] = 0.0;
+        clock.step(&cv, 48_000.0);
+        cv.bytebus_v[8] = 10.0;
+        clock.step(&cv, 48_000.0);
+        let params = Params {
+            sync: Sync::ByteBus,
+            ..Params::default()
+        };
+        assert!(!clock.timing(params, 0.5, 120.0, 48_000.0).awaiting_clock);
+        clock.reset();
+        let t = clock.timing(params, 0.5, 120.0, 48_000.0);
+        assert!(t.awaiting_clock);
+        assert_eq!(t.target_seconds, 0.5);
+    }
+
+    #[test]
+    fn echo_reset_clears_state() {
+        let rate = 48_000.0;
+        let mut mem = std::vec![[0.0; 2]; capacity(rate)];
+        let mut echo = Echo::new(rate);
+        let params = Params::default();
+        for _ in 0..100 {
+            echo.process([0.5, 0.0], &mut mem, params, 0.01);
+        }
+        echo.reset();
+        let out = echo.process([0.0; 2], &mut mem, params, 0.01);
+        assert_eq!(out, [0.0; 2]);
+    }
+
+    #[test]
+    fn echo_is_deterministic_for_same_inputs() {
+        let rate = 48_000.0;
+        let params = Params {
+            feedback: 0.7,
+            spread: 0.4,
+            shift_hz: 40.0,
+            ..Params::default()
+        };
+        let mut a = Echo::new(rate);
+        let mut b = Echo::new(rate);
+        let mut ma = std::vec![[0.0; 2]; capacity(rate)];
+        let mut mb = std::vec![[0.0; 2]; capacity(rate)];
+        for i in 0..2000 {
+            let x = if i % 500 == 0 { 0.3 } else { 0.0 };
+            let input = [x, 0.1];
+            let oa = a.process(input, &mut ma, params, 0.01);
+            let ob = b.process(input, &mut mb, params, 0.01);
+            assert_eq!(oa, ob);
+        }
+    }
+
+    #[test]
+    fn echo_output_stays_finite_and_bounded() {
+        let rate = 48_000.0;
+        let mut mem = std::vec![[0.0; 2]; capacity(rate)];
+        let mut echo = Echo::new(rate);
+        let params = Params {
+            feedback: 1.1,
+            spread: 1.0,
+            ..Params::default()
+        };
+        for i in 0..10_000 {
+            let input = if i == 0 { [0.5, 0.5] } else { [0.0; 2] };
+            let out = echo.process(input, &mut mem, params, 0.01);
+            assert!(out.iter().all(|s| s.is_finite()));
+            assert!(out.iter().all(|s| s.abs() <= 1.75));
+        }
+    }
+
+    #[test]
+    fn echo_process_returns_zero_for_tiny_storage() {
+        let mut mem = [[0.0; 2]; 2];
+        let mut echo = Echo::new(48_000.0);
+        let out = echo.process([1.0, 1.0], &mut mem, Params::default(), 0.01);
+        assert_eq!(out, [0.0; 2]);
+    }
 }
