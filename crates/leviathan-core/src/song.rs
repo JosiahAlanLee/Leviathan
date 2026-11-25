@@ -583,4 +583,81 @@ mod tests {
         }
         assert!(boundaries_seen > 60);
     }
+
+    #[test]
+    fn pattern_chain_push_pop_respects_capacity_and_order() {
+        let mut chain = PatternChain::default();
+        assert!(chain.as_slice().is_empty());
+        assert_eq!(chain.pop(), None);
+        for i in 0..MAX_CHAIN_ENTRIES {
+            assert!(chain.push(i as u8));
+        }
+        assert!(!chain.push(0));
+        assert_eq!(chain.as_slice().len(), MAX_CHAIN_ENTRIES);
+        for i in (0..MAX_CHAIN_ENTRIES).rev() {
+            assert_eq!(chain.pop(), Some(i as u8));
+        }
+        assert!(chain.as_slice().is_empty());
+        assert_eq!(chain.pop(), None);
+    }
+
+    #[test]
+    fn pattern_chain_default_is_empty() {
+        let chain = PatternChain::default();
+        assert!(chain.as_slice().is_empty());
+    }
+
+    #[test]
+    fn launch_with_out_of_range_pattern_is_a_no_op() {
+        let patterns = [Pattern::default()];
+        let mut song = SongPlayer::new(EngineConfig::default());
+        let before = song.status();
+        song.launch(LaunchTarget::Pattern(5), patterns.len());
+        assert_eq!(song.status(), before);
+    }
+
+    #[test]
+    fn launch_with_out_of_range_chain_is_a_no_op() {
+        let patterns = [Pattern::default()];
+        let mut song = SongPlayer::new(EngineConfig::default());
+        song.set_chain(PatternChain::default());
+        song.launch(LaunchTarget::Chain, patterns.len());
+        assert_eq!(song.status().chain_entry, None);
+        assert_eq!(song.status().queued, None);
+    }
+
+    #[test]
+    fn set_empty_chain_clears_queued_chain_target() {
+        let patterns = [Pattern::default()];
+        let mut song = SongPlayer::new(EngineConfig::default());
+        song.evaluator.playing = true;
+        let mut chain = PatternChain::default();
+        assert!(chain.push(0));
+        song.set_chain(chain);
+        song.launch(LaunchTarget::Chain, patterns.len());
+        assert_eq!(song.status().queued, Some(LaunchTarget::Chain));
+        song.set_chain(PatternChain::default());
+        assert_eq!(song.status().queued, None);
+        assert_eq!(song.status().chain_entry, None);
+    }
+
+    #[test]
+    fn step_sample_with_empty_patterns_returns_default_frame() {
+        let mut song = SongPlayer::new(EngineConfig::default());
+        song.evaluator.playing = true;
+        let (cv, retrigger) = song.step_sample(&[]);
+        assert!(!retrigger);
+        assert_eq!(cv.beat, 0.0);
+        assert_eq!(cv.row, 0);
+    }
+
+    #[test]
+    fn cursor_position_without_patterns_reports_zero_row() {
+        let mut song = SongPlayer::new(EngineConfig::default());
+        song.evaluator.playing = true;
+        let patterns: [Pattern; 0] = [];
+        let (beat, row) = song.cursor_position(&patterns);
+        assert!(beat.is_finite());
+        assert_eq!(row, 0);
+    }
 }
