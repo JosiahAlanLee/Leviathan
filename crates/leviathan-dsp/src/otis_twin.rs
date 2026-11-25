@@ -779,4 +779,103 @@ mod tests {
         assert!(voice.mix_b > 0.75);
         assert!(voice.ratio_b > 2.0);
     }
+
+    #[test]
+    fn decode_clamps_out_of_range_values() {
+        let (mode_lo, grit_lo) = TwinLoopMode::decode(-1.0);
+        assert_eq!(mode_lo, TwinLoopMode::OneShot);
+        assert_eq!(grit_lo, 0.0);
+        let (mode_hi, grit_hi) = TwinLoopMode::decode(2.0);
+        assert_eq!(mode_hi, TwinLoopMode::FwdWrap);
+        assert!((grit_hi - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ratio_and_mix_edges_are_sane() {
+        let (ratio_lo, mix_lo) = twin_osc_ratio_and_mix(0.0);
+        assert_eq!(ratio_lo, 1.0);
+        assert_eq!(mix_lo, 0.0);
+        let (ratio_hi, mix_hi) = twin_osc_ratio_and_mix(1.0);
+        assert!(ratio_hi > 2.0 && ratio_hi < 2.1);
+        assert!(mix_hi > 0.0 && mix_hi < 0.8);
+        let (ratio_mid, mix_mid) = twin_osc_ratio_and_mix(0.67);
+        assert!(ratio_mid > 1.4 && ratio_mid < 1.6);
+        assert!(mix_mid > 0.7 && mix_mid < 0.9);
+    }
+
+    #[test]
+    fn step_with_no_trigger_is_silent() {
+        let mut voice = TwinVoice::new();
+        let p = DEFAULTS;
+        let out = voice.step(220.0, 48_000.0, false, None, &p, false, None);
+        assert_eq!(out, 0.0);
+        assert!(voice.is_silent());
+    }
+
+    #[test]
+    fn step_is_deterministic_for_identical_sequences() {
+        let mut a = TwinVoice::new();
+        let mut b = TwinVoice::new();
+        let p = DEFAULTS;
+        let mut outputs_a = Vec::new();
+        let mut outputs_b = Vec::new();
+        for i in 0..2_000 {
+            let trig = (i == 0).then_some(0.8);
+            outputs_a.push(a.step(220.0, 48_000.0, true, trig, &p, false, None));
+            outputs_b.push(b.step(220.0, 48_000.0, true, trig, &p, false, None));
+        }
+        assert_eq!(outputs_a, outputs_b);
+    }
+
+    #[test]
+    fn step_stays_finite_with_extreme_inputs() {
+        let mut p = DEFAULTS;
+        p[1] = 99.0;
+        p[3] = 10.0;
+        let mut outputs = Vec::new();
+        for hz in [-100.0_f32, 0.0, 1.0, 100_000.0] {
+            let mut v = TwinVoice::new();
+            for i in 0..200 {
+                let trig = (i == 0).then_some(0.9);
+                outputs.push(v.step(hz, 0.0, true, trig, &p, false, None));
+            }
+        }
+        for o in outputs {
+            assert!(o.is_finite(), "output must be finite, got {o}");
+        }
+    }
+
+    #[test]
+    #[ignore = "possible bug: NaN frequency is not clamped and propagates NaN out of the DSP path"]
+    fn step_with_nan_frequency_stays_finite() {
+        let p = DEFAULTS;
+        let mut v = TwinVoice::new();
+        for i in 0..200 {
+            let trig = (i == 0).then_some(0.9);
+            let out = v.step(f32::NAN, 48_000.0, true, trig, &p, false, None);
+            assert!(out.is_finite());
+        }
+    }
+
+    #[test]
+    fn trigger_sets_envelope_state() {
+        let mut voice = TwinVoice::new();
+        let p = DEFAULTS;
+        let out = voice.step(220.0, 48_000.0, true, Some(0.7), &p, false, None);
+        assert!(out.is_finite());
+        assert!(voice.amp_env <= 0.7);
+        assert!(voice.scan_env <= 1.0);
+    }
+
+    #[test]
+    fn gate_off_decays_to_silence() {
+        let mut voice = TwinVoice::new();
+        let p = DEFAULTS;
+        voice.step(220.0, 48_000.0, true, Some(1.0), &p, false, None);
+        for _ in 0..200_000 {
+            let out = voice.step(220.0, 48_000.0, false, None, &p, false, None);
+            assert!(out.is_finite());
+        }
+        assert!(voice.is_silent());
+    }
 }
