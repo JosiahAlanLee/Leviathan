@@ -676,4 +676,101 @@ mod tests {
             0.0
         );
     }
+
+    #[test]
+    fn vowel_formant_pair_hz_clamps_and_hits_endpoints() {
+        let (f1_lo, f2_lo) = vowel_formant_pair_hz(0.0);
+        assert!((f1_lo - 310.0).abs() < 1e-3 && (f2_lo - 870.0).abs() < 1e-3);
+        let (f1_hi, f2_hi) = vowel_formant_pair_hz(1.0);
+        assert!((f1_hi - 290.0).abs() < 1e-3 && (f2_hi - 2_290.0).abs() < 1e-3);
+        let (f1_neg, f2_neg) = vowel_formant_pair_hz(-2.0);
+        assert!((f1_neg - f1_lo).abs() < 1e-6 && (f2_neg - f2_lo).abs() < 1e-6);
+        let (f1_big, f2_big) = vowel_formant_pair_hz(4.0);
+        assert!((f1_big - f1_hi).abs() < 1e-6 && (f2_big - f2_hi).abs() < 1e-6);
+        for k in 0..=10 {
+            let (f1, f2) = vowel_formant_pair_hz(k as f32 / 10.0);
+            assert!((290.0..=730.0).contains(&f1) && (870.0..=2_290.0).contains(&f2));
+        }
+    }
+
+    #[test]
+    fn operator_and_morphed_waves_are_finite_and_bounded() {
+        for shape in 0..7usize {
+            for i in 0..64 {
+                let p = i as f32 * 0.1;
+                let v = fs1r_operator_wave(shape, p);
+                assert!(v.is_finite() && v.abs() <= 2.0, "shape {shape} p {p}");
+            }
+        }
+        for m_i in 0..=10 {
+            let morph = m_i as f32 / 10.0;
+            for i in 0..64 {
+                let p = i as f32 * 0.1;
+                let v = morphed_fs1r_wave(morph, p);
+                assert!(v.is_finite() && v.abs() <= 2.0, "morph {morph} p {p}");
+            }
+        }
+    }
+
+    #[test]
+    fn step_is_deterministic_for_identical_inputs() {
+        let mut a = Voice::default();
+        let mut b = Voice::default();
+        let (mut rng_a, mut rng_b) = (0xDEAD_BEEF_u32, 0xDEAD_BEEF_u32);
+        let mut p = FS77_DEFAULTS;
+        p[2] = 0.7;
+        p[5] = 0.35;
+        for i in 0..2_048 {
+            let trig = (i == 0).then_some(0.8);
+            let sa = a.step(196.0, 48_000.0, true, trig, &p, &mut rng_a);
+            let sb = b.step(196.0, 48_000.0, true, trig, &p, &mut rng_b);
+            assert_eq!(sa, sb);
+        }
+    }
+
+    #[test]
+    fn step_handles_extreme_hz_and_sample_rate_without_nan() {
+        for &hz in &[0.0_f32, -50.0, 1.0, 20_000.0, 1.0e6] {
+            for &sr in &[0.0_f32, 8_000.0, 48_000.0, 192_000.0] {
+                let mut voice = Voice::default();
+                let mut rng = 7;
+                let mut p = FS77_DEFAULTS;
+                p[5] = 0.5;
+                let s = voice.step(hz, sr, true, Some(0.9), &p, &mut rng);
+                assert!(s.is_finite(), "hz {hz} sr {sr}");
+            }
+        }
+    }
+
+    #[test]
+    fn step_across_algorithm_range_stays_finite_and_bounded() {
+        for alg in [0.0_f32, 0.2, 0.4, 0.6, 0.8, 0.99, 1.0] {
+            let mut voice = Voice::default();
+            let mut rng = 0x1234_5678_u32;
+            let mut p = FS77_DEFAULTS;
+            p[5] = alg;
+            for i in 0..1_024 {
+                let trig = (i == 0).then_some(0.85);
+                let s = voice.step(220.0, 48_000.0, i < 512, trig, &p, &mut rng);
+                assert!(s.is_finite() && s.abs() <= 2.0, "alg {alg} sample {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn trigger_resets_voice_state_and_release_returns_to_zero() {
+        let mut voice = Voice::default();
+        let mut rng = 9;
+        let mut p = FS77_DEFAULTS;
+        p[0] = 0.0;
+        let _ = voice.step(220.0, 48_000.0, true, Some(1.0), &p, &mut rng);
+        assert!(voice.amp_env > 0.0);
+        for _ in 0..12_000 {
+            voice.step(220.0, 48_000.0, false, None, &p, &mut rng);
+        }
+        assert_eq!(voice.amp_env, 0.0);
+        assert_eq!(voice.phases, [0.0; 4]);
+        let s = voice.step(220.0, 48_000.0, false, None, &p, &mut rng);
+        assert_eq!(s, 0.0);
+    }
 }
