@@ -292,4 +292,74 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn zero_params_produce_finite_in_range_outputs() {
+        let params = [0.0_f32; SOUND_PARAMS];
+        let mut voice = Voice::default();
+        for i in 0..1024 {
+            let sample = voice.step(261.625_58, 48_000.0, (i % 64 == 0).then_some(0.7), &params);
+            assert!(sample.is_finite(), "frame {i}: {sample}");
+            assert!((-1.0..=1.0).contains(&sample), "frame {i}: {sample}");
+        }
+    }
+
+    #[test]
+    fn identical_step_sequences_are_bit_deterministic() {
+        let params = MachineKind::VastFunSynth.spec().default_params();
+        let render = || {
+            let mut voice = Voice::default();
+            (0..1024)
+                .map(|i| {
+                    let hz = if i % 256 < 128 { 110.0 } else { 440.0 };
+                    voice.step(hz, 48_000.0, (i % 97 == 0).then_some(0.9), &params)
+                })
+                .collect::<Vec<f32>>()
+        };
+        assert_eq!(render(), render());
+    }
+
+    #[test]
+    fn reset_restores_silent_output() {
+        let params = MachineKind::VastFunSynth.spec().default_params();
+        let mut voice = Voice::default();
+        for i in 0..2048 {
+            voice.step(261.625_58, 48_000.0, (i % 128 == 0).then_some(1.0), &params);
+        }
+        voice.reset();
+        for i in 0..256 {
+            assert_eq!(voice.step(261.625_58, 48_000.0, None, &params), 0.0, "frame {i}");
+        }
+    }
+
+    #[test]
+    fn out_of_range_lane_inputs_are_clamped_and_finite() {
+        let params = MachineKind::VastFunSynth.spec().default_params();
+        for input in [Input::Through(10.0), Input::Through(-10.0), Input::Gated(42.0)] {
+            let mut voice = Voice::default();
+            for i in 0..512 {
+                let sample = voice.step_input(
+                    261.625_58,
+                    48_000.0,
+                    (i == 0).then_some(0.8),
+                    &params,
+                    input,
+                );
+                assert!(sample.is_finite(), "frame {i}: {sample}");
+                assert!((-1.0..=1.0).contains(&sample), "frame {i}: {sample}");
+            }
+        }
+    }
+
+    #[test]
+    fn switching_algorithm_mid_stream_stays_finite() {
+        let mut params = MachineKind::VastFunSynth.spec().default_params();
+        let mut voice = Voice::default();
+        for i in 0..512 {
+            params[0] = ((i / 64) % ALGORITHM_COUNT) as f32 / ALGORITHM_COUNT as f32;
+            let sample = voice.step(220.0, 48_000.0, (i % 128 == 0).then_some(0.9), &params);
+            assert!(sample.is_finite(), "frame {i}: {sample}");
+            assert!((-1.0..=1.0).contains(&sample), "frame {i}: {sample}");
+        }
+    }
 }
