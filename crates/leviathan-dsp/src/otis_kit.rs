@@ -757,4 +757,236 @@ mod tests {
         assert!(hit.generation.is_none());
         assert_eq!(hit.render(&bank, 0, 0), 0.0);
     }
+
+    #[test]
+    fn default_slot_is_valid() {
+        assert!(Slot::default().is_valid());
+    }
+
+    #[test]
+    fn slot_validity_bounds() {
+        let valid = Slot {
+            tune: 24.0,
+            decay: 1.0,
+            level: 0.0,
+            filter: 1.0,
+            start: 0.0,
+            reverse: false,
+        };
+        assert!(valid.is_valid());
+        let mut bad = valid;
+        bad.tune = 24.01;
+        assert!(!bad.is_valid());
+        let mut bad = valid;
+        bad.tune = -24.01;
+        assert!(!bad.is_valid());
+        let mut bad = valid;
+        bad.decay = 1.01;
+        assert!(!bad.is_valid());
+        let mut bad = valid;
+        bad.level = -0.01;
+        assert!(!bad.is_valid());
+        let mut bad = valid;
+        bad.filter = 1.01;
+        assert!(!bad.is_valid());
+        let mut bad = valid;
+        bad.start = 1.01;
+        assert!(!bad.is_valid());
+        let mut bad = valid;
+        bad.start = -0.01;
+        assert!(!bad.is_valid());
+    }
+
+    #[test]
+    fn velocity_gain_db_rejects_non_finite_and_non_positive() {
+        assert_eq!(velocity_gain_db(f32::NAN), None);
+        assert_eq!(velocity_gain_db(f32::INFINITY), None);
+        assert_eq!(velocity_gain_db(f32::NEG_INFINITY), None);
+        assert_eq!(velocity_gain_db(0.0), None);
+        assert_eq!(velocity_gain_db(-1.0), None);
+        assert_eq!(velocity_gain_db_with(f32::NAN, VelocityCurve::Soft), None);
+    }
+
+    #[test]
+    fn velocity_gain_db_clamps_above_one_to_zero_db() {
+        assert_eq!(velocity_gain_db(1.0), Some(0.0));
+        assert_eq!(velocity_gain_db(2.0), Some(0.0));
+        assert_eq!(velocity_gain_db_with(10.0, VelocityCurve::Soft), Some(0.0));
+    }
+
+    #[test]
+    fn soft_curve_is_one_third_of_chip_curve() {
+        for v in [0.25_f32, 0.5, 0.75, 1.0] {
+            let chip = velocity_gain_db(v).unwrap();
+            let soft = velocity_gain_db_with(v, VelocityCurve::Soft).unwrap();
+            assert!((soft - chip / 3.0).abs() < 1.0e-6, "v={v}");
+        }
+    }
+
+    #[test]
+    fn filter_taper_coefficients_stay_bounded() {
+        for i in 0..=4 {
+            let f = i as f32 * 0.25;
+            let linear = FilterTaper::Linear.coefficient(f);
+            let squared = FilterTaper::Squared.coefficient(f);
+            assert!((0.015..=1.0).contains(&linear));
+            assert!((0.015..=1.0).contains(&squared));
+            assert!(squared <= linear);
+        }
+        assert_eq!(FilterTaper::Linear.coefficient(0.0), 0.015);
+        assert_eq!(FilterTaper::Linear.coefficient(1.0), 1.0);
+        assert_eq!(FilterTaper::Squared.coefficient(1.0), 1.0);
+        assert!(FilterTaper::Squared.coefficient(0.5) < FilterTaper::Linear.coefficient(0.5));
+    }
+
+    #[test]
+    fn addressing_byte_mode_wraps_slots_and_keeps_pitch() {
+        let (slot, pitch) = addressing(0.5, 0.5, Some(0));
+        assert_eq!(slot, 0);
+        assert_eq!(pitch, 0.5);
+        let (slot, _) = addressing(0.5, 1.0, Some(7));
+        assert_eq!(slot, 3); // (7 + 4) % 8
+        let (slot, _) = addressing(0.5, 0.0, Some(0));
+        assert_eq!(slot, 4); // (0 - 4) % 8
+    }
+
+    #[test]
+    fn addressing_semitone_mode_wraps_and_reports_octaves() {
+        let (slot, pitch) = addressing(0.0, 0.5, None);
+        assert_eq!(slot, 0);
+        assert_eq!(pitch, 0.0);
+        let (slot, pitch) = addressing(1.0, 0.5, None);
+        assert_eq!(slot, 4); // 12 semitones % 8
+        assert_eq!(pitch, 1.0);
+        let (slot, pitch) = addressing(-1.0, 0.5, None);
+        assert_eq!(slot, 4);
+        assert_eq!(pitch, -2.0);
+    }
+
+    #[test]
+    fn addressing_clamps_non_finite_and_out_of_range_pitch() {
+        let (slot, pitch) = addressing(f32::NAN, 0.5, None);
+        assert_eq!(slot, 0);
+        assert_eq!(pitch, 0.0);
+        let (slot, pitch) = addressing(100.0, 0.5, None);
+        assert_eq!(slot, 0); // 120 semitones % 8
+        assert_eq!(pitch, 15.0);
+    }
+
+    #[test]
+    fn clock_offset_thresholds() {
+        assert_eq!(clock_offset(0.0), -1);
+        assert_eq!(clock_offset(0.249), -1);
+        assert_eq!(clock_offset(0.25), 0);
+        assert_eq!(clock_offset(0.5), 0);
+        assert_eq!(clock_offset(0.749), 0);
+        assert_eq!(clock_offset(0.75), 1);
+        assert_eq!(clock_offset(1.0), 1);
+    }
+
+    #[test]
+    fn identical_hits_render_identically() {
+        let pcm: std::vec::Vec<i16> = (0..2_048)
+            .map(|i| ((i % 997) as f32 / 997.0 * 30_000.0 - 15_000.0) as i16)
+            .collect();
+        let bank = Bank {
+            current: Sample { generation: 1, rate: 48_000, pcm: &pcm },
+            old: None,
+        };
+        let lane = Lane { clock: 1, ..Lane::default() };
+        let mut hit_a = Hit::new(bank.current, Slot::default(), 0.25, 1.0, 1, lane, 48_000.0);
+        let mut hit_b = Hit::new(bank.current, Slot::default(), 0.25, 1.0, 1, lane, 48_000.0);
+        for _ in 0..256 {
+            assert_eq!(
+                hit_a.render(&bank, 0, 0).to_bits(),
+                hit_b.render(&bank, 0, 0).to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn hit_output_is_finite_across_full_sample() {
+        let pcm: std::vec::Vec<i16> = (0..4_096)
+            .map(|i| (16_000.0 * crate::voice::sine_cycle(i as f32 / 4_096.0)) as i16)
+            .collect();
+        let bank = Bank {
+            current: Sample { generation: 1, rate: 48_000, pcm: &pcm },
+            old: None,
+        };
+        let mut hit = Hit::new(bank.current, Slot::default(), 0.0, 1.0, 0, Lane::default(), 48_000.0);
+        for _ in 0..4_096 {
+            let out = hit.render(&bank, 0, 0);
+            assert!(out.is_finite());
+            if hit.generation.is_none() {
+                assert_eq!(out, 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn finished_hit_stays_silent() {
+        let pcm: std::vec::Vec<i16> = (0..256).map(|_| 8_000_i16).collect();
+        let bank = Bank {
+            current: Sample { generation: 1, rate: 48_000, pcm: &pcm },
+            old: None,
+        };
+        let mut hit = Hit::new(bank.current, Slot::default(), 0.0, 1.0, 0, Lane::default(), 48_000.0);
+        for _ in 0..512 {
+            hit.render(&bank, 0, 0);
+        }
+        assert!(hit.generation.is_none());
+        for _ in 0..64 {
+            assert_eq!(hit.render(&bank, 0, 0), 0.0);
+        }
+    }
+
+    #[test]
+    fn voice_step_with_no_trigger_stays_silent_and_untriggered() {
+        let pcm: std::vec::Vec<i16> = (0..128).map(|_| 4_000_i16).collect();
+        let bank = Bank {
+            current: Sample { generation: 1, rate: 48_000, pcm: &pcm },
+            old: None,
+        };
+        let mut voice = Voice::default();
+        let slots = [Slot::default(); SLOTS];
+        for _ in 0..8 {
+            let out = voice.step(
+                0,
+                48_000.0,
+                &bank,
+                &slots,
+                Lane::default(),
+                0.0,
+                None,
+                &[0.5; 8],
+                Some(0),
+            );
+            assert_eq!(out, 0.0);
+        }
+        assert!(voice.generations().iter().all(|pair| pair.iter().all(|g| g.is_none())));
+    }
+
+    #[test]
+    fn voice_step_ignores_trigger_when_sample_is_too_short() {
+        let pcm: std::vec::Vec<i16> = (0..1).map(|_| 4_000_i16).collect();
+        let bank = Bank {
+            current: Sample { generation: 1, rate: 48_000, pcm: &pcm },
+            old: None,
+        };
+        let mut voice = Voice::default();
+        let slots = [Slot::default(); SLOTS];
+        let out = voice.step(
+            0,
+            48_000.0,
+            &bank,
+            &slots,
+            Lane::default(),
+            0.0,
+            Some(1.0),
+            &[0.5; 8],
+            Some(0),
+        );
+        assert_eq!(out, 0.0);
+        assert!(voice.generations().iter().all(|pair| pair.iter().all(|g| g.is_none())));
+    }
 }
