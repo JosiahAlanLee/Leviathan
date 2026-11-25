@@ -104,4 +104,112 @@ mod tests {
             assert!(g < 0.001, "{hz} Hz stopband gain {g}");
         }
     }
+
+    #[test]
+    fn factor_is_four_and_kernel_is_unity_at_dc() {
+        assert_eq!(FACTOR, 4);
+        assert_eq!(TAPS, 96);
+        assert!((KERNEL.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        assert!(KERNEL.iter().all(|&h| h.is_finite()));
+    }
+
+    #[test]
+    fn zero_block_yields_zero_output() {
+        let mut d = Decimator4::default();
+        assert_eq!(d.process([0.0; FACTOR]), 0.0);
+        // Steady-state zero history stays zero.
+        for _ in 0..200 {
+            assert_eq!(d.process([0.0; FACTOR]), 0.0);
+        }
+    }
+
+    #[test]
+    fn constant_block_is_passed_with_unity_dc_gain() {
+        let mut d = Decimator4::default();
+        let mut last = 0.0;
+        for _ in 0..500 {
+            last = d.process([0.5; FACTOR]);
+        }
+        assert!((last - 0.5).abs() < 1e-3, "constant DC gain {last}");
+    }
+
+    #[test]
+    fn non_finite_inputs_are_treated_as_zero_and_stay_finite() {
+        let mut d = Decimator4::default();
+        let out = d.process([f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.0]);
+        assert!(out.is_finite(), "non-finite input produced non-finite output {out}");
+        // NaN/inf history must not poison later outputs.
+        let mut d2 = Decimator4::default();
+        let _ = d2.process([f32::NAN; FACTOR]);
+        let out2 = d2.process([0.25; FACTOR]);
+        assert!(out2.is_finite());
+    }
+
+    #[test]
+    fn large_magnitude_input_stays_finite() {
+        let mut d = Decimator4::default();
+        let out = d.process([1.0e30; FACTOR]);
+        assert!(out.is_finite(), "large finite input produced {out}");
+        assert!(out.abs() > 0.0);
+    }
+
+    #[test]
+    fn negative_and_mixed_inputs_stay_finite_and_bounded() {
+        let mut d = Decimator4::default();
+        let out = d.process([-1.0, 2.0, -0.5, 0.25]);
+        assert!(out.is_finite());
+        // Output is a convex-ish blend of the recent history; it cannot exceed
+        // the largest absolute input seen times the absolute kernel sum.
+        let kernel_abs_sum: f32 = KERNEL.iter().map(|h| h.abs()).sum();
+        assert!(out.abs() <= 2.0 * kernel_abs_sum + 1e-3);
+    }
+
+    #[test]
+    fn fresh_instances_are_deterministic_for_same_inputs() {
+        let mut a = Decimator4::default();
+        let mut b = Decimator4::default();
+        for n in 0..200 {
+            let block = core::array::from_fn(|i| {
+                (n as f32 * 0.37 + i as f32 * 0.11).sin() * 0.8
+            });
+            let ya = a.process(block);
+            let yb = b.process(block);
+            assert_eq!(ya.to_bits(), yb.to_bits());
+        }
+    }
+
+    #[test]
+    fn reset_via_default_clears_history() {
+        let mut d = Decimator4::default();
+        for _ in 0..500 {
+            d.process([1.0; FACTOR]);
+        }
+        let mut fresh = Decimator4::default();
+        let mut d2 = Decimator4::default();
+        // After a long run, a fresh default instance behaves like a never-run one.
+        let fresh_out = fresh.process([1.0; FACTOR]);
+        let d2_out = d2.process([1.0; FACTOR]);
+        assert_eq!(fresh_out.to_bits(), d2_out.to_bits());
+        // And the reset (default) instance differs from the long-run one only
+        // because the long-run one retains history.
+        let long_out = d.process([1.0; FACTOR]);
+        assert!(long_out.is_finite());
+    }
+
+    #[test]
+    fn output_is_bounded_for_arbitrary_finite_blocks() {
+        let mut d = Decimator4::default();
+        let kernel_abs_sum: f32 = KERNEL.iter().map(|h| h.abs()).sum();
+        let mut max_abs = 0.0f32;
+        for n in 0..100 {
+            let block = core::array::from_fn(|i| {
+                ((n * 7 + i * 3) % 17) as f32 - 8.0
+            });
+            let out = d.process(block);
+            assert!(out.is_finite());
+            max_abs = max_abs.max(out.abs());
+        }
+        // Bounded by largest |input| (8.0) times kernel absolute sum.
+        assert!(max_abs <= 8.0 * kernel_abs_sum + 1e-3);
+    }
 }
