@@ -229,25 +229,25 @@ impl SamplerBankUi {
             if ui
                 .add(
                     egui::DragValue::new(&mut start)
-                        .range(0.0..=100.0)
+                        .range(0.0..=end)
                         .speed(0.25)
                         .suffix("%"),
                 )
                 .changed()
             {
-                region.trim_start = start / 100.0;
+                region.trim_start = (start / 100.0).min(region.trim_end);
             }
             ui.label("End");
             if ui
                 .add(
                     egui::DragValue::new(&mut end)
-                        .range(0.0..=100.0)
+                        .range(region.trim_start * 100.0..=100.0)
                         .speed(0.25)
                         .suffix("%"),
                 )
                 .changed()
             {
-                region.trim_end = end / 100.0;
+                region.trim_end = (end / 100.0).max(region.trim_start);
             }
             ui.checkbox(&mut region.loop_enabled, "Sustain Loop")
                 .on_hover_text("Repeat the trimmed region while the lane gate is high");
