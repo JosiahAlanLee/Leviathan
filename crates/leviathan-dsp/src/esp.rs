@@ -234,4 +234,133 @@ mod tests {
             assert!(tail.iter().flatten().all(|sample| sample.abs() < 1.58e-5));
         }
     }
+
+    #[test]
+    fn mode_all_lists_every_variant_in_declared_order() {
+        assert_eq!(
+            Mode::ALL,
+            [Mode::Off, Mode::Rate336, Mode::Rate224, Mode::Rate128]
+        );
+        assert_eq!(Mode::ALL.len(), 4);
+        for mode in Mode::ALL {
+            assert!(Mode::ALL.contains(&mode));
+        }
+    }
+
+    #[test]
+    fn off_mode_has_no_rate_and_other_modes_declare_chip_rates() {
+        assert_eq!(Mode::Off.rate(), None);
+        assert_eq!(Mode::Rate336.rate(), Some(10_000_000.0 / 336.0));
+        assert_eq!(Mode::Rate224.rate(), Some(10_000_000.0 / 224.0));
+        assert_eq!(Mode::Rate128.rate(), Some(10_000_000.0 / 128.0));
+    }
+
+    #[test]
+    fn node_and_memory_and_coefficient_pass_through_when_not_fixed() {
+        assert_eq!(node(0.37, false), 0.37);
+        assert_eq!(memory(-0.37, false), -0.37);
+        assert_eq!(coefficient(0.37, false), 0.37);
+    }
+
+    #[test]
+    fn coefficient_preserves_exact_unity_even_when_fixed() {
+        assert_eq!(coefficient(1.0, true), 1.0);
+    }
+
+    #[test]
+    fn node_quantizes_to_q23_with_clamping_and_floor_semantics() {
+        assert_eq!(node(0.0, true), 0.0);
+        assert_eq!(node(-1.5, true), -1.0);
+        assert_eq!(node(1.5, true), 8_388_607.0 / 8_388_608.0);
+        // Positive values truncate toward negative infinity in 1/2^23 steps.
+        assert_eq!(node(0.5, true), 4_194_304.0 / 8_388_608.0);
+        // Negative values floor as well (see existing saturates test).
+        assert_eq!(node(-0.5, true), -4_194_304.0 / 8_388_608.0);
+    }
+
+    #[test]
+    fn memory_quantizes_to_q15() {
+        assert_eq!(memory(0.5, true), 16_384.0 / 32_768.0);
+        assert_eq!(memory(-0.5, true), -16_384.0 / 32_768.0);
+    }
+
+    #[test]
+    fn non_finite_node_input_is_clamped_to_zero_when_fixed() {
+        assert_eq!(node(f32::NAN, true), 0.0);
+        assert_eq!(node(f32::INFINITY, true), 8_388_607.0 / 8_388_608.0);
+        assert_eq!(node(f32::NEG_INFINITY, true), -1.0);
+        // Non-fixed path passes non-finite values through unchanged.
+        assert!(node(f32::NAN, false).is_nan());
+        assert!(node(f32::INFINITY, false).is_infinite());
+    }
+
+    #[test]
+    fn history_read_clamps_out_of_range_fractions() {
+        let mut history = History::new(48_000.0, 48_000.0);
+        history.push([0.5; 2]);
+        let negative = history.read(-10.0);
+        let positive = history.read(10.0);
+        assert!(negative.iter().all(|v| v.is_finite()));
+        assert!(positive.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn converter_step_with_zero_input_yields_finite_outputs() {
+        let mut converter = Converter::new(48_000.0, 10_000_000.0 / 224.0);
+        let wet = converter.step([0.0; 2], |s| [s, [0.0; 2]]);
+        assert!(wet.iter().flatten().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn converter_runs_one_internal_tick_per_host_frame_at_unity_ratio() {
+        let mut converter = Converter::new(48_000.0, 48_000.0);
+        let mut count = 0;
+        for _ in 0..64 {
+            converter.step([0.1; 2], |s| {
+                count += 1;
+                [s, [0.0; 2]]
+            });
+        }
+        assert_eq!(count, 64);
+    }
+
+    #[test]
+    fn converter_is_deterministic_for_identical_inputs() {
+        let mut a = Converter::new(48_000.0, 10_000_000.0 / 336.0);
+        let mut b = Converter::new(48_000.0, 10_000_000.0 / 336.0);
+        let mut state = 0x1234_5678_u32;
+        for _ in 0..256 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let x = (state >> 8) as f32 / (1 << 24) as f32 * 2.0 - 1.0;
+            let input = [x; 2];
+            let wa = a.step(input, |s| [s, [s[0] * 0.5, s[1] * 0.5]]);
+            let wb = b.step(input, |s| [s, [s[0] * 0.5, s[1] * 0.5]]);
+            assert_eq!(wa, wb);
+        }
+    }
+
+    #[test]
+    fn converter_outputs_stay_finite_over_pseudo_random_signal() {
+        let mut converter = Converter::new(48_000.0, 10_000_000.0 / 128.0);
+        let mut state = 0x9e37_79b9_u32;
+        for _ in 0..512 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let x = (state >> 8) as f32 / (1 << 24) as f32 * 2.0 - 1.0;
+            let wet = converter.step([x, -x], |s| [s, [s[0] * 0.25, s[1] * 0.25]]);
+            assert!(wet.iter().flatten().all(|v| v.is_finite()));
+        }
+    }
+
+    #[test]
+    fn converter_step_keeps_phase_bounded_and_state_finite() {
+        let mut converter = Converter::new(48_000.0, 10_000_000.0 / 224.0);
+        for i in 0..256 {
+            let x = ((i % 7) as f32 - 3.0) * 0.1;
+            let wet = converter.step([x; 2], |s| [s, [s[0] * 0.5, s[1] * 0.5]]);
+            assert!(wet.iter().flatten().all(|v| v.is_finite()));
+            assert!(converter.phase >= 0.0 && converter.phase < 1.0);
+            assert!(converter.dc_in.iter().flatten().all(|v| v.is_finite()));
+            assert!(converter.dc_out.iter().flatten().all(|v| v.is_finite()));
+        }
+    }
 }
