@@ -15,6 +15,8 @@ Leviathan uses a strict hexagonal ("ports and adapters") layout so external GPU,
 | `crates/leviathan-gpu` | No | `bytemuck` | Uniform buffer layouts (`VisualUniforms`), built-in WGSL ping-pong feedback shader (`FEEDBACK_SHADER_WGSL`), custom `.wgsl` starter template & ABI contract validator, and software reference `FeedbackSurface`. |
 | `crates/leviathan-app` | No | `cpal`, `rtrb`, `eframe`, `midir` | Native desktop workstation hosting the lock-free `cpal` real-time audio engine, `rtrb` command/telemetry rings, `.leviathan.json` project persistence, offline WAV & stem exporter, MIDI input, non-blocking `SoundLinkPacket` UDP loopback sender, custom `.wgsl` live hot-reload viewport, and `egui` 64-row tracker editor. |
 
+For the experimental ARM64 tablet build, see the [Android preview build and smoke test](docs/ANDROID_PREVIEW.md).
+
 ## Tracker Keyboard Shortcuts
 
 | Action | Shortcut |
