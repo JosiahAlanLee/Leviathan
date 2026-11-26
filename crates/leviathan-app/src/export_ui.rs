@@ -16,13 +16,26 @@ pub struct ExportUi {
     focus_path: bool,
     job: Option<ExportJob>,
     result: Option<Result<PathBuf, String>>,
+    #[cfg(target_os = "android")]
+    staging: Option<crate::export::MobileStage>,
+    #[cfg(target_os = "android")]
+    rendered: Option<crate::export::MobileStage>,
 }
 
 impl ExportUi {
     pub fn poll(&mut self, ctx: &egui::Context) {
         if self.job.as_ref().is_some_and(ExportJob::is_finished) {
             if let Some(job) = self.job.take() {
-                self.result = Some(job.finish().map_err(|error| error.to_string()));
+                let result = job.finish().map_err(|error| error.to_string());
+                #[cfg(target_os = "android")]
+                if let Some(stage) = self.staging.take() {
+                    match result {
+                        Ok(_) => self.rendered = Some(stage),
+                        Err(error) => self.result = Some(Err(error)),
+                    }
+                    return;
+                }
+                self.result = Some(result);
             }
         }
         if self.job.is_some() {
@@ -86,6 +99,7 @@ impl ExportUi {
         if !self.dialog {
             return None;
         }
+        #[cfg(not(target_os = "android"))]
         let previous_default = default_path(self.settings);
         if !has_chain {
             self.settings.source = ExportSource::Pattern;
@@ -166,23 +180,31 @@ impl ExportUi {
             )
             .on_hover_text("Writes eight data channels, clock and reset beside the master WAV.")
             .on_disabled_hover_text("Keep a shader take for the selected pattern or chain first.");
-            if self.path == previous_default {
-                self.path = default_path(self.settings).to_string();
-            }
-            ui.label(if self.settings.uses_folder() {
-                "New folder path"
-            } else {
-                "WAV file path"
-            });
-            let path = ui.add(egui::TextEdit::singleline(&mut self.path).desired_width(400.0));
-            if std::mem::take(&mut self.focus_path) {
-                path.request_focus();
-            }
-            let enter = (path.has_focus() || path.lost_focus())
-                && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            #[cfg(not(target_os = "android"))]
+            let (valid, enter, export_label) = {
+                if self.path == previous_default {
+                    self.path = default_path(self.settings).to_string();
+                }
+                ui.label(if self.settings.uses_folder() { "New folder path" } else { "WAV file path" });
+                let path = ui.add(egui::TextEdit::singleline(&mut self.path).desired_width(400.0));
+                if std::mem::take(&mut self.focus_path) {
+                    path.request_focus();
+                }
+                let enter = (path.has_focus() || path.lost_focus())
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                (!self.path.trim().is_empty(), enter, "Export")
+            };
+            #[cfg(target_os = "android")]
+            let (valid, enter, export_label) = {
+                ui.label(if self.settings.uses_folder() {
+                    "Renders the WAVs, then Android Files will ask for a folder."
+                } else {
+                    "Renders the master, then Android Files will ask where to save it."
+                });
+                (true, false, "Render and choose location")
+            };
             ui.horizontal(|ui| {
-                let valid = !self.path.trim().is_empty();
-                let confirmed = ui.add_enabled(valid, egui::Button::new("Export")).clicked()
+                let confirmed = ui.add_enabled(valid, egui::Button::new(export_label)).clicked()
                     || (valid && enter);
                 (confirmed, ui.button("Cancel").clicked())
             })
@@ -210,6 +232,36 @@ impl ExportUi {
             self.dialog = false;
         }
         None
+    }
+
+
+    #[cfg(target_os = "android")]
+    pub fn start_android(
+        &mut self,
+        ctx: &egui::Context,
+        project: Project,
+        fill: bool,
+        mut request: ExportRequest,
+        root: Option<PathBuf>,
+    ) {
+        self.result = None;
+        let stage = root.ok_or_else(|| std::io::Error::other("Private export storage unavailable"))
+            .and_then(|root| crate::export::MobileStage::new(&root, request.settings.uses_folder()));
+        match stage {
+            Ok(stage) => {
+                request.destination = stage.destination();
+                self.start(ctx, project, fill, request);
+                if self.job.is_some() {
+                    self.staging = Some(stage);
+                }
+            }
+            Err(error) => self.result = Some(Err(error.to_string())),
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn take_rendered(&mut self) -> Option<crate::export::MobileStage> {
+        self.rendered.take()
     }
 
     pub fn start(

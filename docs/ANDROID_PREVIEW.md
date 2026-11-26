@@ -47,7 +47,18 @@ for the item the user selects; it does not need broad storage access.
    then reopen a desktop copy through **Open project** on Android. The kit PCM
    is embedded in the project. Replacing another document in place is not
    implemented on Android.
-5. Switch away while playing, return, and unplug/reconnect audio. The document
+5. Open **Export WAV…**. Render a master and choose a file in Android Files.
+   Repeat with **Include stems**; choose a folder and inspect the newly created
+   **Leviathan export** subfolder. Check master and lane frame counts against a
+   desktop bounce. A saved shader take can be included as an additional WAV;
+   live shader feedback is still off on Android. Cancel the picker once and
+   confirm it does not report success.
+6. With a disposable project, force Activity recreation while Android Files
+   is open. The picker request is not replayed. Use **Restore pre-picker
+   project**, and inspect any chosen output before treating it as a backup.
+   This recovers the saved project state, not unsplit waveform edits or an
+   in-progress render.
+7. Switch away while playing, return, and unplug/reconnect audio. The document
    picker, audio-focus/recovery, and behavior under activity or process
    recreation still require physical-device verification; host and build
    checks are not a substitute.

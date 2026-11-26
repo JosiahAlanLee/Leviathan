@@ -1130,16 +1130,46 @@ impl LeviathanApp {
 
     #[cfg(target_os = "android")]
     fn request_android_file(&mut self, kind: android_files::Kind, ctx: &egui::Context) {
-        if !self.android_files.as_ref().is_some_and(|files| !files.pending()) { return; }
-        let data = if matches!(kind, android_files::Kind::Save) {
-            project::encode(self.project_snapshot())
+        self.launch_android_file(kind, None, ctx);
+    }
+
+    #[cfg(target_os = "android")]
+    fn launch_android_file(
+        &mut self,
+        kind: android_files::Kind,
+        stage: Option<export::MobileStage>,
+        ctx: &egui::Context,
+    ) {
+        let Some(files) = self.android_files.as_ref() else { return };
+        if files.pending() || files.recovering() {
+            return;
+        }
+        let project = self.project_snapshot();
+        if let Some(files) = self.android_files.as_mut() {
+            if let Err(error) = files.launch(kind, project, stage, ctx) {
+                files.status = error;
+            }
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    fn resolve_android_recovery(&mut self, restore: bool) {
+        let Some(files) = self.android_files.as_mut() else { return };
+        if !files.recovering() { return; }
+        let snapshot = if restore {
+            match files.recover_project() {
+                Ok(project) => Some(project),
+                Err(error) => { files.status = error; return; }
+            }
         } else {
-            Ok(Vec::new())
+            None
         };
-        let files = self.android_files.as_mut().unwrap();
-        match data {
-            Ok(bytes) => files.launch(kind, bytes, ctx),
-            Err(error) => files.status = error,
+        match files.clear_recovery() {
+            Ok(()) => files.status = if restore { "Recovered pre-picker project." } else { "Recovery copy dismissed." }.into(),
+            Err(error) => { files.status = error; return; }
+        }
+        if let Some(project) = snapshot {
+            self.install_project(project);
         }
     }
 
@@ -1163,6 +1193,8 @@ impl LeviathanApp {
                     Err(error) => error,
                 }
             }
+            (Kind::ExportWav, Reply::Saved) => "Master WAV saved in Android Files.".into(),
+            (Kind::ExportFolder, Reply::Saved) => "WAV bundle saved in a new Leviathan export folder.".into(),
             (_, Reply::Saved) => "Saved a project copy.".into(),
             (_, Reply::Cancelled) => "Files closed without changes.".into(),
             (_, Reply::Failed(error)) => error,
@@ -1171,7 +1203,9 @@ impl LeviathanApp {
                 "Unexpected file result.".into()
             }
         };
-        self.android_files.as_mut().unwrap().status = status;
+        let files = self.android_files.as_mut().unwrap();
+        files.status = status;
+        files.finish();
     }
 
     fn draw_visual_sampler(&mut self, ui: &mut egui::Ui) {
@@ -1618,6 +1652,17 @@ impl eframe::App for LeviathanApp {
         self.poll_android_files(ctx);
         self.audio.flush();
         self.export_ui.poll(ctx);
+        #[cfg(target_os = "android")]
+        if self.android_files.as_ref().is_some_and(|files| !files.pending() && !files.recovering()) {
+            if let Some(stage) = self.export_ui.take_rendered() {
+                let kind = if stage.is_bundle() {
+                    android_files::Kind::ExportFolder
+                } else {
+                    android_files::Kind::ExportWav
+                };
+                self.launch_android_file(kind, Some(stage), ctx);
+            }
+        }
         let mut peaks = MasterPeaks::default();
         let mut visual_gates = [0.0_f32; NUM_LANES];
         let telemetry_generation = self.project_generation;
@@ -1706,7 +1751,15 @@ impl eframe::App for LeviathanApp {
                 #[cfg(target_os = "android")]
                 let file = {
                     ui.horizontal_wrapped(|ui| {
-                        let ready = self.android_files.as_ref().is_some_and(|f| !f.pending());
+                        let ready = self.android_files.as_ref().is_some_and(|f| !f.pending() && !f.recovering());
+                        if self.android_files.as_ref().is_some_and(|f| f.recovering()) {
+                            if ui.button("Restore pre-picker project").clicked() {
+                                self.resolve_android_recovery(true);
+                            }
+                            if ui.button("Dismiss recovery").clicked() {
+                                self.resolve_android_recovery(false);
+                            }
+                        }
                         if ui.add_enabled(ready, egui::Button::new("Open project")).clicked() {
                             self.request_android_file(android_files::Kind::Open, ui.ctx());
                         }
@@ -1744,7 +1797,13 @@ impl eframe::App for LeviathanApp {
             &self.instruments.shader_bus,
         ) {
             let snapshot = self.project_snapshot();
+            #[cfg(not(target_os = "android"))]
             self.export_ui.start(ctx, snapshot, self.fill_active, request);
+            #[cfg(target_os = "android")]
+            self.export_ui.start_android(
+                ctx, snapshot, self.fill_active, request,
+                self.android_files.as_ref().and_then(android_files::Files::export_root),
+            );
         }
 
         let pattern_changed = self.cursor.moved_this_frame;

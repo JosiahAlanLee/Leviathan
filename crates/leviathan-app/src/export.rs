@@ -361,6 +361,63 @@ fn write_outputs(
     Ok(())
 }
 
+/// A private output directory for Android's provider-based export.
+#[cfg(any(target_os = "android", test))]
+pub(crate) struct MobileStage {
+    path: PathBuf,
+    bundle: bool,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl MobileStage {
+    pub(crate) fn new(root: &Path, bundle: bool) -> io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{Duration, SystemTime};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        fs::create_dir_all(root)?;
+        // Process death can strand a render. Only prune our private, old staging directories.
+        for entry in fs::read_dir(root)?.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("export-")
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && entry.metadata().and_then(|meta| meta.modified()).is_ok_and(|time|
+                    SystemTime::now().duration_since(time).is_ok_and(|age| age > Duration::from_secs(86_400)))
+            {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+        loop {
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = root.join(format!("export-{}-{id}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path, bundle }),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    pub(crate) fn destination(&self) -> PathBuf {
+        // For a bundle the renderer creates this as a directory, not a file.
+        self.path.join("mix.wav")
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn is_bundle(&self) -> bool {
+        self.bundle
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+impl Drop for MobileStage {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 fn require_new_folder(path: &Path) -> io::Result<()> {
     if path.try_exists()? {
         return Err(io::Error::new(
@@ -452,6 +509,28 @@ mod tests {
             voice_calibration: false,
             instruments: Default::default(),
         }
+    }
+
+    #[test]
+    fn mobile_export_stages_the_shared_renderer_and_cleans_up() {
+        let temp = StagingDirectory::new(&std::env::temp_dir().join("leviathan-mobile-test")).unwrap();
+        let single = MobileStage::new(&temp.path, false).unwrap();
+        let bundle = MobileStage::new(&temp.path, true).unwrap();
+        assert_ne!(single.root(), bundle.root());
+        assert!(!single.is_bundle());
+        assert!(bundle.is_bundle());
+        for stage in [&single, &bundle] {
+            ExportJob::start(project(), false, ExportRequest {
+                settings: ExportSettings { stems: stage.is_bundle(), ..Default::default() },
+                destination: stage.destination(),
+            }).unwrap().finish().unwrap();
+        }
+        assert_eq!(fs::read(single.destination()).unwrap(),
+            fs::read(bundle.destination().join("master.wav")).unwrap());
+        let root = single.root().to_owned();
+        drop(single);
+        assert!(!root.exists());
+        assert!(bundle.destination().join("master.wav").is_file());
     }
 
     #[test]
