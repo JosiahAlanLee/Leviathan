@@ -540,4 +540,100 @@ mod tests {
         assert_eq!(voice.block_mix, [0.0; BLOCK_COUNT]);
         assert_eq!(voice.step(220.0, 48_000.0, false, None, &params), 0.0);
     }
+
+    #[test]
+    fn step_stays_finite_across_param_sweep() {
+        for p in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+            let mut params = DEFAULTS;
+            for v in params.iter_mut() {
+                *v = p;
+            }
+            let mut voice = Voice::default();
+            for i in 0..2_000 {
+                let hz = 20.0 + (i % 40) as f32 * 100.0;
+                let sample = voice.step(
+                    hz,
+                    48_000.0,
+                    i % 7 != 0,
+                    (i == 0).then_some(0.9),
+                    &params,
+                );
+                assert!(sample.is_finite());
+                assert!(sample.abs() <= 2.0);
+            }
+        }
+    }
+
+    #[test]
+    fn step_is_deterministic_for_identical_inputs() {
+        let mut a = Voice::default();
+        let mut b = Voice::default();
+        for i in 0..4_000 {
+            let hz = 55.0 + (i % 32) as f32 * 30.0;
+            let trig = (i % 500 == 0).then_some(0.8);
+            let gate = i % 2 == 0;
+            let sa = a.step(hz, 48_000.0, gate, trig, &DEFAULTS);
+            let sb = b.step(hz, 48_000.0, gate, trig, &DEFAULTS);
+            assert_eq!(sa, sb);
+        }
+    }
+
+    #[test]
+    fn reset_restores_fresh_state() {
+        let mut voice = Voice::default();
+        for i in 0..2_000 {
+            voice.step(220.0, 48_000.0, i % 2 == 0, (i == 0).then_some(0.9), &DEFAULTS);
+        }
+        voice.reset();
+        let mut fresh = Voice::default();
+        let mut params = DEFAULTS;
+        params[0] = 0.0;
+        for i in 0..1_000 {
+            let a = voice.step(220.0, 48_000.0, false, (i == 0).then_some(0.9), &params);
+            let b = fresh.step(220.0, 48_000.0, false, (i == 0).then_some(0.9), &params);
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn step_clamps_low_sample_rate_and_extreme_frequency() {
+        let mut voice = Voice::default();
+        let low = voice.step(220.0, 1_000.0, true, Some(0.9), &DEFAULTS);
+        assert!(low.is_finite());
+        let mut voice = Voice::default();
+        let high = voice.step(1.0e6, 48_000.0, true, Some(0.9), &DEFAULTS);
+        assert!(high.is_finite());
+    }
+
+    #[test]
+    fn drawbars_stay_finite_and_bounded() {
+        for i in 0..=100 {
+            let phase = i as f32 / 100.0;
+            let (sum, octave) = drawbars(phase, 0.5, 0.5);
+            assert!(sum.is_finite());
+            assert!(octave.is_finite());
+            assert!(sum.abs() <= 1.6);
+            assert!(octave.abs() <= 0.25);
+        }
+    }
+
+    #[test]
+    fn cutoff_curve_stays_finite_and_bounded() {
+        for i in 0..=100 {
+            let v = i as f32 / 100.0;
+            let c = cutoff_curve(v);
+            assert!(c.is_finite());
+            assert!((0.0..=1.0).contains(&c));
+        }
+    }
+
+    #[test]
+    fn filter_coefficient_stays_bounded_by_ceiling() {
+        for hz in [0.0_f32, 1.0, 100.0, 1_000.0, 10_000.0, 20_000.0] {
+            let g = filter_coefficient(hz, 48_000.0, 0.70);
+            assert!(g.is_finite());
+            assert!(g >= 0.0);
+            assert!(g <= 0.70);
+        }
+    }
 }
