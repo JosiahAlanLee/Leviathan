@@ -199,4 +199,109 @@ mod tests {
         assert!(late[0] < early[0] * 0.25 && late[0] > 1e-6);
         assert!(late[1] / late[0] < early[1] / early[0] * 0.6);
     }
+
+    #[test]
+    fn output_is_zero_when_gate_and_strike_are_dark() {
+        let mut voice = Voice::default();
+        let params = MachineKind::WestCoastLpg.spec().default_params();
+        for _ in 0..10_000 {
+            let output = voice.step(220.0, 48_000.0, false, None, &params);
+            assert_eq!(output, 0.0);
+        }
+        assert_eq!(voice.light, 0.0);
+        assert_eq!(voice.lpg, [0.0, 0.0]);
+        assert_eq!(voice.dc, 0.0);
+    }
+
+    #[test]
+    fn trigger_sets_target_and_strike_env() {
+        let mut voice = Voice::default();
+        let mut params = MachineKind::WestCoastLpg.spec().default_params();
+        params[7] = 0.5; // strike
+        voice.step(220.0, 48_000.0, true, Some(0.8), &params);
+        assert_eq!(voice.target, 0.8);
+        // strike_env is set to strike*velocity, then decayed within the same step.
+        assert!(voice.strike_env > 0.39 && voice.strike_env <= 0.4 + 1e-6);
+    }
+
+    #[test]
+    fn output_is_finite_and_bounded_across_parameter_sweep() {
+        for mode in [0.0, 0.33, 0.5, 0.67, 1.0] {
+            for drive in [0.0, 0.5, 1.0] {
+                let mut voice = Voice::default();
+                let params = [0.9, drive, 0.25, 1.0, 0.9, 0.8, mode, 1.0];
+                for i in 0..2_000 {
+                    let output = voice.step(440.0, 48_000.0, i % 7 < 5, (i == 0).then_some(1.0), &params);
+                    assert!(output.is_finite(), "mode {mode} drive {drive} step {i}");
+                    assert!((-1.2..=1.2).contains(&output));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn identical_sequences_are_deterministic() {
+        let mut params = MachineKind::WestCoastLpg.spec().default_params();
+        params[3] = 0.7;
+        let mut a = Voice::default();
+        let mut b = Voice::default();
+        for i in 0..5_000 {
+            let trigger = (i == 0 || i == 2_500).then_some(0.9);
+            let gate = i % 3 != 0;
+            assert_eq!(
+                a.step(330.0, 48_000.0, gate, trigger, &params),
+                b.step(330.0, 48_000.0, gate, trigger, &params)
+            );
+        }
+    }
+
+    #[test]
+    fn gate_release_decays_output_to_zero_and_resets_state() {
+        let mut voice = Voice::default();
+        let params = MachineKind::WestCoastLpg.spec().default_params();
+        for i in 0..10_000 {
+            voice.step(220.0, 48_000.0, true, (i == 0).then_some(1.0), &params);
+        }
+        let mut saw_nonzero = false;
+        for _ in 0..200_000 {
+            let output = voice.step(220.0, 48_000.0, false, None, &params);
+            saw_nonzero |= output != 0.0;
+        }
+        assert!(saw_nonzero);
+        assert_eq!(voice.light, 0.0);
+        assert_eq!(voice.lpg, [0.0, 0.0]);
+        assert_eq!(voice.dc, 0.0);
+        assert_eq!(voice.strike_env, 0.0);
+    }
+
+    #[test]
+    fn fold_with_zero_drive_returns_clamped_input() {
+        for input in [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0] {
+            let output = fold(input, 0.0, 0.5);
+            assert!((-1.0..=1.0).contains(&output));
+            assert!((output - input.clamp(-1.0, 1.0)).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn fold_stays_bounded_at_extreme_drive_and_symmetry() {
+        for symmetry in [0.0, 0.5, 1.0] {
+            for drive in [0.0, 1.0] {
+                for i in 0..256 {
+                    let input = sine(i as f32 / 256.0);
+                    let output = fold(input, drive, symmetry);
+                    assert!(output.is_finite());
+                    assert!(output.abs() <= 3.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_hz_is_finite() {
+        let mut voice = Voice::default();
+        let params = MachineKind::WestCoastLpg.spec().default_params();
+        let out = voice.step(0.0, 48_000.0, true, Some(1.0), &params);
+        assert!(out.is_finite());
+    }
 }
