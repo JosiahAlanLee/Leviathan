@@ -8,6 +8,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/leviathan-app/Cargo.toml'
+      - 'crates/leviathan-app/src/**'
       - 'docs/ANDROID_PREVIEW.md'
   workflow_dispatch:
 

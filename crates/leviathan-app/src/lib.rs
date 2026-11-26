@@ -23,6 +23,8 @@ mod sampler_ui;
 mod session_ui;
 mod shader_bus;
 mod smf;
+#[cfg(any(target_os = "android", test))]
+mod tablet_ui;
 mod tracker_edit;
 mod tracker_keys;
 mod wav;
@@ -203,6 +205,10 @@ struct LeviathanApp {
     followed_row: Option<(usize, usize)>,
     playing: bool,
     fill_active: bool,
+    #[cfg(target_os = "android")]
+    touch_fill: tablet_ui::TouchFill,
+    #[cfg(target_os = "android")]
+    tablet_scrub: tablet_ui::TabletScrub,
     bpm: f64,
     master_send: f32,
     delay_mode: DelayMode,
@@ -315,6 +321,10 @@ impl LeviathanApp {
             followed_row: None,
             playing: false,
             fill_active: false,
+            #[cfg(target_os = "android")]
+            touch_fill: tablet_ui::TouchFill::default(),
+            #[cfg(target_os = "android")]
+            tablet_scrub: tablet_ui::TabletScrub::default(),
             bpm: 132.0,
             master_send: 0.0,
             delay_mode: DelayMode::default(),
@@ -402,6 +412,51 @@ impl LeviathanApp {
                 }
             }
         });
+    }
+
+    #[cfg(target_os = "android")]
+    fn draw_tablet_scrub(&mut self, ui: &mut egui::Ui, pattern: usize) {
+        let lane = self.cursor.lane;
+        let row = self.cursor.row;
+        let cell = self.patterns[pattern].lanes[lane][row];
+        let patch = self.lane_patches[lane];
+        let enabled = row < self.patterns[pattern].length;
+        if let Some((mut drag, up)) =
+            self.tablet_scrub.draw(ui, (pattern, lane, row), cell, &patch, enabled)
+        {
+            self.apply_tablet_scrub(pattern, lane, row, &mut drag, up);
+            if drag.recorded_undo {
+                self.tablet_scrub.mark_edit_recorded();
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn apply_tablet_scrub(
+        &mut self,
+        pattern: usize,
+        lane: usize,
+        row: usize,
+        drag: &mut tablet_ui::ScrubDrag,
+        up: f32,
+    ) {
+        let cell = drag.cell_at(up, &self.lane_patches[lane]);
+        if self.patterns[pattern].lanes[lane][row] == cell {
+            return;
+        }
+        if !drag.recorded_undo {
+            self.histories[pattern].record_before_edit(&self.patterns[pattern]);
+            drag.recorded_undo = true;
+        }
+        self.patterns[pattern].lanes[lane][row] = cell;
+        self.send_audio(AudioCommand::SetCell { pattern, lane, row, cell });
+    }
+
+    fn set_fill(&mut self, active: bool) {
+        if self.fill_active != active {
+            self.fill_active = active;
+            self.send_audio(AudioCommand::SetFill(active));
+        }
     }
 
     fn send_audio(&mut self, command: AudioCommand) {
@@ -1276,6 +1331,11 @@ impl LeviathanApp {
         self.midi.record_armed = false;
         self.midi.events.discard_pending();
         self.fill_active = false;
+        #[cfg(target_os = "android")]
+        {
+            self.touch_fill = tablet_ui::TouchFill::default();
+            self.tablet_scrub.end_drag();
+        }
         self.inspector_drag_recorded = false;
         self.cursor = TrackerCursor::default();
         self.latest_cv = CvFrame::default();
@@ -1499,9 +1559,14 @@ impl eframe::App for LeviathanApp {
                 if ui.button("Reset").clicked() {
                     self.send_audio(AudioCommand::Reset);
                 }
+                #[cfg(target_os = "android")]
+                {
+                    let active = self.touch_fill.draw(ui, !modal_open);
+                    self.set_fill(active);
+                }
+                #[cfg(not(target_os = "android"))]
                 if ui.selectable_label(self.fill_active, "FILL").clicked() {
-                    self.fill_active = !self.fill_active;
-                    self.send_audio(AudioCommand::SetFill(self.fill_active));
+                    self.set_fill(!self.fill_active);
                 }
                 ui.separator();
                 ui.label("BPM");
@@ -1644,7 +1709,10 @@ impl eframe::App for LeviathanApp {
         let tracker = egui::CentralPanel::default().show(ctx, |ui| {
             #[cfg(target_os = "android")]
             if !modal_open {
+                self.draw_tablet_scrub(ui, selected);
                 self.draw_touch_notes(ui, selected);
+            } else {
+                self.tablet_scrub.end_drag();
             }
             let pattern_length = self.patterns[selected].length;
             let has_chain = !self.chain.as_slice().is_empty();
@@ -2035,6 +2103,43 @@ mod tests {
         };
         frame(ctx, app, vec![Event::PointerMoved(position), pointer(true)]);
         frame(ctx, app, vec![pointer(false)]);
+    }
+
+    #[test]
+    fn tablet_scrub_uses_one_undo_and_sends_real_cell_commands() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        let (tx, mut rx) = rtrb::RingBuffer::new(16);
+        app.audio = AudioControl::new(tx);
+        app.offline_player = None;
+        let original = app.patterns[0].lanes[0][0];
+        assert!(original.active);
+        let mut gesture = tablet_ui::ScrubDrag::new(tablet_ui::ScrubMode::Note, original);
+        app.apply_tablet_scrub(0, 0, 0, &mut gesture, 0.0);
+        assert_eq!(app.histories[0].undo_len(), 0);
+        assert!(rx.pop().is_err());
+        app.apply_tablet_scrub(0, 0, 0, &mut gesture, 8.0);
+        app.apply_tablet_scrub(0, 0, 0, &mut gesture, 24.0);
+        assert_eq!(app.patterns[0].lanes[0][0].midi, original.midi + 3);
+        for semitones in [1, 3] {
+            assert!(matches!(rx.pop(), Ok(AudioCommand::SetCell {
+                pattern: 0, lane: 0, row: 0, cell,
+            }) if cell.midi == original.midi + semitones));
+        }
+        assert_eq!(app.histories[0].undo_len(), 1);
+        app.step_history(0, false);
+        assert_eq!(app.patterns[0].lanes[0][0], original);
+    }
+
+    #[test]
+    fn momentary_fill_reaches_the_existing_evaluator_and_releases() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        let mut fill = tablet_ui::TouchFill::default();
+        app.set_fill(fill.update(false, true));
+        assert!(app.offline_player.as_ref().unwrap().evaluator.fill_active);
+        app.set_fill(fill.update(false, false));
+        assert!(!app.offline_player.as_ref().unwrap().evaluator.fill_active);
     }
 
     #[test]
