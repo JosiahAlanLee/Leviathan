@@ -729,14 +729,23 @@ pub fn load(path: &Path) -> Result<Project, String> {
     File::open(path)
         .and_then(|file| file.take(MAX_PROJECT_BYTES + 1).read_to_end(&mut bytes))
         .map_err(|error| error.to_string())?;
+    decode(&bytes)
+}
+
+pub fn decode(bytes: &[u8]) -> Result<Project, String> {
     if bytes.len() as u64 > MAX_PROJECT_BYTES {
         return Err("Project exceeds 8 MiB".to_string());
     }
-    let file: ProjectFile = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let file: ProjectFile = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
     file.into_project()
 }
 
 pub fn save(path: &Path, project: Project) -> Result<(), String> {
+    let bytes = encode(project)?;
+    atomic_write(path, &bytes).map_err(|error| error.to_string())
+}
+
+pub fn encode(project: Project) -> Result<Vec<u8>, String> {
     validate_sample_trims(&project.sample_regions)?;
     if project.instruments.routing.render_order().is_none() {
         return Err("Invalid or cyclic instrument routing".to_string());
@@ -791,7 +800,7 @@ pub fn save(path: &Path, project: Project) -> Result<(), String> {
     if bytes.len() as u64 > MAX_PROJECT_BYTES {
         return Err("Project exceeds 8 MiB".to_string());
     }
-    atomic_write(path, &bytes).map_err(|error| error.to_string())
+    Ok(bytes)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {

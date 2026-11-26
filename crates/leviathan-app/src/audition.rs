@@ -67,8 +67,33 @@ impl Player {
         let ramp = (f64::from(request.rate()) * 0.003)
             .min(len as f64 * 0.5)
             .max(1.0);
-        let gain = (self.position.min(len as f64 - self.position) / ramp).min(1.0) as f32 * 0.55;
-        self.position += f64::from(request.rate()) / rate;
+        let stride = f64::from(request.rate()) / rate;
+        // A slice that fits in one output frame would otherwise be entirely
+        // silent: the ramp starts at zero and the next sample is out of range.
+        let gain = if stride >= len as f64 {
+            0.55
+        } else {
+            (self.position.min(len as f64 - self.position) / ramp).min(1.0) as f32 * 0.55
+        };
+        self.position += stride;
         std::array::from_fn(|ch| (a[ch] + (b[ch] - a[ch]) * fraction) * gain)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_high_rate_audition_emits_one_frame_instead_of_silence() {
+        for (rate, audible_on) in [(192_000, 0), (48_000, 1)] {
+            let sample = KitSample::new("tick".into(), rate, vec![16_384; 2]).unwrap();
+            let mut player = Player::default();
+            player.start(Some(Arc::new(Request { sample: Sample::Kit(sample), range: 0..2, reverse: false })));
+            let frames = std::array::from_fn::<_, 3, _>(|_| player.step(48_000.0));
+            assert!(frames[audible_on][0] > 0.2);
+            assert_eq!(frames[2], [0.0; 2]);
+        }
     }
 }

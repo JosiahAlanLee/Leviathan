@@ -41,6 +41,7 @@ pub enum AudioCommand {
     SetBenderParams(BenderParams),
     SetEchoParams(echo::Params),
     Audition(Arc<audition::Request>),
+    StopAudition,
     SetKit(Arc<Kit>),
     SetKitControls {
         params: [otis_kit::Slot; otis_kit::SLOTS],
@@ -71,6 +72,11 @@ pub enum AudioCommand {
         pattern: usize,
         lane: usize,
         row: usize,
+        cell: NoteCell,
+    },
+    #[cfg(any(target_os = "android", test))]
+    PreviewStep {
+        lane: usize,
         cell: NoteCell,
     },
     SetAutomation {
@@ -331,6 +337,14 @@ struct MidiPreview {
     retrigger: bool,
 }
 
+#[cfg(any(target_os = "android", test))]
+struct StepPreview {
+    lane: usize,
+    cell: NoteCell,
+    remaining: u32,
+    attack: bool,
+}
+
 struct RtAudioWorker {
     patterns: Box<[Pattern]>,
     pattern_count: usize,
@@ -346,6 +360,8 @@ struct RtAudioWorker {
     midi_events: Option<MidiReceiver>,
     midi_target: MidiTarget,
     midi_preview: [Option<MidiPreview>; NUM_LANES],
+    #[cfg(any(target_os = "android", test))]
+    step_preview: Option<StepPreview>,
     takes: TakeBank,
     kit: KitBank,
     echo_storage: Box<[[f32; 2]]>,
@@ -429,6 +445,8 @@ impl RtAudioWorker {
             midi_events,
             midi_target: MidiTarget::default(),
             midi_preview: [None; NUM_LANES],
+            #[cfg(any(target_os = "android", test))]
+            step_preview: None,
             takes: TakeBank::default(),
             kit: KitBank::default(),
             echo_storage: vec![[0.0; 2]; echo::capacity(sample_rate as f32)].into_boxed_slice(),
@@ -472,6 +490,7 @@ impl RtAudioWorker {
                 AudioCommand::SetBenderParams(params) => self.synth.set_bender_params(params),
                 AudioCommand::SetEchoParams(params) => self.synth.set_echo_params(params),
                 AudioCommand::Audition(request) => self.audition.start(Some(request)),
+                AudioCommand::StopAudition => self.audition.start(None),
                 AudioCommand::SetBpm(bpm) => self.synth.set_tempo(bpm),
                 AudioCommand::SetKit(kit) => {
                     self.synth.set_kit_controls(kit.params, kit.lanes);
@@ -537,6 +556,22 @@ impl RtAudioWorker {
                 } => {
                     if pattern < self.pattern_count && lane < NUM_LANES && row < ROWS_PER_PATTERN {
                         self.patterns[pattern].lanes[lane][row] = cell;
+                    }
+                }
+                #[cfg(any(target_os = "android", test))]
+                AudioCommand::PreviewStep { lane, cell } => {
+                    if !self.player.evaluator.playing
+                        && lane < NUM_LANES
+                        && cell.active
+                        && !cell.air
+                    {
+                        self.step_preview = Some(StepPreview {
+                            lane,
+                            cell,
+                            remaining: (0.14 * self.player.evaluator.config.sample_rate)
+                                .max(1.0) as u32,
+                            attack: true,
+                        });
                     }
                 }
                 AudioCommand::SetAutomation {
@@ -860,6 +895,30 @@ impl RtAudioWorker {
         cv
     }
 
+    #[cfg(any(target_os = "android", test))]
+    fn preview_step_frame(&mut self, mut frame: CvFrame) -> CvFrame {
+        let Some(preview) = &mut self.step_preview else { return frame };
+        if self.player.evaluator.playing
+            || preview.remaining == 0
+            || self.midi_preview[preview.lane].is_some()
+        {
+            self.step_preview = None;
+            return frame;
+        }
+        preview.remaining -= 1;
+        let lane = preview.lane;
+        let config = &self.player.evaluator.config;
+        let semitones = i32::from(preview.cell.midi) + config.key_offset - config.pitch_zero;
+        frame.pitch_v[lane] = semitones as f32 / 12.0;
+        frame.velocity_v[lane] = f32::from(preview.cell.velocity.min(127)) / 127.0 * config.v_high;
+        frame.locks[lane] = preview.cell.lock;
+        frame.gate_v[lane] = config.v_high;
+        if std::mem::take(&mut preview.attack) {
+            self.synth.retrigger_lanes(1 << lane);
+        }
+        frame
+    }
+
     #[inline]
     fn next_output(&mut self) -> ((f32, f32), shader_bus::ReturnFrame) {
         if self.pending_next < self.pending_len {
@@ -879,6 +938,8 @@ impl RtAudioWorker {
             }
             cv
         };
+        #[cfg(any(target_os = "android", test))]
+        let render_cv = self.preview_step_frame(render_cv);
         let tap = self.recorder.as_mut().and_then(|recorder| {
             recorder.tap(
                 cv.beat,
@@ -2706,6 +2767,42 @@ mod tests {
         assert!(telemetry.cv.bytebus_v[0] > 5.0);
         assert!(telemetry.cv.bytebus_v[1] < 5.0);
         assert!(telemetry.cv.bytebus_v[2] > 5.0);
+    }
+
+    #[test]
+    fn touch_note_preview_is_audible_then_sequence_plays_the_edited_note() {
+        let (mut tx, rx) = rtrb::RingBuffer::new(8);
+        let (tel_tx, mut telemetry) = rtrb::RingBuffer::new(128);
+        let lane = 2;
+        let mut worker = RtAudioWorker::new(Pattern::default(), 48_000.0, rx, tel_tx, None);
+        let mut output = [0.0f32; 512];
+        worker.render_output(&mut output, 2, false, |v| v, 0.0);
+        assert!(output.iter().all(|&v| v == 0.0));
+        let cell = NoteCell { active: true, midi: 72, velocity: 110, ..NoteCell::default() };
+        assert!(tx.push(AudioCommand::SetCell { pattern: 0, lane, row: 3, cell }).is_ok());
+        assert!(tx.push(AudioCommand::PreviewStep { lane, cell }).is_ok());
+        worker.render_output(&mut output, 2, false, |v| v, 0.0);
+        assert!(output.iter().any(|&v| v.abs() > 1e-4));
+        assert_eq!(worker.patterns[0].lanes[lane][3], cell);
+        assert_eq!(worker.step_preview.as_ref().unwrap().remaining, 6720 - 256);
+        assert!(!worker.player.evaluator.playing);
+        // No synthetic gate is published to external sequencer outputs.
+        while let Ok(t) = telemetry.pop() {
+            assert_eq!(t.cv.gate_v[lane], 0.0);
+        }
+        for _ in 0..28 {
+            worker.render_output(&mut output, 2, false, |v| v, 0.0);
+        }
+        assert!(worker.step_preview.is_none());
+        while telemetry.pop().is_ok() {}
+        assert!(tx.push(AudioCommand::PlayFromRow {pattern: 0, row: 3, request: 1}).is_ok());
+        assert!(tx.push(AudioCommand::PreviewStep {lane, cell}).is_ok());
+        worker.render_output(&mut output, 2, false, |v| v, 0.0);
+        assert!(worker.player.evaluator.playing);
+        assert!(worker.step_preview.is_none(), "preview must not steal the running lane");
+        assert!(std::iter::from_fn(|| telemetry.pop().ok())
+            .any(|t| t.cv.gate_v[lane] > 0.0 && t.cv.pitch_v[lane] == 1.0));
+        assert!(output.iter().any(|&v| v.abs() > 1e-4));
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub enum ProjectAction {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(target_os = "android", allow(dead_code))]
 enum FileOperation {
     Open,
     Save,
@@ -35,6 +36,7 @@ pub struct ProjectUi {
 }
 
 impl ProjectUi {
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     fn choose(&mut self, operation: FileOperation) {
         let path = match (&self.current, operation) {
             (Some(path), _) => path.to_string_lossy().into_owned(),
@@ -48,6 +50,7 @@ impl ProjectUi {
         });
     }
 
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub fn toolbar(&mut self, ui: &mut egui::Ui, export: &mut ExportUi) -> Option<ProjectAction> {
         let mut action = None;
         ui.horizontal_wrapped(|ui| {
