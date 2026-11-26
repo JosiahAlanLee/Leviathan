@@ -12,8 +12,8 @@ import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import java.util.Arrays;
 import java.util.Comparator;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.io.File;
+import java.io.FileFilter;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -23,7 +23,8 @@ import java.io.OutputStream;
 /** The Rust engine stays in NativeActivity; only the document result crosses here. */
 public final class DocumentActivity extends NativeActivity {
     private static final int WAV = 1, OPEN = 2, SAVE = 3, EXPORT_WAV = 4, EXPORT_FOLDER = 5;
-    private static final AtomicInteger NEXT_REQUEST = new AtomicInteger(4700);
+    // Called only on the UI thread, and shared across Activity instances in this process.
+    private static int nextRequest = 4700;
     private static final int WAV_LIMIT = 64 * 1024 * 1024, PROJECT_LIMIT = 8 * 1024 * 1024;
     private int operation;
     private int requestCode;
@@ -58,7 +59,8 @@ public final class DocumentActivity extends NativeActivity {
         result = null;
         operation = kind;
         sourcePath = path;
-        requestCode = NEXT_REQUEST.getAndUpdate(previous -> previous >= 0x7fff ? 4700 : previous + 1);
+        requestCode = nextRequest;
+        nextRequest = nextRequest >= 0x7fff ? 4700 : nextRequest + 1;
         String action = kind == EXPORT_FOLDER ? Intent.ACTION_OPEN_DOCUMENT_TREE :
             kind == SAVE || kind == EXPORT_WAV ? Intent.ACTION_CREATE_DOCUMENT : Intent.ACTION_OPEN_DOCUMENT;
         Intent intent = new Intent(action);
@@ -188,11 +190,19 @@ public final class DocumentActivity extends NativeActivity {
     }
 
     private void writeBundle(File source, Uri tree) throws IOException {
-        File[] outputs = source.listFiles(file -> file.isFile() && file.getName().endsWith(".wav"));
+        File[] outputs = source.listFiles(new FileFilter() {
+            @Override public boolean accept(File file) {
+                return file.isFile() && file.getName().endsWith(".wav");
+            }
+        });
         if (outputs == null || outputs.length == 0 || !new File(source, "master.wav").isFile()) {
             throw new IOException("No rendered WAV bundle is available");
         }
-        Arrays.sort(outputs, Comparator.comparing(File::getName));
+        Arrays.sort(outputs, new Comparator<File>() {
+            @Override public int compare(File left, File right) {
+                return left.getName().compareTo(right.getName());
+            }
+        });
         Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
         Uri folder = DocumentsContract.createDocument(getContentResolver(), parent,
             DocumentsContract.Document.MIME_TYPE_DIR, "Leviathan export");
