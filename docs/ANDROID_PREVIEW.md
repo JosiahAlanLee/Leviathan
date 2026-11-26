@@ -16,7 +16,7 @@ side-by-side NDK 27.3.13750724, Android platform-tools, and a JDK.
 rustup target add aarch64-linux-android
 cargo install cargo-apk --version 0.10.0 --locked
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.3.13750724"
-cargo apk build -p leviathan-app
+cargo apk build -p leviathan-app --lib
 adb install -r target/debug/apk/leviathan-app.apk
 ```
 
