@@ -167,6 +167,171 @@ mod tests {
     }
 
     #[test]
+    fn clap_burst_is_zero_beyond_four_bursts() {
+        let spacing = 480;
+        assert_eq!(clap_burst(4 * spacing, spacing), 0.0);
+        assert_eq!(clap_burst(4 * spacing + 1, spacing), 0.0);
+        assert_eq!(clap_burst(0, spacing), 0.0);
+    }
+
+    #[test]
+    fn clap_burst_is_bounded_in_unit_interval() {
+        let spacing = 480;
+        for age in 0..(4 * spacing) {
+            let value = clap_burst(age, spacing);
+            assert!((0.0..=1.0).contains(&value));
+        }
+    }
+
+    #[test]
+    fn zero_velocity_trigger_produces_silence_for_clap_mode() {
+        let mut params = MachineKind::ElectroPerc.spec().default_params();
+        params[1] = 0.375; // mode 1 (clap)
+        let mut voice = Voice::default();
+        let mut rng = 1;
+        for i in 0..64 {
+            let sample = voice.step(
+                240.0,
+                48_000.0,
+                (i == 0).then_some(0.0),
+                &params,
+                &mut rng,
+            );
+            assert_eq!(sample, 0.0);
+        }
+    }
+
+    #[test]
+    fn step_is_deterministic_for_identical_inputs() {
+        let mut params = MachineKind::ElectroPerc.spec().default_params();
+        params[1] = 0.875;
+        let run = || {
+            let mut voice = Voice::default();
+            let mut rng = 99;
+            (0..256)
+                .map(|i| {
+                    voice.step(
+                        180.0,
+                        44_100.0,
+                        (i % 64 == 0).then_some(0.7),
+                        &params,
+                        &mut rng,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn step_never_emits_nan_or_infinity() {
+        let mut rng = 7;
+        for mode in 0..4 {
+            let mut params = [0.0; SOUND_PARAMS];
+            params[1] = (mode as f32 + 0.5) / 4.0;
+            for extreme in [0.0_f32, 1.0] {
+                params[0] = extreme; // decay
+                params[6] = extreme; // drive
+                params[4] = extreme; // spread
+                let mut voice = Voice::default();
+                for i in 0..256 {
+                    let sample = voice.step(
+                        3_000.0,
+                        48_000.0,
+                        (i == 0).then_some(1.0),
+                        &params,
+                        &mut rng,
+                    );
+                    assert!(sample.is_finite());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retrigger_resets_body_and_phases() {
+        let mut params = MachineKind::ElectroPerc.spec().default_params();
+        params[1] = 0.125; // mode 0
+        // Voice that has been running for 64 steps without trigger.
+        let mut voice = Voice::default();
+        let mut rng = 5;
+        for _ in 0..64 {
+            voice.step(220.0, 48_000.0, None, &params, &mut rng);
+        }
+        // Fresh voice with the same rng state and same no-trigger history.
+        let mut fresh_rng = 5;
+        let mut fresh = Voice::default();
+        for _ in 0..64 {
+            fresh.step(220.0, 48_000.0, None, &params, &mut fresh_rng);
+        }
+        // Reset rng to the same state as a fresh voice, then trigger both.
+        rng = 5;
+        fresh_rng = 5;
+        voice.step(220.0, 48_000.0, Some(0.9), &params, &mut rng);
+        fresh.step(220.0, 48_000.0, Some(0.9), &params, &mut fresh_rng);
+        let a = voice.step(220.0, 48_000.0, None, &params, &mut rng);
+        let b = fresh.step(220.0, 48_000.0, None, &params, &mut fresh_rng);
+        assert!((a - b).abs() < 1e-6);
+    }
+
+    #[test]
+    fn trigger_velocity_zero_is_silence_without_clap_pending() {
+        let mut params = MachineKind::ElectroPerc.spec().default_params();
+        params[1] = 0.125; // mode 0
+        let mut voice = Voice::default();
+        let mut rng = 3;
+        let sample = voice.step(240.0, 48_000.0, Some(0.0), &params, &mut rng);
+        assert_eq!(sample, 0.0);
+    }
+
+    #[test]
+    fn no_trigger_returns_silence_when_body_wire_zero_and_not_pending() {
+        let mut params = MachineKind::ElectroPerc.spec().default_params();
+        params[1] = 0.125;
+        let mut voice = Voice::default();
+        let mut rng = 2;
+        assert_eq!(voice.step(240.0, 48_000.0, None, &params, &mut rng), 0.0);
+    }
+
+    #[test]
+    fn clap_pending_continues_while_age_below_four_bursts() {
+        let mut params = MachineKind::ElectroPerc.spec().default_params();
+        params[1] = 0.375; // mode 1 (clap)
+        let mut voice = Voice::default();
+        let mut rng = 11;
+        voice.step(240.0, 48_000.0, Some(0.8), &params, &mut rng);
+        let mut any_nonzero = false;
+        for _ in 0..8 {
+            let sample = voice.step(240.0, 48_000.0, None, &params, &mut rng);
+            if sample != 0.0 {
+                any_nonzero = true;
+            }
+        }
+        assert!(any_nonzero);
+    }
+
+    #[test]
+    fn step_is_bounded_for_extreme_sample_rates() {
+        let mut params = MachineKind::ElectroPerc.spec().default_params();
+        params[1] = 0.625;
+        for sample_rate in [1_000.0, 8_000.0, 96_000.0] {
+            let mut voice = Voice::default();
+            let mut rng = 13;
+            for i in 0..256 {
+                let sample = voice.step(
+                    120.0,
+                    sample_rate,
+                    (i == 0).then_some(1.0),
+                    &params,
+                    &mut rng,
+                );
+                assert!(sample.is_finite());
+                assert!((-1.0..=1.0).contains(&sample));
+            }
+        }
+    }
+
+    #[test]
     fn four_retriggers_stay_bounded_at_every_midi_pitch() {
         for sample_rate in [8_000.0, 48_000.0, 96_000.0] {
             for mode in 0..4 {
