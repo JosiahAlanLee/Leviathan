@@ -3,8 +3,11 @@ package io.github.josiahalanlee.leviathan;
 import android.app.Activity;
 import android.app.NativeActivity;
 import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.ActivityInfo;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.Bundle;
 import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import java.util.Arrays;
@@ -27,6 +30,29 @@ public final class DocumentActivity extends NativeActivity {
     private int requestCode;
     private String sourcePath;
     private volatile String result;
+
+    @Override protected void onCreate(Bundle state) {
+        super.onCreate(state);
+        if (rotationPreferences().getBoolean("follow_device", false)) {
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_FULL_USER);
+        }
+    }
+
+    private SharedPreferences rotationPreferences() {
+        return getSharedPreferences("leviathan-display", MODE_PRIVATE);
+    }
+
+    // Called by Rust on the Java main thread: -1 reads, 0 locks portrait, 1 follows Android.
+    public int rotationPreference(int desired) {
+        SharedPreferences preferences = rotationPreferences();
+        if (desired == 0 || desired == 1) {
+            boolean follow = desired == 1;
+            setRequestedOrientation(follow ? ActivityInfo.SCREEN_ORIENTATION_FULL_USER
+                : ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT);
+            preferences.edit().putBoolean("follow_device", follow).apply();
+        }
+        return preferences.getBoolean("follow_device", false) ? 1 : 0;
+    }
 
     public void launchDocument(int kind, String path) {
         if (kind < WAV || kind > EXPORT_FOLDER || operation != 0) return;
