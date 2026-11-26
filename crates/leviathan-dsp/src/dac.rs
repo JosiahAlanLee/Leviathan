@@ -430,4 +430,98 @@ mod tests {
         );
         assert_eq!(stage.step(0.0, 48_000.0, profile, 1.0), 0.0);
     }
+
+    #[test]
+    fn bypass_returns_input_unchanged_and_resets_state() {
+        let mut stage = DacStage::default();
+        for _ in 0..100 {
+            stage.step(0.5, 48_000.0, ConverterProfile::LinearSigned { bits: 16 }, 0.5);
+        }
+        assert!(stage.held != 0.0 || stage.reconstructed != 0.0);
+        let out = stage.step(0.25, 48_000.0, ConverterProfile::Bypass, 0.0);
+        assert_eq!(out, 0.25);
+        assert_eq!(stage.held, 0.0);
+        assert_eq!(stage.reconstructed, 0.0);
+        assert_eq!(stage.envelope, 0.0);
+        assert_eq!(stage.phase, 1.0);
+    }
+
+    #[test]
+    fn non_finite_input_and_rate_are_sanitized() {
+        let mut stage = DacStage::default();
+        let out = stage.step(f32::NAN, f32::NAN, ConverterProfile::LinearSigned { bits: 16 }, 0.5);
+        assert!(out.is_finite());
+        let out = stage.step(f32::INFINITY, 48_000.0, ConverterProfile::Ym3012Fp, 0.0);
+        assert!(out.is_finite());
+        let mut stage = DacStage::default();
+        let out = stage.step(f32::NEG_INFINITY, f32::INFINITY, ConverterProfile::R2rOffset { skew: 0.5 }, 0.0);
+        assert!(out.is_finite());
+    }
+
+    #[test]
+    fn same_inputs_give_identical_outputs() {
+        let mut a = DacStage::default();
+        let mut b = DacStage::default();
+        for n in 0..2_000 {
+            let input = 0.7 * (n as f32 * 0.013).sin();
+            let profile = match n % 4 {
+                0 => ConverterProfile::LinearSigned { bits: 12 },
+                1 => ConverterProfile::Ym3012Fp,
+                2 => ConverterProfile::R2rOffset { skew: 0.3 },
+                _ => ConverterProfile::CzProvisional { range: CzRange::Syllabic, track: 0.5 },
+            };
+            let oa = a.step(input, 48_000.0, profile, 0.4);
+            let ob = b.step(input, 48_000.0, profile, 0.4);
+            assert_eq!(oa, ob);
+            assert!(oa.is_finite());
+        }
+    }
+
+    #[test]
+    fn linear_signed_output_stays_bounded_and_finite() {
+        let mut stage = DacStage::default();
+        for n in 0..2_000 {
+            let input = 0.9 * (n as f32 * 0.017).sin();
+            let out = stage.step(input, 48_000.0, ConverterProfile::LinearSigned { bits: 8 }, 0.0);
+            assert!(out.is_finite());
+            assert!((-1.0..=1.0).contains(&out));
+        }
+    }
+
+    #[test]
+    fn r2r_output_is_clamped_to_unit_range() {
+        let mut dac = R2r::default();
+        for n in 0..2_000 {
+            let input = (n as f32 * 0.11).sin();
+            let out = dac.step(input, 48_000.0, 0.3, 0.5, 0.5);
+            assert!(out.is_finite());
+            assert!((-1.0..=1.0).contains(&out));
+        }
+    }
+
+    #[test]
+    fn quantize_linear_i16_clamps_bit_depth_to_4_and_16() {
+        assert_eq!(quantize_linear_i16(0x1234, 0), 0x1000);
+        assert_eq!(quantize_linear_i16(0x1234, 32), 0x1234);
+        assert_eq!(quantize_linear_i16(0x1234, 4), 0x1000);
+        assert_eq!(quantize_linear_i16(i16::MIN, 4), i16::MIN & !0x0fff);
+    }
+
+    #[test]
+    fn ym3012_decode_rejects_zero_exponent_words() {
+        assert_eq!(decode_ym3012_word(0x0000), None);
+        assert_eq!(decode_ym3012_word(0x1fff), None);
+        assert_eq!(decode_ym3012_word(0x2000), Some(i16::MIN));
+    }
+
+    #[test]
+    fn cz_quantize_track_is_normalized() {
+        // Track outside [0,1] is treated as clamped, not as a wild gain.
+        let low = cz_quantize(0.1, 0.4, -5.0);
+        let high = cz_quantize(0.1, 0.4, 5.0);
+        let zero = cz_quantize(0.1, 0.4, 0.0);
+        let one = cz_quantize(0.1, 0.4, 1.0);
+        assert_eq!(low, zero);
+        assert_eq!(high, one);
+    }
 }
