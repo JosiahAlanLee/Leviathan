@@ -33,7 +33,15 @@ adb install -r target/debug/apk/leviathan-app.apk
    the edit without stopping the transport. Scroll and edit while playing and
    listen for clicks or dropouts. Check that editing and playing state remain
    distinct while queuing a pattern from Song.
-3. Switch away and back, then unplug/reconnect wired audio. Record what happens;
+3. Select a populated cell, then scrub the value strip above the grid. Up raises
+   the value, down lowers it, and a floating readout stays clear of the finger.
+   Modes: Note, Velocity, Nudge (1/48 row), and Lock (choose a macro first).
+   Undo should restore the whole gesture in one action. Scroll by dragging the
+   grid, not the strip. The normal piano strip still inserts notes.
+4. Try **FILL hold** (release to clear) and **FILL latch** (tap again to clear).
+   Use a step set to play only on FILL; release hold while latch is on to verify
+   that latch stays active.
+5. Switch away and back, then unplug/reconnect wired audio. Record what happens;
    correct Android audio focus, stream recovery and lifecycle are still work
    to validate before this preview is suitable for live use.
 
