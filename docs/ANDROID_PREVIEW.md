@@ -58,7 +58,15 @@ for the item the user selects; it does not need broad storage access.
    project**, and inspect any chosen output before treating it as a backup.
    This recovers the saved project state, not unsplit waveform edits or an
    in-progress render.
-7. Switch away while playing, return, and unplug/reconnect audio. The document
+7. Portrait remains the default. Turn on **Follow device rotation** beside
+   the deck tabs and rotate the unlocked tablet. On a wide window the left
+   rail has transport and the first six notes; the right rail has the other
+   six notes and octave controls. Check both landscape directions, unlock and
+   relock portrait, and return to the same pattern and waveform edit. Try
+   split-screen, taskbar changes and display scaling while playing; the app
+   handles more configuration changes in place, but Android can still
+   recreate the process. The rotation preference persists across restarts.
+8. Switch away while playing, return, and unplug/reconnect audio. The document
    picker, audio-focus/recovery, and behavior under activity or process
    recreation still require physical-device verification; host and build
    checks are not a substitute.
