@@ -1,3 +1,5 @@
+#[cfg(target_os = "android")]
+mod android_files;
 mod audio;
 mod audition;
 mod capture;
@@ -23,8 +25,13 @@ mod sampler_ui;
 mod session_ui;
 mod shader_bus;
 mod smf;
+#[cfg(any(target_os = "android", test))]
+mod tablet_ui;
+#[cfg(any(target_os = "android", test))]
+mod system_bars;
 mod tracker_edit;
 mod tracker_keys;
+mod visual_sampler;
 mod wav;
 mod workflow_ui;
 
@@ -203,6 +210,18 @@ struct LeviathanApp {
     followed_row: Option<(usize, usize)>,
     playing: bool,
     fill_active: bool,
+    #[cfg(target_os = "android")]
+    touch_fill: tablet_ui::TouchFill,
+    #[cfg(any(target_os = "android", test))]
+    tablet_scrub: tablet_ui::TabletScrub,
+    #[cfg(test)]
+    exercise_tablet_layout: bool,
+    #[cfg(test)]
+    simulated_system_bars: Option<system_bars::Edges>,
+    #[cfg(target_os = "android")]
+    system_bars: Option<system_bars::SystemBars>,
+    #[cfg(target_os = "android")]
+    android_files: Option<android_files::Files>,
     bpm: f64,
     master_send: f32,
     delay_mode: DelayMode,
@@ -224,6 +243,9 @@ struct LeviathanApp {
     rework: rework_ui::ReworkUi,
     echo_timing: leviathan_dsp::echo::Timing,
     show_kit: bool,
+    show_waveform: bool,
+    visual_sampler: visual_sampler::VisualSampler,
+    split_undo: Option<(kit::Kit, kit::Kit)>,
     kit_sounding: [u8; NUM_LANES],
     capture_kit_slot: Option<usize>,
     routed_byte: Option<u8>,
@@ -243,6 +265,14 @@ struct LeviathanApp {
 
 impl LeviathanApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        #[cfg(target_os = "android")]
+        let mut app = {
+            log::info!("Creating tracker with audio disabled");
+            let app = Self::with_audio(cc, |_, _, _, _, _| Err("Audio not started".into()));
+            log::info!("Tracker constructed");
+            app
+        };
+        #[cfg(not(target_os = "android"))]
         let mut app = Self::with_audio(cc, try_start_audio);
         if cfg!(target_os = "android") {
             app.deck = Deck::Grid;
@@ -315,6 +345,18 @@ impl LeviathanApp {
             followed_row: None,
             playing: false,
             fill_active: false,
+            #[cfg(target_os = "android")]
+            touch_fill: tablet_ui::TouchFill::default(),
+            #[cfg(any(target_os = "android", test))]
+            tablet_scrub: tablet_ui::TabletScrub::default(),
+            #[cfg(test)]
+            exercise_tablet_layout: false,
+            #[cfg(test)]
+            simulated_system_bars: None,
+            #[cfg(target_os = "android")]
+            system_bars: None,
+            #[cfg(target_os = "android")]
+            android_files: None,
             bpm: 132.0,
             master_send: 0.0,
             delay_mode: DelayMode::default(),
@@ -348,6 +390,9 @@ impl LeviathanApp {
             rework: rework_ui::ReworkUi::default(),
             echo_timing: Default::default(),
             show_kit: false,
+            show_waveform: true,
+            visual_sampler: visual_sampler::VisualSampler::default(),
+            split_undo: None,
             kit_sounding: [0; NUM_LANES],
             capture_kit_slot: None,
             routed_byte: None,
@@ -375,33 +420,153 @@ impl LeviathanApp {
     }
 
     #[cfg(target_os = "android")]
-    fn draw_touch_notes(&mut self, ui: &mut egui::Ui, pattern: usize) {
+    #[inline(never)]
+    fn start_diagnostic_audio(&mut self) {
+        log::info!("Starting AAudio on request");
+        let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(256);
+        let (tel_tx, tel_rx) = rtrb::RingBuffer::new(256);
+        let (capture_port, recorder) = Recorder::channel();
+        let (_, midi_events) = MidiControls::new();
+        match try_start_audio(self.patterns[0].clone(), cmd_rx, tel_tx, midi_events, recorder) {
+            Ok((stream, label)) => {
+                self._audio_stream = Some(stream);
+                self.audio = AudioControl::new(cmd_tx);
+                self.tel_rx = tel_rx;
+                self.capture_port = capture_port;
+                self.offline_player = None;
+                self.offline_clock = None;
+                self.playing = false;
+                self.applied_play_request = self.play_request;
+                self.send_audio(AudioCommand::ReplaceProject(Arc::new(AudioProject::prepare(
+                    &self.project_snapshot(),
+                    self.project_generation,
+                ))));
+                self.send_audio(AudioCommand::SetMidiTarget(self.midi_target));
+                self.send_audio(AudioCommand::SetFill(self.fill_active));
+                log::info!("Started {label}");
+                self.audio_status = label;
+            }
+            Err(error) => {
+                log::error!("AAudio start failed: {error}");
+                self.audio_status = error;
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn draw_touch_notes(&mut self, ui: &mut egui::Ui, pattern: usize, portrait: bool) {
         const KEYS: [&str; 12] = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"];
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Oct −").clicked() {
-                self.cursor.base_octave = (self.cursor.base_octave - 1).max(1);
+        let enabled = self.cursor.row < self.patterns[pattern].length;
+        let octave = |app: &mut Self, ui: &mut egui::Ui| {
+            if ui.add(egui::Button::new("Oct −").min_size(egui::vec2(46.0, 36.0))).clicked() {
+                app.cursor.base_octave = (app.cursor.base_octave - 1).max(1);
             }
-            if ui.button("Oct +").clicked() {
-                self.cursor.base_octave = (self.cursor.base_octave + 1).min(6);
+            if ui.add(egui::Button::new("Oct +").min_size(egui::vec2(46.0, 36.0))).clicked() {
+                app.cursor.base_octave = (app.cursor.base_octave + 1).min(6);
             }
-            for (semitone, name) in KEYS.iter().enumerate() {
-                if ui.add_sized([36.0, 40.0], egui::Button::new(*name)).clicked() {
-                    let midi = ((self.cursor.base_octave + 1) * 12 + semitone as i32) as u8;
-                    let update = self.cursor.enter_note(
-                        &mut self.patterns[pattern],
-                        &mut self.histories[pattern],
-                        midi,
-                        None,
-                    );
-                    self.send_audio(AudioCommand::SetCell {
-                        pattern,
-                        lane: update.lane,
-                        row: update.row,
-                        cell: update.cell,
-                    });
+        };
+        let key = |app: &mut Self, ui: &mut egui::Ui, semitone: usize, width: f32| {
+            if ui.add_enabled(
+                enabled,
+                egui::Button::new(KEYS[semitone]).min_size(egui::vec2(width, 44.0)),
+            ).clicked() {
+                let midi = ((app.cursor.base_octave + 1) * 12 + semitone as i32) as u8;
+                app.enter_touch_note(pattern, midi);
+            }
+        };
+        if portrait {
+            ui.horizontal(|ui| {
+                octave(self, ui);
+                ui.label(format!("Octave {}", self.cursor.base_octave));
+            });
+            let width = ((ui.available_width() - ui.spacing().item_spacing.x * 5.0) / 6.0)
+                .max(24.0).floor();
+            for offset in [0, 6] {
+                ui.horizontal(|ui| {
+                    for semitone in offset..offset + 6 {
+                        key(self, ui, semitone, width);
+                    }
+                });
+            }
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                octave(self, ui);
+                for semitone in 0..KEYS.len() {
+                    key(self, ui, semitone, 36.0);
                 }
-            }
+            });
+        }
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn enter_touch_note(&mut self, pattern: usize, midi: u8) {
+        let length = self.patterns[pattern].length.clamp(1, ROWS_PER_PATTERN);
+        if self.cursor.row >= length {
+            return;
+        }
+        let update = self.cursor.enter_note(
+            &mut self.patterns[pattern],
+            &mut self.histories[pattern],
+            midi,
+            None,
+        );
+        self.cursor.row = (update.row + self.cursor.edit_step) % length;
+        self.send_audio(AudioCommand::SetCell {
+            pattern,
+            lane: update.lane,
+            row: update.row,
+            cell: update.cell,
         });
+        // The worker checks the actual transport state at the callback boundary.
+        self.send_audio(AudioCommand::PreviewStep {
+            lane: update.lane,
+            cell: update.cell,
+        });
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn draw_tablet_scrub(&mut self, ui: &mut egui::Ui, pattern: usize) {
+        let lane = self.cursor.lane;
+        let row = self.cursor.row;
+        let cell = self.patterns[pattern].lanes[lane][row];
+        let patch = self.lane_patches[lane];
+        let enabled = row < self.patterns[pattern].length;
+        if let Some((mut drag, up)) =
+            self.tablet_scrub.draw(ui, (pattern, lane, row), cell, &patch, enabled)
+        {
+            self.apply_tablet_scrub(pattern, lane, row, &mut drag, up);
+            if drag.recorded_undo {
+                self.tablet_scrub.mark_edit_recorded();
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn apply_tablet_scrub(
+        &mut self,
+        pattern: usize,
+        lane: usize,
+        row: usize,
+        drag: &mut tablet_ui::ScrubDrag,
+        up: f32,
+    ) {
+        let cell = drag.cell_at(up, &self.lane_patches[lane]);
+        if self.patterns[pattern].lanes[lane][row] == cell {
+            return;
+        }
+        if !drag.recorded_undo {
+            self.histories[pattern].record_before_edit(&self.patterns[pattern]);
+            drag.recorded_undo = true;
+        }
+        self.patterns[pattern].lanes[lane][row] = cell;
+        self.send_audio(AudioCommand::SetCell { pattern, lane, row, cell });
+    }
+
+    fn set_fill(&mut self, active: bool) {
+        if self.fill_active != active {
+            self.fill_active = active;
+            self.send_audio(AudioCommand::SetFill(active));
+        }
     }
 
     fn send_audio(&mut self, command: AudioCommand) {
@@ -887,10 +1052,6 @@ impl LeviathanApp {
     }
 
     fn draw_samples_deck(&mut self, ui: &mut egui::Ui, hovering_wav: bool) -> Vec<BankAction> {
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.show_kit, false, "Capture and Banks");
-            ui.selectable_value(&mut self.show_kit, true, "OtisKit");
-        });
         let selected = self.show_kit.then_some(self.kit_ui.slot);
         match self.rack_panel.draw_capture(
             ui,
@@ -965,6 +1126,150 @@ impl LeviathanApp {
         } else {
             self.sampler_ui.draw(ui, hovering_wav)
         }
+    }
+
+    #[cfg(target_os = "android")]
+    fn request_android_file(&mut self, kind: android_files::Kind, ctx: &egui::Context) {
+        if !self.android_files.as_ref().is_some_and(|files| !files.pending()) { return; }
+        let data = if matches!(kind, android_files::Kind::Save) {
+            project::encode(self.project_snapshot())
+        } else {
+            Ok(Vec::new())
+        };
+        let files = self.android_files.as_mut().unwrap();
+        match data {
+            Ok(bytes) => files.launch(kind, bytes, ctx),
+            Err(error) => files.status = error,
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    fn poll_android_files(&mut self, ctx: &egui::Context) {
+        use android_files::{Kind, Reply};
+        let Some((kind, reply)) = self.android_files.as_mut().and_then(|files| files.poll(ctx)) else { return };
+        let status = match (kind, reply) {
+            (Kind::Wav, Reply::File(path, name)) => {
+                self.visual_sampler.load(path, Some(name), true, ctx);
+                "WAV selected.".into()
+            }
+            (Kind::Open, Reply::File(path, _)) => {
+                let result = project::load(&path);
+                let _ = std::fs::remove_file(path);
+                match result {
+                    Ok(project) => {
+                        self.install_project(project);
+                        "Opened project.".into()
+                    }
+                    Err(error) => error,
+                }
+            }
+            (_, Reply::Saved) => "Saved a project copy.".into(),
+            (_, Reply::Cancelled) => "Files closed without changes.".into(),
+            (_, Reply::Failed(error)) => error,
+            (_, Reply::File(path, _)) => {
+                let _ = std::fs::remove_file(path);
+                "Unexpected file result.".into()
+            }
+        };
+        self.android_files.as_mut().unwrap().status = status;
+    }
+
+    fn draw_visual_sampler(&mut self, ui: &mut egui::Ui) {
+        let actions = self.visual_sampler.draw(
+            ui, &self.instruments.kit, self._audio_stream.is_some(), self.split_undo.is_some(),
+        );
+        if let Some(request) = actions.audio {
+            match request {
+                Some(request) => self.send_audio(AudioCommand::Audition(Arc::new(request))),
+                None => self.send_audio(AudioCommand::StopAudition),
+            }
+        }
+        #[cfg(target_os = "android")]
+        if actions.open {
+            self.request_android_file(android_files::Kind::Wav, ui.ctx());
+        }
+        if let Some(first) = actions.commit {
+            self.visual_sampler.status = match self.commit_visual_split(first) {
+                Ok(()) => "Slices copied to OtisKit. Select a slot and Enter hit on an OtisKit lane.".into(),
+                Err(error) => error,
+            };
+        }
+        if actions.undo {
+            self.visual_sampler.status = match self.undo_visual_split() {
+                Ok(()) => "Restored kit before the split.".into(),
+                Err(error) => error,
+            };
+        }
+        let slot = self.visual_sampler.lane_slot;
+        if actions.hear_slot {
+            if let Some(sample) = self.instruments.kit.samples[slot].clone() {
+                let request = rework_ui::kit_audition(sample, self.instruments.kit.params[slot]);
+                self.send_audio(AudioCommand::Audition(Arc::new(request)));
+            }
+        }
+        if actions.enter {
+            self.visual_sampler.status = match self.enter_visual_hit(slot) {
+                Ok(()) => format!("Entered slot {}.", slot + 1),
+                Err(error) => error,
+            };
+        }
+    }
+
+    fn commit_visual_split(&mut self, first: usize) -> Result<(), String> {
+        let next = self.visual_sampler.make_kit(&self.instruments.kit, first)?;
+        let mut check = self.project_snapshot();
+        check.instruments.kit = next.clone();
+        // Validate the real serialized budget before modifying UI/audio state.
+        project::encode(check)?;
+        let previous = std::mem::replace(&mut self.instruments.kit, next.clone());
+        self.split_undo = Some((previous, next));
+        self.publish_kit();
+        Ok(())
+    }
+
+    fn undo_visual_split(&mut self) -> Result<(), String> {
+        let (before, after) = self.split_undo.as_ref().ok_or("No sampler split to undo.")?;
+        let kit = &self.instruments.kit;
+        if kit.params != after.params || kit.lanes != after.lanes ||
+            !kit.samples.iter().zip(&after.samples).all(|(a, b)|
+                a.as_ref().map(|s| s.generation()) == b.as_ref().map(|s| s.generation()))
+        {
+            self.split_undo = None;
+            return Err("The kit changed after the split; undo would discard later edits.".into());
+        }
+        self.instruments.kit = before.clone();
+        self.split_undo = None;
+        self.publish_kit();
+        Ok(())
+    }
+
+    fn enter_visual_hit(&mut self, slot: usize) -> Result<(), String> {
+        let (pattern, lane, row) = (self.selected_pattern, self.cursor.lane, self.cursor.row);
+        let cells = &mut self.patterns[pattern];
+        if row >= cells.length || cells.lanes[lane][row].active {
+            return Err("Select an empty step inside the active pattern.".into());
+        }
+        if self.instruments.kit.samples.get(slot).and_then(Option::as_ref).is_none() {
+            return Err("Choose a filled kit slot.".into());
+        }
+        let patch = self.lane_patches[lane];
+        if patch.machine != MachineKind::OtisKit || self.instruments.kit.lanes[lane].bytebus {
+            return Err("Select a note-addressed OtisKit lane in Voice / Trig or Grid.".into());
+        }
+        let config = EngineConfig::default();
+        let midi = leviathan_dsp::otis_kit::note_for_slot(
+            slot, patch.params[0], config.pitch_zero, config.key_offset,
+        ).ok_or("No native-pitch note for the selected slot.")?;
+        let cell = NoteCell { active: true, midi, velocity: 100, ..NoteCell::default() };
+        self.histories[pattern].record_before_edit(cells);
+        cells.lanes[lane][row] = cell;
+        let next_row = (row + self.cursor.edit_step) % cells.length;
+        self.cursor.select(lane, next_row, SubColumn::Note, false);
+        self.cursor.moved_this_frame = true;
+        self.send_audio(AudioCommand::SetCell { pattern, lane, row, cell });
+        #[cfg(target_os = "android")]
+        self.send_audio(AudioCommand::PreviewStep { lane, cell });
+        Ok(())
     }
 
     fn publish_kit(&mut self) {
@@ -1241,6 +1546,8 @@ impl LeviathanApp {
 
     fn install_project(&mut self, project: project::Project) {
         self.project_generation = self.project_generation.wrapping_add(1);
+        self.visual_sampler = visual_sampler::VisualSampler::default();
+        self.split_undo = None;
         let prepared = Arc::new(AudioProject::prepare(&project, self.project_generation));
         self.bpm = project.bpm;
         self.master_send = project.master_send;
@@ -1276,6 +1583,11 @@ impl LeviathanApp {
         self.midi.record_armed = false;
         self.midi.events.discard_pending();
         self.fill_active = false;
+        #[cfg(target_os = "android")]
+        {
+            self.touch_fill = tablet_ui::TouchFill::default();
+            self.tablet_scrub.end_drag();
+        }
         self.inspector_drag_recorded = false;
         self.cursor = TrackerCursor::default();
         self.latest_cv = CvFrame::default();
@@ -1293,6 +1605,17 @@ impl LeviathanApp {
 
 impl eframe::App for LeviathanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "android")]
+        if let Some(system_bars) = &mut self.system_bars {
+            system_bars.update(ctx).reserve(ctx);
+        }
+        #[cfg(test)]
+        if let Some(system_bars) = self.simulated_system_bars {
+            system_bars.reserve(ctx);
+        }
+
+        #[cfg(target_os = "android")]
+        self.poll_android_files(ctx);
         self.audio.flush();
         self.export_ui.poll(ctx);
         let mut peaks = MasterPeaks::default();
@@ -1378,7 +1701,25 @@ impl eframe::App for LeviathanApp {
 
         let (file, arrangement) = egui::TopBottomPanel::top("project_and_patterns")
             .show(ctx, |ui| {
+                #[cfg(not(target_os = "android"))]
                 let file = self.project_ui.toolbar(ui, &mut self.export_ui);
+                #[cfg(target_os = "android")]
+                let file = {
+                    ui.horizontal_wrapped(|ui| {
+                        let ready = self.android_files.as_ref().is_some_and(|f| !f.pending());
+                        if ui.add_enabled(ready, egui::Button::new("Open project")).clicked() {
+                            self.request_android_file(android_files::Kind::Open, ui.ctx());
+                        }
+                        if ui.add_enabled(ready, egui::Button::new("Save a copy")).clicked() {
+                            self.request_android_file(android_files::Kind::Save, ui.ctx());
+                        }
+                        if let Some(files) = &self.android_files {
+                            if !files.status.is_empty() { ui.small(&files.status); }
+                        }
+                        self.export_ui.toolbar(ui, ready);
+                    });
+                    None
+                };
                 let arrangement = session_ui::draw_pattern_bar(
                     ui,
                     &self.patterns,
@@ -1447,7 +1788,17 @@ impl eframe::App for LeviathanApp {
         self.cursor.moved_this_frame |= pattern_changed;
         self.read_midi(ctx, modal_open);
         self.sync_midi_target();
-        let (hovering_wav, mut bank_actions) = self.sampler_ui.poll_drag_and_drop(ctx);
+        if self.visual_sampler.poll() {
+            self.send_audio(AudioCommand::StopAudition);
+        }
+        let visual_drop = self.deck == Deck::Samples && self.show_waveform
+            && !modal_open && self.visual_sampler.accepts_drop(ctx);
+        let (hovering_wav, mut bank_actions) = if visual_drop {
+            self.visual_sampler.use_drop(ctx);
+            (false, Vec::new())
+        } else {
+            self.sampler_ui.poll_drag_and_drop(ctx)
+        };
         let hovering_wgsl = self.viewport.poll_shader_drop(ctx);
         self.viewport.poll_hot_reload(now);
         self.advance_offline_transport(now);
@@ -1481,6 +1832,10 @@ impl eframe::App for LeviathanApp {
         egui::TopBottomPanel::top("transport_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("LEVIATHAN");
+                #[cfg(target_os = "android")]
+                if self._audio_stream.is_none() && ui.button("Enable audio").clicked() {
+                    self.start_diagnostic_audio();
+                }
                 ui.separator();
                 let (label, tip) = if self.playing {
                     ("Pause", "Pause transport at its current position (Space)")
@@ -1499,9 +1854,14 @@ impl eframe::App for LeviathanApp {
                 if ui.button("Reset").clicked() {
                     self.send_audio(AudioCommand::Reset);
                 }
+                #[cfg(target_os = "android")]
+                {
+                    let active = self.touch_fill.draw(ui, !modal_open);
+                    self.set_fill(active);
+                }
+                #[cfg(not(target_os = "android"))]
                 if ui.selectable_label(self.fill_active, "FILL").clicked() {
-                    self.fill_active = !self.fill_active;
-                    self.send_audio(AudioCommand::SetFill(self.fill_active));
+                    self.set_fill(!self.fill_active);
                 }
                 ui.separator();
                 ui.label("BPM");
@@ -1581,42 +1941,88 @@ impl eframe::App for LeviathanApp {
             });
         });
 
-        let mut song_action = None;
-        if self.deck != Deck::Grid {
-            let width = (ctx.screen_rect().width() * 0.35).clamp(320.0, 420.0);
-            egui::SidePanel::right("workflow_deck")
-                .resizable(false)
-                .exact_width(width)
-                .show(ctx, |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt((self.deck, self.deck == Deck::Voice && self.edit_lane_patch))
-                        .show(ui, |ui| match self.deck {
-                            Deck::Grid => {}
-                            Deck::Voice => self.draw_voice_deck(ui),
-                            Deck::Mixer => self.draw_mixer_deck(ui),
-                            Deck::Routing => self.draw_routing_deck(ui),
-                            Deck::Samples => {
-                                bank_actions.extend(self.draw_samples_deck(ui, hovering_wav))
-                            }
-                            Deck::Scene => {
-                                if let Some(preview) = preview {
-                                    self.draw_scene_deck(ui, preview, hovering_wgsl);
-                                } else {
-                                    ui.label("Shader feedback is disabled in the Android preview.");
-                                }
-                            }
-                            Deck::Song => {
-                                song_action = session_ui::draw_song(
-                                    ui,
-                                    &self.patterns,
-                                    selected,
-                                    &self.chain,
-                                    self.latest_song,
-                                    self.playing,
-                                );
-                            }
-                        });
+        if self.deck == Deck::Samples {
+            egui::TopBottomPanel::top("sampler_views").show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.selectable_label(self.show_waveform, "Waveform").clicked() {
+                        self.show_waveform = true;
+                    }
+                    if ui.selectable_label(!self.show_waveform && !self.show_kit, "Capture and Banks").clicked() {
+                        self.show_waveform = false;
+                        self.show_kit = false;
+                    }
+                    if ui.selectable_label(!self.show_waveform && self.show_kit, "OtisKit").clicked() {
+                        self.show_waveform = false;
+                        self.show_kit = true;
+                    }
                 });
+            });
+        }
+        let waveform_deck = self.deck == Deck::Samples && self.show_waveform;
+
+        #[allow(unused_mut)]
+        let mut touch_layout = cfg!(target_os = "android");
+        #[cfg(test)]
+        { touch_layout |= self.exercise_tablet_layout; }
+        let screen = ctx.screen_rect();
+        let portrait = touch_layout && screen.height() > screen.width();
+
+        #[cfg(any(target_os = "android", test))]
+        if portrait && !waveform_deck {
+            egui::TopBottomPanel::bottom("portrait_note_keys").show(ctx, |ui| {
+                ui.add_enabled_ui(!modal_open, |ui| self.draw_touch_notes(ui, selected, true));
+            });
+        }
+
+        let mut song_action = None;
+        if self.deck != Deck::Grid && !waveform_deck {
+            let draw_deck = |ui: &mut egui::Ui| {
+                let scroll = if portrait {
+                    egui::ScrollArea::both()
+                } else {
+                    egui::ScrollArea::vertical()
+                };
+                scroll
+                    .id_salt((self.deck, self.deck == Deck::Voice && self.edit_lane_patch))
+                    .show(ui, |ui| match self.deck {
+                        Deck::Grid => {}
+                        Deck::Voice => self.draw_voice_deck(ui),
+                        Deck::Mixer => self.draw_mixer_deck(ui),
+                        Deck::Routing => self.draw_routing_deck(ui),
+                        Deck::Samples => {
+                            bank_actions.extend(self.draw_samples_deck(ui, hovering_wav))
+                        }
+                        Deck::Scene => {
+                            if let Some(preview) = preview {
+                                self.draw_scene_deck(ui, preview, hovering_wgsl);
+                            } else {
+                                ui.label("Shader feedback is disabled in the Android preview.");
+                            }
+                        }
+                        Deck::Song => {
+                            song_action = session_ui::draw_song(
+                                ui,
+                                &self.patterns,
+                                selected,
+                                &self.chain,
+                                self.latest_song,
+                                self.playing,
+                            );
+                        }
+                    });
+            };
+            if portrait {
+                let height = (screen.height() * 0.24).clamp(100.0, 270.0);
+                egui::TopBottomPanel::bottom("portrait_workflow_deck")
+                    .exact_height(height)
+                    .show(ctx, draw_deck);
+            } else {
+                let width = (screen.width() * 0.35).clamp(320.0, 420.0);
+                egui::SidePanel::right("workflow_deck")
+                    .resizable(false)
+                    .exact_width(width)
+                    .show(ctx, draw_deck);
+            }
         }
         if !ctx.input(|i| i.pointer.any_down()) {
             self.inspector_drag_recorded = false;
@@ -1642,9 +2048,22 @@ impl eframe::App for LeviathanApp {
         }
 
         let tracker = egui::CentralPanel::default().show(ctx, |ui| {
-            #[cfg(target_os = "android")]
-            if !modal_open {
-                self.draw_touch_notes(ui, selected);
+            if waveform_deck {
+                egui::ScrollArea::vertical().id_salt("waveform_deck").show(ui, |ui| {
+                    ui.add_enabled_ui(!modal_open, |ui| self.draw_visual_sampler(ui));
+                });
+                return None;
+            }
+            #[cfg(any(target_os = "android", test))]
+            if touch_layout {
+                if !modal_open {
+                    self.draw_tablet_scrub(ui, selected);
+                    if !portrait {
+                        self.draw_touch_notes(ui, selected, false);
+                    }
+                } else {
+                    self.tablet_scrub.end_drag();
+                }
             }
             let pattern_length = self.patterns[selected].length;
             let has_chain = !self.chain.as_slice().is_empty();
@@ -1735,15 +2154,28 @@ impl eframe::App for LeviathanApp {
             let sel_rect = self.cursor.active_rect();
             let pat_len = self.patterns[selected].length;
 
+            let lane_width = ((ui.available_width() - 36.0
+                - ui.spacing().item_spacing.x * NUM_LANES as f32) / NUM_LANES as f32)
+                .max(36.0).floor();
             egui::ScrollArea::both().id_salt("tracker_scroll").show(ui, |ui| {
                 egui::Grid::new("score_v3_grid")
                     .striped(true)
-                    .min_col_width(75.0)
+                    .min_col_width(if portrait { 0.0 } else { 75.0 })
                     .show(ui, |ui| {
                         ui.monospace("ROW");
                         for (lane, patch) in self.lane_patches.iter().enumerate() {
                             let name = format!("{} {}", lane + 1, patch.machine.short_name());
-                            self.lane_mix.header(ui, &name, lane);
+                            if portrait {
+                                let button = egui::Button::new(egui::RichText::new(&name).monospace())
+                                    .truncate().selected(lane == cur_lane);
+                                if ui.add_sized([lane_width, 28.0], button)
+                                    .on_hover_text(&name).clicked()
+                                {
+                                    self.cursor.select(lane, cur_row, SubColumn::Note, false);
+                                }
+                            } else {
+                                self.lane_mix.header(ui, &name, lane);
+                            }
                         }
                         ui.end_row();
 
@@ -1785,6 +2217,37 @@ impl eframe::App for LeviathanApp {
                                 } else {
                                     format!("---{mark}")
                                 };
+                                if portrait {
+                                    let here = cur_lane == lane && cur_row == row;
+                                    let tone = if row >= pat_len || !cell.active {
+                                        egui::Color32::from_rgb(125, 130, 140)
+                                    } else {
+                                        egui::Color32::from_rgb(220, 235, 255)
+                                    };
+                                    let button = egui::Button::new(
+                                        egui::RichText::new(note_str).monospace().color(tone),
+                                    ).truncate().selected(here || (sel_rect.is_multi_cell()
+                                        && sel_rect.contains(lane, row)));
+                                    let response = ui.add_sized([lane_width, 30.0], button);
+                                    if response.clicked() {
+                                        self.cursor.select(lane, row, SubColumn::Note,
+                                            ui.input(|i| i.modifiers.shift));
+                                    }
+                                    if response.double_clicked() && row < pat_len {
+                                        self.histories[selected]
+                                            .record_before_edit(&self.patterns[selected]);
+                                        let note = &mut self.patterns[selected].lanes[lane][row];
+                                        note.active = !note.active;
+                                        let cell = *note;
+                                        self.send_audio(AudioCommand::SetCell {
+                                            pattern: selected, lane, row, cell,
+                                        });
+                                    }
+                                    if here && scroll_to_cursor {
+                                        response.scroll_to_me(None);
+                                    }
+                                    continue;
+                                }
                                 let vel_str = if cell.active {
                                     format!("{:02X}", cell.velocity)
                                 } else {
@@ -1949,20 +2412,38 @@ pub fn run_desktop() -> eframe::Result<()> {
 #[cfg(target_os = "android")]
 #[no_mangle]
 fn android_main(app: winit::platform::android::activity::AndroidApp) {
+    android_logger::init_once(
+        android_logger::Config::default().with_tag("Leviathan").with_max_level(log::LevelFilter::Info),
+    );
+    std::panic::set_hook(Box::new(|info| log::error!("{info}")));
+    log::info!("NativeActivity entered; starting GLES tracker");
     let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Glow,
         android_app: Some(app),
         ..eframe::NativeOptions::default()
     };
     if let Err(error) = run_tracker(options) {
-        eprintln!("Could not launch Leviathan: {error}");
+        log::error!("Could not launch Leviathan: {error}");
     }
 }
 
 fn run_tracker(options: eframe::NativeOptions) -> eframe::Result<()> {
+    #[cfg(target_os = "android")]
+    let android_app = options.android_app.clone();
     eframe::run_native(
         "Leviathan -- Rust A/V Tracker",
         options,
-        Box::new(|cc| Ok(Box::new(LeviathanApp::new(cc)))),
+        Box::new(move |cc| {
+            let app = LeviathanApp::new(cc);
+            #[cfg(target_os = "android")]
+            let app = {
+                let mut app = app;
+                app.system_bars = android_app.clone().map(system_bars::SystemBars::new);
+                app.android_files = android_app.map(android_files::Files::new);
+                app
+            };
+            Ok(Box::new(app))
+        }),
     )
 }
 
@@ -1997,10 +2478,19 @@ mod tests {
     }
 
     fn frame(ctx: &egui::Context, app: &mut LeviathanApp, events: Vec<Event>) -> egui::FullOutput {
+        frame_at(ctx, app, egui::vec2(1280.0, 840.0), events)
+    }
+
+    fn frame_at(
+        ctx: &egui::Context,
+        app: &mut LeviathanApp,
+        size: egui::Vec2,
+        events: Vec<Event>,
+    ) -> egui::FullOutput {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(1280.0, 840.0),
+                size,
             )),
             events,
             ..egui::RawInput::default()
@@ -2035,6 +2525,170 @@ mod tests {
         };
         frame(ctx, app, vec![Event::PointerMoved(position), pointer(true)]);
         frame(ctx, app, vec![pointer(false)]);
+    }
+
+    #[test]
+    fn tablet_scrub_uses_one_undo_and_sends_real_cell_commands() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        let (tx, mut rx) = rtrb::RingBuffer::new(16);
+        app.audio = AudioControl::new(tx);
+        app.offline_player = None;
+        let original = app.patterns[0].lanes[0][0];
+        assert!(original.active);
+        let mut gesture = tablet_ui::ScrubDrag::new(tablet_ui::ScrubMode::Note, original);
+        app.apply_tablet_scrub(0, 0, 0, &mut gesture, 0.0);
+        assert_eq!(app.histories[0].undo_len(), 0);
+        assert!(rx.pop().is_err());
+        app.apply_tablet_scrub(0, 0, 0, &mut gesture, 8.0);
+        app.apply_tablet_scrub(0, 0, 0, &mut gesture, 24.0);
+        assert_eq!(app.patterns[0].lanes[0][0].midi, original.midi + 3);
+        for semitones in [1, 3] {
+            assert!(matches!(rx.pop(), Ok(AudioCommand::SetCell {
+                pattern: 0, lane: 0, row: 0, cell,
+            }) if cell.midi == original.midi + semitones));
+        }
+        assert_eq!(app.histories[0].undo_len(), 1);
+        app.step_history(0, false);
+        assert_eq!(app.patterns[0].lanes[0][0], original);
+    }
+
+    #[test]
+    fn portrait_keeps_six_lanes_and_the_note_keyboard_in_view() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        app.deck = Deck::Grid;
+        app.exercise_tablet_layout = true;
+        app.simulated_system_bars = Some(system_bars::Edges {
+            top: 36,
+            bottom: 56,
+            left: 8,
+            right: 8,
+        });
+        let size = egui::vec2(600.0, 900.0);
+
+        fn bounds(output: &egui::FullOutput, label: &str) -> egui::Rect {
+            output.shapes.iter().find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    if text.galley.text() == label {
+                        let rect = text.visual_bounding_rect();
+                        assert!(shape.clip_rect.contains_rect(rect), "{label} is clipped");
+                        return Some(rect);
+                    }
+                }
+                None
+            }).unwrap_or_else(|| panic!("Missing {label}"))
+        }
+
+        let output = frame_at(&ctx, &mut app, size, Vec::new());
+        let last_lane = format!("6 {}", app.lane_patches[5].machine.short_name());
+        let first_lane = format!("1 {}", app.lane_patches[0].machine.short_name());
+        let first = bounds(&output, &first_lane);
+        let last = bounds(&output, &last_lane);
+        assert!(first.max.x < last.min.x && last.max.x < size.x);
+        let c = bounds(&output, "C");
+        let b = bounds(&output, "B");
+        assert!(last.max.y < c.min.y && c.max.y < b.min.y && b.max.y < size.y);
+        let play = bounds(&output, "Play");
+        assert!(play.min.y >= 36.0 && play.max.y < first.min.y);
+        assert!(first.min.x >= 8.0 && last.max.x <= size.x - 8.0);
+        assert!(b.max.y <= size.y - 56.0);
+
+        // If Android hides navigation, reclaim the bottom rather than using a fixed pad.
+        app.simulated_system_bars.as_mut().unwrap().bottom = 0;
+        let no_nav = frame_at(&ctx, &mut app, size, Vec::new());
+        assert!(bounds(&no_nav, "B").min.y >= b.min.y + 55.0);
+        app.simulated_system_bars.as_mut().unwrap().bottom = 56;
+
+        // With an inspector open, the grid and keyboard still share the screen.
+        app.deck = Deck::Mixer;
+        let output = frame_at(&ctx, &mut app, size, Vec::new());
+        assert!(bounds(&output, &last_lane).max.y < bounds(&output, "C").min.y);
+    }
+
+    #[test]
+    fn visual_sampler_actions_fit_in_the_portrait_safe_area() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        app.exercise_tablet_layout = true;
+        app.deck = Deck::Samples;
+        app.visual_sampler = visual_sampler::VisualSampler::four_hit_fixture();
+        app.simulated_system_bars = Some(system_bars::Edges {
+            top: 36, bottom: 56, ..Default::default()
+        });
+        let output = frame_at(&ctx, &mut app, egui::vec2(600.0, 900.0), Vec::new());
+        for label in ["Waveform editor", "Play trim", "Play 4", "Split to Kit", "Enter hit"] {
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == label
+                    && shape.clip_rect.contains_rect(text.visual_bounding_rect())
+            )), "Control not visible: {label}");
+        }
+    }
+
+    #[test]
+    fn visual_sampler_four_hits_round_trip_and_undo_without_the_source() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        app.visual_sampler = visual_sampler::VisualSampler::four_hit_fixture();
+        app.patterns[0] = Pattern::default();
+        let lane = 2;
+        app.lane_patches[lane] = LanePatch::for_machine(MachineKind::OtisKit);
+        app.lane_patches[lane].params[0] = 0.875;
+        app.cursor.select(lane, 0, SubColumn::Note, false);
+        app.commit_visual_split(2).unwrap();
+        assert!(app.commit_visual_split(2).is_err());
+        for slot in 2..6 {
+            app.enter_visual_hit(slot).unwrap();
+        }
+        let bytes = project::encode(app.project_snapshot()).unwrap();
+        drop(app.visual_sampler);
+        let from_disk = project::decode(&bytes).unwrap();
+        for (row, slot) in (2..6).enumerate() {
+            let sample = from_disk.instruments.kit.samples[slot].as_ref().unwrap();
+            assert_eq!(sample.pcm.len(), 4);
+            assert_eq!(sample.rate, 48_000);
+            assert_eq!(from_disk.patterns[0].lanes[lane][row].midi, [67, 60, 61, 62][row]);
+            assert!(from_disk.patterns[0].lanes[lane][row].active);
+        }
+        app.visual_sampler = visual_sampler::VisualSampler::default();
+        app.undo_visual_split().unwrap();
+        assert!(app.instruments.kit.samples.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn touch_note_writes_before_preview_and_wraps_at_pattern_end() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        let (tx, mut rx) = rtrb::RingBuffer::new(8);
+        app.audio = AudioControl::new(tx);
+        app.offline_player = None;
+        app.patterns[0].length = 12;
+        app.cursor.select(2, 12, SubColumn::Note, false);
+        app.enter_touch_note(0, 72);
+        assert!(rx.pop().is_err(), "inactive rows don't accept touch notes");
+
+        app.cursor.select(2, 11, SubColumn::Note, false);
+        app.enter_touch_note(0, 72);
+        let edited = app.patterns[0].lanes[2][11];
+        assert_eq!(app.cursor.row, 0);
+        assert!(edited.active);
+        assert!(!edited.air);
+        assert_eq!(edited.midi, 72);
+        assert!(matches!(rx.pop(), Ok(AudioCommand::SetCell {
+            pattern: 0, lane: 2, row: 11, cell,
+        }) if cell == edited));
+        assert!(matches!(rx.pop(), Ok(AudioCommand::PreviewStep {lane: 2, cell}) if cell == edited));
+    }
+
+    #[test]
+    fn momentary_fill_reaches_the_existing_evaluator_and_releases() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        let mut fill = tablet_ui::TouchFill::default();
+        app.set_fill(fill.update(false, true));
+        assert!(app.offline_player.as_ref().unwrap().evaluator.fill_active);
+        app.set_fill(fill.update(false, false));
+        assert!(!app.offline_player.as_ref().unwrap().evaluator.fill_active);
     }
 
     #[test]

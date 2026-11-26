@@ -21,11 +21,14 @@ serde_json = { workspace = true, features = ["float_roundtrip"] }
 crate-type = ["rlib", "cdylib"]
 
 [target.'cfg(target_os = "android")'.dependencies]
-eframe = { workspace = true, features = ["android-native-activity"] }
+eframe = { workspace = true, features = ["android-native-activity", "glow"] }
 winit = { version = "0.30", default-features = false }
+android_logger = "0.15"
+log = "0.4"
+jni = "0.22.4"
 
 [package.metadata.android]
-package = "io.github.josiahalanlee.leviathan"
+package = "io.github.josiahalanlee.leviathan.portrait"
 build_targets = ["aarch64-linux-android"]
 strip = "strip"
 
@@ -34,8 +37,10 @@ min_sdk_version = 29
 target_sdk_version = 35
 
 [package.metadata.android.application]
-label = "Leviathan"
+label = "Leviathan Portrait"
+has_code = true
 extract_native_libs = true
 
 [package.metadata.android.application.activity]
-orientation = "landscape"
+orientation = "sensorPortrait"
+name = "io.github.josiahalanlee.leviathan.DocumentActivity"

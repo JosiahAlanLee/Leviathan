@@ -501,6 +501,20 @@ fn clock_offset(value: f32) -> i8 {
     }
 }
 
+/// Authoring inverse for note-addressed hits. Prefer the native-pitch group
+/// (semitones 0..8) and share the same rounding and slot shift as playback.
+pub fn note_for_slot(slot: usize, offset: f32, pitch_zero: i32, key_offset: i32) -> Option<u8> {
+    (slot < SLOTS).then_some(())?;
+    let base = pitch_zero.checked_sub(key_offset)?;
+    for semi in 0..8 {
+        let note = base.checked_add(semi)?;
+        if (0..=127).contains(&note) && addressing(semi as f32 / 12.0, offset, None).0 == slot {
+            return Some(note as u8);
+        }
+    }
+    None
+}
+
 fn addressing(pitch: f32, offset: f32, byte: Option<u8>) -> (usize, f32) {
     let pitch = if pitch.is_finite() {
         pitch.clamp(-10.0, 10.0)
@@ -525,6 +539,20 @@ fn addressing(pitch: f32, offset: f32, byte: Option<u8>) -> (usize, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_pitch_note_matches_renderer_with_offset_and_shift() {
+        for (pitch_zero, key_offset) in [(60, 0), (48, 5)] {
+            for shift in [0.0, 0.375, 0.5, 0.875, 1.0] {
+                for slot in 0..SLOTS {
+                    let note = note_for_slot(slot, shift, pitch_zero, key_offset).unwrap();
+                    let pitch = (i32::from(note) + key_offset - pitch_zero) as f32 / 12.0;
+                    assert_eq!(addressing(pitch, shift, None), (slot, 0.0));
+                }
+            }
+        }
+        assert_eq!(note_for_slot(SLOTS, 0.5, 60, 0), None);
+    }
 
     #[test]
     fn velocity_readout_matches_the_existing_hit_gain() {

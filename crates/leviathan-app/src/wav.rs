@@ -32,20 +32,25 @@ pub fn decode_wav_bytes(name: &str, bytes: &[u8]) -> Result<DecodedWav, String> 
     make_sample_bank(name, sample_rate, mono)
 }
 
+pub const MAX_WAV_BYTES: u64 = 64 * 1024 * 1024;
+
 pub fn load_kit_wav(path: &Path) -> Result<(String, u32, Vec<i16>), String> {
     use std::io::Read;
-    // Bound raw input independently of decoded frame count, including multichannel WAV.
-    const MAX_FILE: u64 = 64 * 1024 * 1024;
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("sample.wav");
+    let file = std::fs::File::open(path).map_err(|e| format!("Read error: {e}"))?;
     let mut bytes = Vec::new();
-    std::fs::File::open(path).and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut bytes))
+    file.take(MAX_WAV_BYTES + 1).read_to_end(&mut bytes)
         .map_err(|e| format!("Read error: {e}"))?;
-    if bytes.len() as u64 > MAX_FILE {
+    decode_kit_wav(name, &bytes)
+}
+
+pub fn decode_kit_wav(name: &str, bytes: &[u8]) -> Result<(String, u32, Vec<i16>), String> {
+    if bytes.len() as u64 > MAX_WAV_BYTES {
         return Err("Kit WAV exceeds 64 MiB".into());
     }
-    let (rate, mono) = decode_mono(&bytes, leviathan_dsp::otis_kit::MAX_FRAMES)?;
-    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("sample.wav").to_owned();
+    let (rate, mono) = decode_mono(bytes, leviathan_dsp::otis_kit::MAX_FRAMES)?;
     let pcm = mono.into_iter().map(|s| (s * 32_768.0).round() as i16).collect();
-    Ok((name, rate, pcm))
+    Ok((name.to_owned(), rate, pcm))
 }
 
 fn decode_mono(bytes: &[u8], max_frames: usize) -> Result<(u32, Vec<f32>), String> {
