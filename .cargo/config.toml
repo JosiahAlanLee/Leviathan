@@ -1,3 +1,0 @@
-[target.aarch64-linux-android]
-# NDK r27 does not use 16 KiB ELF segment alignment by default.
-rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
