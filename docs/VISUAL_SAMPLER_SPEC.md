@@ -96,6 +96,41 @@ and keyboard, not a separate sampler implementation.
   project on Android, open it on desktop without the source file, and compare
   slice PCM/rates, grid triggers and a deterministic offline bounce.
 
+## Cross-platform release gate
+
+The same sampler feature set ships on **Android ARM64, Linux, macOS, and
+Windows**, the app's current target platforms. Tablet-first describes layout
+and interaction design, not an Android-only editor. Use the same frame model,
+bounded WAV decoder, waveform/trim state, audition player, kit transaction,
+step-entry rules, and project codec everywhere. Platform code is limited to
+input/window behavior, audio-device glue, and opening or saving documents.
+Do not add a separate Android project format or renderer-dependent waveform.
+This proposal does not add new targets such as iOS or web.
+
+| Target | Automated gate | Run with a real app and audio device |
+| --- | --- | --- |
+| Android ARM64 | Build and verify an installable APK on picker, app, shared-crate, and packaging changes. Run the shared logic fixtures in desktop CI; APK success is not a device pass. | Galaxy Tab A9+ in portrait: open a local and a provider-backed WAV in Files, cancel once, check resume and system bars, audition through the device, split, enter four hits, and save a copy. Smoke on a second Android device before external beta. |
+| Linux | Build all targets and run the workspace tests in Linux CI. | Open/drop through the desktop app (including a path with spaces), trim with mouse/keyboard, audition, split, enter four hits and save/reopen with the normal local output device. Smoke both X11 and Wayland where those builds are supported. |
+| macOS | Build all targets and run the workspace tests in macOS CI; record the tested architecture. | Run the same desktop workflow on a supported Mac, including Open/Save and audition through its normal output device. If both Intel and Apple Silicon builds are offered, smoke both. |
+| Windows | Build all targets and run the workspace tests in Windows CI. | Run the same desktop workflow, including picker cancellation, a Unicode file path, overwrite protection, and audition through the normal output device. |
+
+Keep one generated WAV and expected frame/slot manifest as the shared fixture.
+On each target, verify the four frame boundaries, exact committed PCM and
+rates, slot routing and undo, and that a project made there opens on another
+target with the original WAV unavailable. As part of the release check, open
+the Android project on all three desktop OSes, then open a desktop-authored
+copy back on Android. Compare saved PCM and tracker data exactly, and compare
+the offline render with a stated numerical tolerance at the same sample rate
+rather than requiring device waveforms to be bit-identical. Include a valid
+two-frame, 192 kHz slice at 48 kHz output: make the preview limit clear if it
+cannot be heard at that rate, without silently stretching or changing the PCM.
+
+A shared test pass covers the rules, not the file-picker return path, window
+fit or audible output. Record build/head, OS/device, and pass/fail per row;
+leave unrun rows explicitly pending. A PR may land an incremental slice with
+known coverage gaps, but the feature is not declared cross-platform ready
+until every row is verified.
+
 **Not v1:** auto-transient detection, destructive edits, time stretch, stereo
 kit slots, new DSP voices, persistent slice sets, general project migration,
 or Play Store packaging. Keep the scope to the edit-to-pattern loop.
