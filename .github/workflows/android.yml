@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/android.yml'
+      - '.cargo/config.toml'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/leviathan-app/Cargo.toml'
@@ -24,13 +25,38 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: android-arm64
-      - name: Install Android SDK tools
+      - name: Locate or install Android SDK tools
         run: |
-          sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.3.13750724'
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.3.13750724" >> "$GITHUB_ENV"
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$RUNNER_TEMP/android-sdk}}"
+          sdkmanager="$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+          if ! test -f "$sdk_root/platforms/android-35/android.jar" ||
+             ! test -x "$sdk_root/build-tools/35.0.0/apksigner" ||
+             ! test -d "$sdk_root/ndk/27.3.13750724"; then
+            if ! test -x "$sdkmanager"; then
+              sdk_root="$RUNNER_TEMP/android-sdk"
+              mkdir -p "$sdk_root/cmdline-tools"
+              curl --fail --silent --show-error --location --retry 3 \
+                https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
+                --output "$RUNNER_TEMP/android-command-line-tools.zip"
+              unzip -q "$RUNNER_TEMP/android-command-line-tools.zip" -d "$sdk_root/cmdline-tools"
+              mv "$sdk_root/cmdline-tools/cmdline-tools" "$sdk_root/cmdline-tools/latest"
+              sdkmanager="$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+            fi
+            # Use a file rather than a pipe so sdkmanager can stop reading at EOF.
+            printf 'y\n%.0s' {1..100} > "$RUNNER_TEMP/sdk-license-answers"
+            "$sdkmanager" --sdk_root="$sdk_root" --licenses < "$RUNNER_TEMP/sdk-license-answers"
+            "$sdkmanager" --sdk_root="$sdk_root" \
+              'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.3.13750724'
+          fi
+          echo "ANDROID_HOME=$sdk_root" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$sdk_root" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$sdk_root/ndk/27.3.13750724" >> "$GITHUB_ENV"
       - name: Install cargo-apk
         run: cargo install cargo-apk --version 0.10.0 --locked
       - name: Build ARM64 debug APK
+        env:
+          CARGO_PROFILE_DEV_OPT_LEVEL: "1"
+          CARGO_PROFILE_DEV_DEBUG: "0"
         run: cargo apk build -p leviathan-app --lib
       - uses: actions/upload-artifact@v4
         with:

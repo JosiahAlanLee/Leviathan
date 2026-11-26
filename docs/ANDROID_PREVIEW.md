@@ -9,6 +9,9 @@ dependency; external MIDI is not part of this preview's test scope.
 
 The Android preview workflow publishes a debug APK as the
 `leviathan-android-arm64-debug` artifact. Unzip the artifact before sideloading.
+Signing is for testing only. A later debug APK signed by a different builder
+may not install over an earlier one; do not keep your only project copy here.
+
 For local builds, install the Android SDK (platform 35, build-tools 35.0.0),
 side-by-side NDK 27.3.13750724, Android platform-tools, and a JDK.
 
@@ -16,7 +19,7 @@ side-by-side NDK 27.3.13750724, Android platform-tools, and a JDK.
 rustup target add aarch64-linux-android
 cargo install cargo-apk --version 0.10.0 --locked
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.3.13750724"
-cargo apk build -p leviathan-app --lib
+CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo apk build -p leviathan-app --lib
 adb install -r target/debug/apk/leviathan-app.apk
 ```
 

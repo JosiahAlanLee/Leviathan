@@ -27,6 +27,7 @@ winit = { version = "0.30", default-features = false }
 [package.metadata.android]
 package = "io.github.josiahalanlee.leviathan"
 build_targets = ["aarch64-linux-android"]
+strip = "strip"
 
 [package.metadata.android.sdk]
 min_sdk_version = 29
@@ -34,6 +35,7 @@ target_sdk_version = 35
 
 [package.metadata.android.application]
 label = "Leviathan"
+extract_native_libs = true
 
 [package.metadata.android.application.activity]
 orientation = "landscape"
