@@ -318,4 +318,81 @@ mod tests {
         assert!(delta.iter().all(|&sum| sum > 20.0), "{delta:?}");
         }
     }
+
+    #[test]
+    fn tracker_word_requires_run_and_ignores_clock_bit() {
+        let mut cv = CvFrame::default();
+        assert_eq!(tracker_word(&cv), None);
+        cv.run_v = 2.5;
+        assert_eq!(tracker_word(&cv), None);
+        cv.run_v = 2.6;
+        cv.bytebus_v = encode_bytebus_frame(0b1010_0011, true);
+        assert_eq!(tracker_word(&cv), Some(0b1010_0011));
+        cv.bytebus_v = encode_bytebus_frame(0x00, true);
+        assert_eq!(tracker_word(&cv), Some(0x00));
+    }
+
+    #[test]
+    fn decode_word_uses_strict_five_volt_threshold() {
+        let mut volts = [0.0_f32; 9];
+        volts[0] = 5.0;
+        volts[1] = 5.000_001;
+        assert_eq!(decode_word(&volts), 0b0000_0010);
+    }
+
+    #[test]
+    fn clocked_receiver_publishes_only_on_rising_edges() {
+        let mut rx = ByteBusReceiver::default();
+        let mut volts = encode_bytebus_frame(0x42, false);
+        assert_eq!(rx.step(ByteBusSource::Clocked, &volts), None);
+        volts[8] = 10.0;
+        assert_eq!(rx.step(ByteBusSource::Clocked, &volts), Some(0x42));
+        volts[0] = 0.0;
+        assert_eq!(rx.step(ByteBusSource::Clocked, &volts), Some(0x42));
+        volts[8] = 0.0;
+        assert_eq!(rx.step(ByteBusSource::Clocked, &volts), Some(0x42));
+    }
+
+    #[test]
+    fn current_source_decodes_and_standalone_resets_held_word() {
+        let mut rx = ByteBusReceiver::default();
+        let volts = encode_bytebus_frame(0xA5, true);
+        assert_eq!(rx.step(ByteBusSource::Current, &volts), Some(0xA5));
+        assert_eq!(rx.step(ByteBusSource::Standalone, &volts), None);
+        assert_eq!(rx.step(ByteBusSource::Clocked, &volts), Some(0xA5));
+    }
+
+    #[test]
+    fn parallel_sum_is_bounded_and_finite_for_all_words_and_extremes() {
+        for word in 0..=255_u8 {
+            for tilt in [0.0, 0.5, 1.0] {
+                for color in [0.0, 1.0] {
+                    let value = parallel_sum(word, tilt, color);
+                    assert!(value.is_finite());
+                    assert!((-1.0..=1.0).contains(&value), "word={word:#x} tilt={tilt} color={color} -> {value}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn voice_step_is_deterministic_and_bounded() {
+        let params = MachineKind::ByteBusR2r.spec().default_params();
+        let mut a = Voice::default();
+        let mut b = Voice::default();
+        for i in 0..4_096 {
+            let trigger = (i == 0).then_some(0.9);
+            let sample_a = a.step(220.0, 48_000.0, true, trigger, Some(0x71), &params, false);
+            let sample_b = b.step(220.0, 48_000.0, true, trigger, Some(0x71), &params, false);
+            assert_eq!(sample_a, sample_b);
+            assert!(sample_a.is_finite());
+            assert!((-1.0..=1.0).contains(&sample_a));
+        }
+        assert!(a.amp < 0.9);
+        let mut gated = Voice::default();
+        let mut untriggered = Voice::default();
+        let gated_sample = gated.step(220.0, 48_000.0, false, None, Some(0x71), &params, false);
+        let untriggered_sample = untriggered.step(220.0, 48_000.0, false, None, Some(0x71), &params, false);
+        assert_eq!(gated_sample, untriggered_sample);
+    }
 }
