@@ -5,8 +5,13 @@ import android.app.NativeActivity;
 import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
+import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -14,30 +19,37 @@ import java.io.OutputStream;
 
 /** The Rust engine stays in NativeActivity; only the document result crosses here. */
 public final class DocumentActivity extends NativeActivity {
-    private static final int BASE = 4700, WAV = 1, OPEN = 2, SAVE = 3;
+    private static final int WAV = 1, OPEN = 2, SAVE = 3, EXPORT_WAV = 4, EXPORT_FOLDER = 5;
+    private static final AtomicInteger NEXT_REQUEST = new AtomicInteger(4700);
     private static final int WAV_LIMIT = 64 * 1024 * 1024, PROJECT_LIMIT = 8 * 1024 * 1024;
     private int operation;
-    private byte[] saveBytes;
+    private int requestCode;
+    private String sourcePath;
     private volatile String result;
 
-    public void launchDocument(int kind, byte[] payload) {
-        if (kind < WAV || kind > SAVE || operation != 0) return;
+    public void launchDocument(int kind, String path) {
+        if (kind < WAV || kind > EXPORT_FOLDER || operation != 0) return;
         result = null;
         operation = kind;
-        saveBytes = payload;
-        Intent intent = new Intent(kind == SAVE ? Intent.ACTION_CREATE_DOCUMENT : Intent.ACTION_OPEN_DOCUMENT);
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
-        if (kind == SAVE) {
-            intent.setType("application/json");
-            intent.putExtra(Intent.EXTRA_TITLE, "untitled.leviathan.json");
-        } else {
-            // Several providers advertise WAV and JSON as octet-stream. Rust validates bytes.
-            intent.setType("*/*");
+        sourcePath = path;
+        requestCode = NEXT_REQUEST.getAndUpdate(previous -> previous >= 0x7fff ? 4700 : previous + 1);
+        String action = kind == EXPORT_FOLDER ? Intent.ACTION_OPEN_DOCUMENT_TREE :
+            kind == SAVE || kind == EXPORT_WAV ? Intent.ACTION_CREATE_DOCUMENT : Intent.ACTION_OPEN_DOCUMENT;
+        Intent intent = new Intent(action);
+        if (kind != EXPORT_FOLDER) {
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            if (kind == SAVE || kind == EXPORT_WAV) {
+                intent.setType(kind == SAVE ? "application/json" : "audio/wav");
+                intent.putExtra(Intent.EXTRA_TITLE, kind == SAVE ? "untitled.leviathan.json" : "leviathan.wav");
+            } else {
+                // Several providers advertise WAV and JSON as octet-stream. Rust validates bytes.
+                intent.setType("*/*");
+            }
         }
         try {
-            startActivityForResult(intent, BASE + kind);
+            startActivityForResult(intent, requestCode);
         } catch (RuntimeException error) {
-            saveBytes = null;
+            sourcePath = null;
             result = "error\nCould not open Android Files: " + error.getMessage();
         }
     }
@@ -54,10 +66,12 @@ public final class DocumentActivity extends NativeActivity {
 
     @Override protected void onActivityResult(int code, int status, Intent intent) {
         super.onActivityResult(code, status, intent);
-        final int kind = code - BASE;
-        if (kind == 0 || kind != operation) return;
-        final byte[] output = saveBytes;
-        saveBytes = null;
+        // A recreated NativeActivity deliberately cancels rather than replaying a write.
+        // Rust exposes the private pre-picker project for recovery.
+        if (operation == 0 || code != requestCode) return;
+        final int kind = operation;
+        final String source = sourcePath;
+        sourcePath = null;
         final Uri uri = intent == null ? null : intent.getData();
         if (status != Activity.RESULT_OK || uri == null) {
             result = "cancel";
@@ -68,11 +82,27 @@ public final class DocumentActivity extends NativeActivity {
             @Override public void run() {
             File temporary = null;
             try {
-                if (kind == SAVE) {
-                    if (output == null || output.length > PROJECT_LIMIT) throw new IOException("Invalid project bytes");
-                    try (OutputStream stream = getContentResolver().openOutputStream(uri, "w")) {
-                        if (stream == null) throw new IOException("Files did not provide a writable document");
-                        stream.write(output);
+                if (kind == SAVE || kind == EXPORT_WAV || kind == EXPORT_FOLDER) {
+                    File files = getFilesDir().getCanonicalFile();
+                    File staged = new File(source).getCanonicalFile();
+                    if (kind == SAVE) {
+                        if (!staged.equals(new File(files, "files-recovery.leviathan.json"))
+                            || !staged.isFile() || staged.length() > PROJECT_LIMIT) {
+                            throw new IOException("Invalid staged project");
+                        }
+                        writeSelectedFile(staged, uri);
+                    } else {
+                        File root = new File(files, "wav-staging");
+                        if (!root.equals(staged.getParentFile()) || !staged.isDirectory()) {
+                            throw new IOException("Invalid WAV staging folder");
+                        }
+                        File output = new File(staged, "mix.wav");
+                        if (kind == EXPORT_WAV) {
+                            if (!output.isFile()) throw new IOException("Master WAV is missing");
+                            writeSelectedFile(output, uri);
+                        } else {
+                            writeBundle(output, uri);
+                        }
                     }
                     result = "saved";
                 } else {
@@ -101,6 +131,58 @@ public final class DocumentActivity extends NativeActivity {
             }
             }
         }, "Leviathan Files").start();
+    }
+
+    private void copyToDocument(File source, Uri destination) throws IOException {
+        try (InputStream input = new FileInputStream(source);
+             OutputStream output = getContentResolver().openOutputStream(destination, "w")) {
+            if (output == null) throw new IOException("Files did not provide a writable document");
+            byte[] buffer = new byte[65536];
+            int n;
+            while ((n = input.read(buffer)) != -1) output.write(buffer, 0, n);
+        }
+    }
+
+    private boolean deleteCreated(Uri document) {
+        try {
+            return DocumentsContract.deleteDocument(getContentResolver(), document);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private void writeSelectedFile(File source, Uri destination) throws IOException {
+        try {
+            copyToDocument(source, destination);
+        } catch (Exception error) {
+            boolean removed = deleteCreated(destination);
+            throw new IOException("Could not write the selected file."
+                + (removed ? "" : " Check Files for an incomplete copy."), error);
+        }
+    }
+
+    private void writeBundle(File source, Uri tree) throws IOException {
+        File[] outputs = source.listFiles(file -> file.isFile() && file.getName().endsWith(".wav"));
+        if (outputs == null || outputs.length == 0 || !new File(source, "master.wav").isFile()) {
+            throw new IOException("No rendered WAV bundle is available");
+        }
+        Arrays.sort(outputs, Comparator.comparing(File::getName));
+        Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+        Uri folder = DocumentsContract.createDocument(getContentResolver(), parent,
+            DocumentsContract.Document.MIME_TYPE_DIR, "Leviathan export");
+        if (folder == null) throw new IOException("Files could not create a new export folder");
+        try {
+            for (File file : outputs) {
+                Uri treeFolder = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getDocumentId(folder));
+                Uri child = DocumentsContract.createDocument(getContentResolver(), treeFolder, "audio/wav", file.getName());
+                if (child == null) throw new IOException("Files could not create " + file.getName());
+                copyToDocument(file, DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getDocumentId(child)));
+            }
+        } catch (Exception error) {
+            boolean removed = deleteCreated(DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getDocumentId(folder)));
+            throw new IOException("Could not finish the WAV bundle."
+                + (removed ? "" : " Check Files for an incomplete Leviathan export folder."), error);
+        }
     }
 
     private String displayName(Uri uri, String fallback) {

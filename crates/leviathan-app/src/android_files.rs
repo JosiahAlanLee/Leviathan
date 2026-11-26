@@ -18,6 +18,8 @@ pub enum Kind {
     Wav = 1,
     Open = 2,
     Save = 3,
+    ExportWav = 4,
+    ExportFolder = 5,
 }
 
 pub enum Reply {
@@ -34,17 +36,30 @@ pub struct Files {
     pending: Option<Kind>,
     replies: Mailbox,
     last_check: Option<Instant>,
+    recovery: Option<PathBuf>,
+    recovering: bool,
+    export_stage: Option<crate::export::MobileStage>,
     pub status: String,
 }
 
 impl Files {
     pub fn new(app: AndroidApp) -> Self {
+        let recovery = app.internal_data_path().map(|dir| dir.join("files-recovery.leviathan.json"));
+        let recovering = recovery.as_ref().is_some_and(|path| path.is_file());
+        let status = if recovering {
+            "Android Files was interrupted. Check any output in Files. Restore the pre-picker project or dismiss.".into()
+        } else {
+            String::new()
+        };
         Self {
             app,
             pending: None,
             replies: Default::default(),
             last_check: None,
-            status: String::new(),
+            recovery,
+            recovering,
+            export_stage: None,
+            status,
         }
     }
 
@@ -52,10 +67,51 @@ impl Files {
         self.pending.is_some()
     }
 
-    pub fn launch(&mut self, kind: Kind, bytes: Vec<u8>, ctx: &egui::Context) {
-        if self.pending.is_some() {
-            return;
+
+    pub fn recovering(&self) -> bool {
+        self.recovering
+    }
+
+    pub fn recover_project(&self) -> Result<crate::project::Project, String> {
+        crate::project::load(self.recovery.as_deref().ok_or("Recovery path unavailable")?)
+    }
+
+    pub fn clear_recovery(&mut self) -> Result<(), String> {
+        if let Some(path) = &self.recovery {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("Could not remove recovery copy: {e}")),
+            }
         }
+        self.recovering = false;
+        Ok(())
+    }
+
+    pub fn export_root(&self) -> Option<PathBuf> {
+        self.app.internal_data_path().map(|dir| dir.join("wav-staging"))
+    }
+
+    pub fn launch(
+        &mut self,
+        kind: Kind,
+        project: crate::project::Project,
+        stage: Option<crate::export::MobileStage>,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        if self.pending() || self.recovering() {
+            return Err("Finish the current Files operation or recovery first.".into());
+        }
+        let recovery = self.recovery.as_ref().ok_or("Recovery path unavailable")?;
+        let payload = match kind {
+            Kind::Save => recovery.as_os_str(),
+            Kind::ExportWav | Kind::ExportFolder => stage.as_ref()
+                .ok_or("Rendered WAV is unavailable")?.root().as_os_str(),
+            Kind::Open | Kind::Wav => std::ffi::OsStr::new(""),
+        }.to_str().ok_or("Invalid private file path")?.to_owned();
+        // Atomically retain one validated snapshot before Android can stop this activity.
+        crate::project::save(recovery, project)?;
+        self.export_stage = stage;
         self.pending = Some(kind);
         self.last_check = None;
         self.status = "Waiting for Android Files…".into();
@@ -68,11 +124,11 @@ impl Files {
                     let raw = app.activity_as_ptr() as jni::sys::jobject;
                     // The cloned AndroidApp owns the Java activity for this callback.
                     let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw)? };
-                    let data = env.byte_array_from_slice(&bytes)?;
+                    let data = env.new_string(&payload)?;
                     env.call_method(
                         activity.as_ref(),
                         jni_str!("launchDocument"),
-                        jni_sig!("(I[B)V"),
+                        jni_sig!("(ILjava/lang/String;)V"),
                         &[JValue::Int(kind as i32), JValue::Object(data.as_ref())],
                     )?;
                     Ok(())
@@ -83,6 +139,15 @@ impl Files {
             }
             ctx.request_repaint();
         }));
+        Ok(())
+    }
+
+    pub fn finish(&mut self) {
+        drop(self.export_stage.take());
+        if let Err(error) = self.clear_recovery() {
+            self.recovering = true;
+            self.status = error;
+        }
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) -> Option<(Kind, Reply)> {
