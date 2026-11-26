@@ -1,5 +1,7 @@
 #[cfg(target_os = "android")]
 mod android_files;
+#[cfg(target_os = "android")]
+mod android_orientation;
 mod audio;
 mod audition;
 mod capture;
@@ -222,6 +224,8 @@ struct LeviathanApp {
     system_bars: Option<system_bars::SystemBars>,
     #[cfg(target_os = "android")]
     android_files: Option<android_files::Files>,
+    #[cfg(target_os = "android")]
+    android_orientation: Option<android_orientation::Orientation>,
     bpm: f64,
     master_send: f32,
     delay_mode: DelayMode,
@@ -357,6 +361,8 @@ impl LeviathanApp {
             system_bars: None,
             #[cfg(target_os = "android")]
             android_files: None,
+            #[cfg(target_os = "android")]
+            android_orientation: None,
             bpm: 132.0,
             master_send: 0.0,
             delay_mode: DelayMode::default(),
@@ -496,6 +502,45 @@ impl LeviathanApp {
                 }
             });
         }
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn draw_landscape_rails(&mut self, ui: &mut egui::Ui, pattern: usize) {
+        const KEYS: [&str; 12] = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"];
+        let button = |label| egui::Button::new(label).min_size(egui::vec2(48.0, 48.0));
+        let enabled = self.cursor.row < self.patterns[pattern].length;
+        let key = |app: &mut Self, ui: &mut egui::Ui, semitone: usize| {
+            if ui.add_enabled(enabled, button(KEYS[semitone])).clicked() {
+                let midi = ((app.cursor.base_octave + 1) * 12 + semitone as i32) as u8;
+                app.enter_touch_note(pattern, midi);
+            }
+        };
+        ui.columns(2, |columns| {
+            columns[0].horizontal(|ui| {
+                if ui.add(button(if self.playing { "Pause" } else { "Play" })).clicked() {
+                    self.toggle_playing();
+                }
+                if ui.add(button("From row")).on_hover_text("Play from edit cursor").clicked() {
+                    self.play_from_cursor();
+                }
+                for semitone in 0..6 {
+                    key(self, ui, semitone);
+                }
+            });
+            columns[1].horizontal(|ui| {
+                let rail_width = 8.0 * 48.0 + 8.0 * ui.spacing().item_spacing.x;
+                ui.add_space((ui.available_width() - rail_width).max(0.0));
+                for semitone in 6..12 {
+                    key(self, ui, semitone);
+                }
+                if ui.add(button("Oct −")).clicked() {
+                    self.cursor.base_octave = (self.cursor.base_octave - 1).max(1);
+                }
+                if ui.add(button("Oct +")).clicked() {
+                    self.cursor.base_octave = (self.cursor.base_octave + 1).min(6);
+                }
+            });
+        });
     }
 
     #[cfg(any(target_os = "android", test))]
@@ -1991,6 +2036,12 @@ impl eframe::App for LeviathanApp {
         egui::TopBottomPanel::top("deck_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 self.deck.draw_tabs(ui);
+                #[cfg(target_os = "android")]
+                if let Some(orientation) = &self.android_orientation {
+                    ui.separator();
+                    ui.add_enabled_ui(!modal_open && self.android_files.as_ref().is_none_or(|f| !f.pending()),
+                        |ui| orientation.draw(ui));
+                }
                 ui.separator();
                 ui.checkbox(&mut self.follow_playback, "Follow playback")
                     .on_hover_text("Show the playing pattern and keep its row visible. The edit cursor stays on its own lane and row.");
@@ -2025,6 +2076,16 @@ impl eframe::App for LeviathanApp {
         { touch_layout |= self.exercise_tablet_layout; }
         let screen = ctx.screen_rect();
         let portrait = touch_layout && screen.height() > screen.width();
+        #[cfg(any(target_os = "android", test))]
+        let landscape_rails = touch_layout && !portrait && !waveform_deck
+            && ctx.available_rect().width() >= 940.0 && screen.height() >= 400.0;
+
+        #[cfg(any(target_os = "android", test))]
+        if landscape_rails {
+            egui::TopBottomPanel::bottom("landscape_thumb_rails").show(ctx, |ui| {
+                ui.add_enabled_ui(!modal_open, |ui| self.draw_landscape_rails(ui, selected));
+            });
+        }
 
         #[cfg(any(target_os = "android", test))]
         if portrait && !waveform_deck {
@@ -2117,7 +2178,7 @@ impl eframe::App for LeviathanApp {
             if touch_layout {
                 if !modal_open {
                     self.draw_tablet_scrub(ui, selected);
-                    if !portrait {
+                    if !portrait && !landscape_rails {
                         self.draw_touch_notes(ui, selected, false);
                     }
                 } else {
@@ -2498,6 +2559,8 @@ fn run_tracker(options: eframe::NativeOptions) -> eframe::Result<()> {
             let app = {
                 let mut app = app;
                 app.system_bars = android_app.clone().map(system_bars::SystemBars::new);
+                app.android_orientation = android_app.clone().map(|app|
+                    android_orientation::Orientation::new(app, &cc.egui_ctx));
                 app.android_files = android_app.map(android_files::Files::new);
                 app
             };
@@ -2663,6 +2726,27 @@ mod tests {
         app.deck = Deck::Mixer;
         let output = frame_at(&ctx, &mut app, size, Vec::new());
         assert!(bounds(&output, &last_lane).max.y < bounds(&output, "C").min.y);
+    }
+
+    #[test]
+    fn landscape_thumb_rails_stay_inside_the_safe_area() {
+        let ctx = egui::Context::default();
+        let mut app = offline_app(&ctx);
+        app.deck = Deck::Grid;
+        app.exercise_tablet_layout = true;
+        app.simulated_system_bars = Some(system_bars::Edges {
+            left: 18, right: 28, top: 28, bottom: 38,
+        });
+        let output = frame_at(&ctx, &mut app, egui::vec2(1120.0, 625.0), Vec::new());
+        for (label, left_side) in [("From row", true), ("Oct +", false)] {
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == label
+                    && shape.clip_rect.contains_rect(text.visual_bounding_rect())
+                    && ((text.pos.x < 560.0) == left_side)
+                    && text.pos.y > 490.0
+                    && text.visual_bounding_rect().bottom() <= 587.0
+            )), "Landscape rail control not visible: {label}");
+        }
     }
 
     #[test]

@@ -43,4 +43,5 @@ extract_native_libs = true
 
 [package.metadata.android.application.activity]
 orientation = "sensorPortrait"
+config_changes = "orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|uiMode|density"
 name = "io.github.josiahalanlee.leviathan.DocumentActivity"
