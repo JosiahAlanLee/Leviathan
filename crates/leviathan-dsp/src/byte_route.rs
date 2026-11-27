@@ -21,7 +21,11 @@ impl Register {
             }
         }
         self.reset_high = reset;
-        self.high = high;
+        // A stopped transport suppresses its clock output. Preserve the last
+        // observed running level until transport resumes.
+        if running {
+            self.high = high;
+        }
         self.initializing = false;
         route.lookup.map(self.held)
     }
@@ -65,6 +69,34 @@ mod tests {
         assert_eq!(step(false, 17, true), 255);
         register.reset(17);
         assert_eq!(register.step(&CvFrame::default(), None, route), 238);
+    }
+
+    #[test]
+    fn pause_resume_in_same_high_pulse_does_not_reacquire() {
+        for paused_clock in [false, true] {
+            let mut register = Register::default();
+            let route = ByteRoute {
+                enabled: true,
+                reset_word: 0,
+                lookup: ByteLookup::Identity,
+            };
+            let mut cv = CvFrame {
+                run_v: 10.0,
+                bytebus_v: encode_bytebus_frame(0x2a, true),
+                ..CvFrame::default()
+            };
+            assert_eq!(register.step(&cv, Some(0x2a), route), 0x2a);
+            cv.run_v = 0.0;
+            cv.bytebus_v = encode_bytebus_frame(0xb7, paused_clock);
+            assert_eq!(register.step(&cv, Some(0xb7), route), 0x2a);
+            cv.run_v = 10.0;
+            cv.bytebus_v = encode_bytebus_frame(0xb7, true);
+            assert_eq!(register.step(&cv, Some(0xb7), route), 0x2a);
+            cv.bytebus_v[8] = 0.0;
+            assert_eq!(register.step(&cv, Some(0xb7), route), 0x2a);
+            cv.bytebus_v[8] = 10.0;
+            assert_eq!(register.step(&cv, Some(0xb7), route), 0xb7);
+        }
     }
 
     #[test]
