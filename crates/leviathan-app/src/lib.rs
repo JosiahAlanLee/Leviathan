@@ -296,12 +296,7 @@ impl LeviathanApp {
             Recorder,
         ) -> Result<(cpal::Stream, String), String>,
     ) -> Self {
-        let viewport = if cfg!(target_os = "android") {
-            // The first device pass isolates audio and touch from shader feedback.
-            FeedbackViewport::new_software()
-        } else {
-            FeedbackViewport::new(cc)
-        };
+        let viewport = FeedbackViewport::new(cc);
 
         let initial_pattern = starter_electro_pattern();
         let (cmd_tx, cmd_rx) = rtrb::RingBuffer::<AudioCommand>::new(256);
@@ -1924,7 +1919,7 @@ impl eframe::App for LeviathanApp {
                 rotation: patch.rotation,
                 threshold: patch.threshold,
             });
-        let preview = if cfg!(target_os = "android") {
+        let preview = if cfg!(target_os = "android") && option_env!("LEVIATHAN_ANDROID_BACKEND") == Some("glow") {
             None
         } else {
             Some(self.viewport.render_frame(ctx, now, &visual_cv, &self.latest_scope, probe))
@@ -2116,7 +2111,7 @@ impl eframe::App for LeviathanApp {
                             if let Some(preview) = preview {
                                 self.draw_scene_deck(ui, preview, hovering_wgsl);
                             } else {
-                                ui.label("Shader feedback is disabled in the Android preview.");
+                                ui.label("Shader feedback is disabled in the Glow recovery build.");
                             }
                         }
                         Deck::Song => {
@@ -2509,7 +2504,7 @@ impl eframe::App for LeviathanApp {
             || self.capture_port.busy()
             || self.master_meters.is_active(now)
         {
-            if cfg!(target_os = "android") {
+            if cfg!(target_os = "android") && option_env!("LEVIATHAN_ANDROID_BACKEND") == Some("glow") {
                 ctx.request_repaint_after(std::time::Duration::from_millis(33));
             } else {
                 self.viewport.request_next_frame(ctx, now);
@@ -2536,12 +2531,24 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
         android_logger::Config::default().with_tag("Leviathan").with_max_level(log::LevelFilter::Info),
     );
     std::panic::set_hook(Box::new(|info| log::error!("{info}")));
-    log::info!("NativeActivity entered; starting GLES tracker");
-    let options = eframe::NativeOptions {
-        renderer: eframe::Renderer::Glow,
+    let backend = option_env!("LEVIATHAN_ANDROID_BACKEND").unwrap_or("auto");
+    let renderer = if backend == "glow" {
+        eframe::Renderer::Glow
+    } else {
+        eframe::Renderer::Wgpu
+    };
+    let mut options = eframe::NativeOptions {
+        renderer,
         android_app: Some(app),
         ..eframe::NativeOptions::default()
     };
+    use eframe::wgpu;
+    options.wgpu_options.supported_backends = match backend {
+        "vulkan" => wgpu::Backends::VULKAN,
+        "gl" => wgpu::Backends::GL,
+        _ => wgpu::Backends::VULKAN | wgpu::Backends::GL,
+    };
+    log::info!("NativeActivity entered; renderer preference: {backend}");
     if let Err(error) = run_tracker(options) {
         log::error!("Could not launch Leviathan: {error}");
     }
