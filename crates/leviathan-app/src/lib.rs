@@ -2543,11 +2543,14 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
         ..eframe::NativeOptions::default()
     };
     use eframe::wgpu;
-    options.wgpu_options.supported_backends = match backend {
+    let backends = match backend {
         "vulkan" => wgpu::Backends::VULKAN,
         "gl" => wgpu::Backends::GL,
         _ => wgpu::Backends::VULKAN | wgpu::Backends::GL,
     };
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+        setup.instance_descriptor.backends = backends;
+    }
     log::info!("NativeActivity entered; renderer preference: {backend}");
     if let Err(error) = run_tracker(options) {
         log::error!("Could not launch Leviathan: {error}");
